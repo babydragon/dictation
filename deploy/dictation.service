@@ -1,0 +1,25 @@
+# Managed by dictation installer; local edits may be preserved on upgrade.
+[Unit]
+Description=Dictation server (listening practice)
+Documentation=file:///opt/dictation/INSTALL.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dictation
+Group=dictation
+WorkingDirectory=/opt/dictation
+EnvironmentFile=-/etc/dictation/env
+ExecStart=/opt/dictation/dictation --config /etc/dictation/config.toml serve
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/dictation
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

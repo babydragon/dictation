@@ -1,0 +1,6 @@
+# English dictation smoke (comma prosody)
+apple | speak=apple,
+library | speak=library,
+school | speak=school,
+teacher | speak=teacher,
+friend | speak=friend,

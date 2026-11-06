@@ -1,0 +1,292 @@
+name: Release
+
+# 触发：推送 v* tag，或手动指定版本（如 v0.1.0-rc.1）。
+"on":
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "要发布的版本 tag，必须以 v 开头（例如 v0.1.0-rc.1）"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: rustfmt
+        run: cargo fmt --check
+
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --locked
+
+      - name: Check web app syntax
+        run: node --check web/app.js
+
+      - name: Check installer syntax
+        run: bash -n install.sh
+
+  build:
+    name: Build release assets
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      INPUT_VERSION: ${{ inputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Resolve and validate version
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            TAG="${INPUT_VERSION}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          if [[ ! "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.]*)?$ ]]; then
+            echo "::error::非法版本 tag: '${TAG}'（期望 vX.Y.Z 或 vX.Y.Z-rc.N）"
+            exit 1
+          fi
+          CARGO_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
+          if [ "v${CARGO_VERSION}" != "${TAG}" ]; then
+            echo "::error::Cargo.toml 版本 (${CARGO_VERSION}) 与 tag (${TAG}) 不一致"
+            exit 1
+          fi
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "cargo_version=${CARGO_VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "TAG=${TAG}" >> "${GITHUB_ENV}"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: riscv64gc-unknown-linux-gnu
+
+      - name: Build x86_64
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked
+          mkdir -p dist-bin
+          install -m 0755 target/release/dictation "dist-bin/dictation-x86_64"
+
+      - name: Install Zig 0.16.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIG_VERSION="0.16.0"
+          ZIG_DIR="${RUNNER_TEMP}/zig-${ZIG_VERSION}"
+          mkdir -p "${ZIG_DIR}"
+          URLS=(
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz"
+          )
+          downloaded=0
+          for url in "${URLS[@]}"; do
+            if curl -fsSL --retry 3 -o "${RUNNER_TEMP}/zig.tar.xz" "${url}"; then
+              downloaded=1
+              break
+            fi
+            echo "下载失败，尝试下一个地址: ${url}"
+          done
+          if [ "${downloaded}" -ne 1 ]; then
+            echo "::error::无法下载 Zig ${ZIG_VERSION}"
+            exit 1
+          fi
+          tar -xJf "${RUNNER_TEMP}/zig.tar.xz" -C "${ZIG_DIR}" --strip-components=1
+          echo "${ZIG_DIR}" >> "${GITHUB_PATH}"
+          "${ZIG_DIR}/zig" version
+
+      - name: Install cargo-zigbuild
+        shell: bash
+        run: cargo install cargo-zigbuild --locked
+
+      - name: Build riscv64 (glibc 2.30)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo zigbuild --release --locked --target riscv64gc-unknown-linux-gnu.2.30
+          mkdir -p dist-bin
+          install -m 0755 target/riscv64gc-unknown-linux-gnu/release/dictation "dist-bin/dictation-riscv64"
+
+      - name: Package release assets
+        shell: bash
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          TAG="${TAG:?}"
+          mkdir -p dist/pkg
+          # 生成最终 install.sh：替换仓库占位符，供 curl | bash 使用。
+          python3 - "${GITHUB_REPOSITORY}" <<'PY'
+          import pathlib
+          import sys
+          repo = sys.argv[1]
+          src = pathlib.Path("install.sh").read_text(encoding="utf-8")
+          if "__REPO__" not in src:
+              raise SystemExit("install.sh 缺少 __REPO__ 占位符")
+          pathlib.Path("dist/install.sh").write_text(
+              src.replace("__REPO__", repo), encoding="utf-8"
+          )
+          PY
+          chmod 0755 dist/install.sh
+
+          package() {
+            local target="$1" binary="$2" name
+            name="dictation-${TAG}-${target}"
+            rm -rf "dist/pkg/${name}"
+            mkdir -p "dist/pkg/${name}"/{web,deploy,docs,skills/dictation-prep}
+            install -m 0755 "${binary}" "dist/pkg/${name}/dictation"
+            cp -a web/. "dist/pkg/${name}/web/"
+            install -m 0644 deploy/dictation.service deploy/config.example deploy/env.example "dist/pkg/${name}/deploy/"
+            install -m 0644 docs/P1-CONTRACT.md "dist/pkg/${name}/docs/"
+            install -m 0644 skills/dictation-prep/SKILL.md "dist/pkg/${name}/skills/dictation-prep/"
+            install -m 0644 INSTALL.md README.md LICENSE "dist/pkg/${name}/"
+            install -m 0755 dist/install.sh "dist/pkg/${name}/install.sh"
+            tar -C dist/pkg -czf "dist/${name}.tar.gz" "${name}"
+          }
+
+          package "x86_64-unknown-linux-gnu" "dist-bin/dictation-x86_64"
+          package "riscv64gc-unknown-linux-gnu" "dist-bin/dictation-riscv64"
+
+          rm -rf dist/pkg
+          cd dist
+          sha256sum *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+          ls -lh ./*.tar.gz ./install.sh ./SHA256SUMS
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      INPUT_VERSION: ${{ inputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Resolve and validate version
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            TAG="${INPUT_VERSION}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          if [[ ! "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.]*)?$ ]]; then
+            echo "::error::非法版本 tag: '${TAG}'（期望 vX.Y.Z 或 vX.Y.Z-rc.N）"
+            exit 1
+          fi
+          CARGO_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
+          if [ "v${CARGO_VERSION}" != "${TAG}" ]; then
+            echo "::error::Cargo.toml 版本 (${CARGO_VERSION}) 与 tag (${TAG}) 不一致"
+            exit 1
+          fi
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "TAG=${TAG}" >> "${GITHUB_ENV}"
+
+      - name: Create or update release
+        shell: bash
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          TAG="${TAG:?}"
+          PRERELEASE=""
+          case "${TAG}" in
+            *-rc.*|*-rc|*-alpha*|*-beta*) PRERELEASE="--prerelease" ;;
+          esac
+
+          NOTES="$(cat <<EOF
+          ## dictation ${TAG}
+
+          安装（Linux x86_64 / riscv64 SBC，需要 root）：
+
+          \`\`\`bash
+          curl -fsSL https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/install.sh | sudo bash -s -- --version ${TAG}
+          \`\`\`
+
+          指定版本安装后，用 \`--version\` 可重复执行以升级程序与前端；
+          已有的 \`/etc/dictation/config.toml\`、\`env\` 和
+          \`/srv/dictation/{lessons,data,cache}\` 不会被覆盖或删除。
+
+          资产：
+
+          - \`dictation-${TAG}-x86_64-unknown-linux-gnu.tar.gz\`
+          - \`dictation-${TAG}-riscv64gc-unknown-linux-gnu.tar.gz\`
+          - \`install.sh\`
+          - \`SHA256SUMS\`
+
+          安装前可先校验：
+
+          \`\`\`bash
+          sha256sum -c SHA256SUMS
+          \`\`\`
+
+          完整安装/部署说明见仓库 \`INSTALL.md\`。
+          EOF
+          )"
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} 已存在，跳过创建，直接上传资产。"
+          else
+            ARGS=(release create "${TAG}" --target "${GITHUB_SHA}" --title "${TAG}" --notes "${NOTES}")
+            if [ -n "${PRERELEASE}" ]; then
+              ARGS+=("${PRERELEASE}")
+            fi
+            gh "${ARGS[@]}"
+          fi
+
+          gh release upload "${TAG}" dist/*.tar.gz dist/install.sh dist/SHA256SUMS --clobber

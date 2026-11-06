@@ -1,0 +1,29 @@
+# build
+/target/
+/dist/
+**/*.rs.bk
+
+# release artifacts
+*.tar.gz
+*.tgz
+
+# runtime data
+/cache/
+/lessons/
+/data/
+*.mp3
+*.wav
+
+# secrets
+.env
+.env.*
+!.env.example
+
+# editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# node (P1 web)
+node_modules/
+web/dist/

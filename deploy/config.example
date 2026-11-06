@@ -1,0 +1,17 @@
+# /etc/dictation/config.toml
+# 本应用读取的路径/server 配置。密钥不要写这里，放 /etc/dictation/env。
+
+[paths]
+# 可写数据根目录；相对路径会基于它解析。
+base = "/srv/dictation"
+
+# 以下相对 base；也可以写绝对路径。
+lessons = "lessons"
+data = "data"
+cache = "cache"
+# 只读前端目录（通常 /opt/dictation/web）
+web = "/opt/dictation/web"
+
+[server]
+host = "0.0.0.0"
+port = 8080

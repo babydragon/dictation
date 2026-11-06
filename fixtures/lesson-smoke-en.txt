@@ -1,0 +1,6 @@
+# English dictation smoke
+apple
+library
+school
+teacher
+friend
