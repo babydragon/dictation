@@ -46,8 +46,10 @@ release 构建通过。
 - [x] GitHub Actions：测试 → x86_64/riscv64 构建 → tgz → release/pre-release
 - [x] `install.sh`：下载/校验/幂等安装/保留配置
 - [x] 本地 mock release 安装、二次幂等、dry-run、checksum 失败验证
-- [ ] 首次 commit + push（需用户确认；按约定不自动提交）
-- [ ] tag `v0.1.0-rc.1` 并触发 Action
+- [x] 首次 commit + push + tag `v0.1.0-rc.1`
+- [x] GitHub Actions 全流程通过；pre-release 已发布
+- [x] 从 GitHub release 实测 `install.sh --root` 安装；x86 二进制 rc.1、RISC-V 资产校验通过
+- [ ] 在目标 SBC 上真实安装 + systemd 启动（待上板）
 
 ---
 
@@ -278,6 +280,22 @@ release 构建通过。
   `result list` → `result wrong --latest --json` → 只基于返回的词做归纳，
   不编造错因，不直接改课时。
 
+### 2026-11-06（v0.1.0-rc.1 已发布）
+
+- GitHub Actions `Release` 全流程通过：
+  Test 1m19s → Build 3m35s → Publish 10s。
+- pre-release：
+  `https://github.com/babydragon/dictation/releases/tag/v0.1.0-rc.1`
+- 资产：
+  - `dictation-v0.1.0-rc.1-x86_64-unknown-linux-gnu.tar.gz`（4.1MB）
+  - `dictation-v0.1.0-rc.1-riscv64gc-unknown-linux-gnu.tar.gz`（3.7MB）
+  - `install.sh`、`SHA256SUMS`
+- `sha256sum -c` 两个资产均通过；RISC-V 资产确认为 ELF64 RISC-V。
+- 从 GitHub release 用 `curl | bash -s -- --version v0.1.0-rc.1 --root ... --no-systemd`
+  实测安装成功；二进制 `dictation 0.1.0-rc.1`，LICENSE/skill/deploy/web 均安装，
+  权限 2775/0750/600 正确。
+- 待办：在目标 SBC 上真实执行（systemd、开机自启、手机访问）。
+
 ### 2026-11-06（v0.1.0-rc.1 发布准备）
 
 - 文档设备泛化：只写最低配置（2 核 / 1GB RAM / 8GB 磁盘 / glibc ≥2.30）。
@@ -292,7 +310,7 @@ release 构建通过。
   release/镜像下载、SHA256 校验、路径穿越检查、幂等安装、保留 config/env/data、
   managed unit 更新、systemd、健康检查；支持 `--dry-run`/`--root`/`--no-systemd`。
 - 本地 mock release 实测：安装、二次幂等、dry-run、checksum 失败均符合预期。
-- 首次 commit/push 与 tag 需用户确认后执行。
+- 首次 commit/push 与 tag：已完成（commit `84bf7e3`，tag `v0.1.0-rc.1`）。
 
 ### 2026-10-22（SBC 交叉编译验证）
 
