@@ -638,7 +638,7 @@ printf '数据:   %s\n' "$DATA_DIR"
 printf '前端:   http://<本机IP>:8080\n'
 printf '\n'
 printf '下一步:\n'
-printf '  - 编辑 %s 检查 paths/server（serve 不需要 TTS key）\n' "$ETC_DIR/config.toml"
-printf '  - 若要在服务进程里生成音频，编辑 %s 填入 API key\n' "$ETC_DIR/env"
+printf '  - 编辑 %s 检查 paths/server\n' "$ETC_DIR/config.toml"
+printf '  - 服务端生成需要 TTS key：编辑 %s 填入 DOUBAO_API_KEY（0600）\n' "$ETC_DIR/env"
 printf '  - 查看状态: systemctl status dictation --no-pager\n'
 printf '  - 健康检查: curl %s\n' "$HEALTH_URL"

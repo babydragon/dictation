@@ -64,8 +64,8 @@ release 构建通过。
 - [x] 代码：`DICTATION_API_TOKEN` 可选鉴权（常量时间比较，鉴权先于 body 解析）
 - [x] `install.sh`：`EFFECTIVE_BASE` 以 `config.toml` 为准，修 unit/config 不一致
 - [x] 全量验证：fmt / clippy / 143 tests / JS / bash -n / x86 + riscv64 构建 / E2E curl
-- [ ] commit + push + tag `v0.1.0-rc.2` 并触发 Action
-- [ ] 从 rc.2 release 再验一次 x86/RISC-V 资产
+- [x] commit + push + tag `v0.1.0-rc.2` 并触发 Action（`5479cd7`，run `42196618526`）
+- [x] 从 rc.2 release 再验一次 x86/RISC-V 资产（checksum、ELF、`--data-root` 安装、HTTP 生成）
 - [ ] 在目标 SBC 上真实安装 + systemd 启动（待上板）
 
 ### 后续（S1 未覆盖）
@@ -320,6 +320,20 @@ release 构建通过。
   实测安装成功；二进制 `dictation 0.1.0-rc.1`，LICENSE/skill/deploy/web 均安装，
   权限 2775/0750/600 正确。
 - 待办：在目标 SBC 上真实执行（systemd、开机自启、手机访问）。
+
+### 2026-11-06（v0.1.0-rc.2 已发布）
+
+- 提交 `5479cd7`，tag `v0.1.0-rc.2`；Action `42196618526` 全流程通过
+  （Test 1m20s → Build 3m26s → Publish 11s）。
+- pre-release：`https://github.com/babydragon/dictation/releases/tag/v0.1.0-rc.2`
+- 资产：x86_64（4.4MB）、riscv64gc（3.9MB）、`install.sh`、`SHA256SUMS`；
+  `sha256sum -c` 通过，RISC-V 资产确认为 ELF64 RISC-V。
+- 从 release 实测：`install.sh --root ... --data-root /var/lib/dictation`
+  安装成功，`base=/var/lib/dictation`、`ReadWritePaths=/var/lib/dictation`；
+  安装后的二进制用 mock 跑通 HTTP 导入 → 生成 → done。
+- 注：首次 `git push origin v0.1.0-rc.2` 未触发 Action，删除远端 tag 重新推送后
+  正常（GitHub 侧偶发，重推即可）。
+- 待办：安装器结尾提示仍写“serve 不需要 TTS key”，已在本地修正，随下个版本发布。
 
 ### 2026-11-06（S1：agent 走 HTTP + 密钥收口）
 
