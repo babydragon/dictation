@@ -133,12 +133,28 @@ SBC 同时跑服务 + SQLite 没问题；本地 TTS 只在生成时占用 CPU。
 中文内容用中文，全英文内容用英文；相同文本 + 音色 + 语速只生成一次。
 开场白在 lead-in 后；结束语在最后一个 item 的 gap 之后。
 
-### D13. agent 通过 CLI 写入，不直接碰主机目录
+### D13. agent 通过 HTTP 写入，不 exec、不碰主机目录
 
-agent 可能在沙箱中，没有主机路径读写权限。它只生成 JSON payload，
-通过 stdin 交给 `dictation lesson import --payload -`；CLI 按
-`/etc/dictation/config.toml` 的 `paths` 校验并写入 `lessons/`。
-agent 不写 `data/`、`web/`，也不需要知道 `/srv` 的实际绝对路径。
+agent 通常在沙箱中，文件系统白名单很窄，软链接也会被 `realpath` 解析后拒绝。
+因此 agent **不执行 CLI、不读任何路径**，只调 `serve` 的 HTTP API：
+
+- `POST /api/lessons` 导入词表；
+- `POST /api/lessons/{id}/generate` 触发合成；
+- `GET /api/jobs/{id}` 轮询进度。
+
+服务进程按 `/etc/dictation/config.toml` 解析路径并落盘。agent 既不需要知道
+`/srv` 或 `/var/lib` 的实际位置，也不需要 `dictation` 在 PATH 里。
+CLI（`lesson import` / `lesson gen`）保留为**运维与本地调试**路径。
+
+写操作可用 `DICTATION_API_TOKEN` 保护；未设置时按家庭局域网开放。
+
+### D13b. TTS 密钥属于应用，不属于 agent
+
+密钥只放 `/etc/dictation/env`（root:root 0600），由 `serve` 读取；
+合成在服务侧完成，所以 agent 和你自己的 shell 都不需要持有 key。
+需要进一步收紧时，systemd 用 `LoadCredential` 注入：代码优先读
+`$CREDENTIALS_DIRECTORY/<NAME>`，回退环境变量，密钥因此不进 `environ`、
+也不会被子进程（如 `ffmpeg`）继承。
 
 ### D14. 结果查询与错词导出
 
@@ -446,6 +462,13 @@ lessons/第5课/
 ```
 家长：纯文本 / agent skill
         ↓
+axum 服务（SBC / 本机）
+  ├─ POST /api/lessons            导入词表（校验后写 lessons/）
+  ├─ POST /api/lessons/{id}/generate → 后台 job
+  ├─ GET  /api/jobs/{id}          轮询
+  ├─ lessons / sessions / check / review
+  └─ media / static PWA
+        ↓（生成由服务进程执行，持有 TTS 密钥）
 lesson 解析 / plan
         ↓
 TTS Provider（豆包/Qwen/mock） + 内容缓存
@@ -454,12 +477,11 @@ TTS Provider（豆包/Qwen/mock） + 内容缓存
         ↓
 clips + manifest + full.mp3
         ↓
-axum 服务（SBC / 本机）
-  - lessons / sessions / check / review
-  - media / static PWA
-        ↓
-PWA（手机/平板）
+PWA（手机/平板） / agent（只用 HTTP）
 ```
+
+同一个进程既提供 API 也执行生成；生成串行（并发 1），避免打满小机器。
+CLI 仍保留 `dictation gen` 作为运维/本地调试入口。
 
 ---
 
@@ -513,6 +535,8 @@ port = 8080
 - `lessons`/`data`/`cache` 相对 `base`；`web` 默认相对 base，示例用绝对。
 - `--config` 是 clap global arg，所有子命令可用。
 - `dictation config show [--json]` 输出解析后的路径与来源。
+- 安装脚本的 `--data-root` 可把 `base` 改为 `/var/lib/dictation` 等其他目录；
+  默认 `/srv/dictation`。改目录时同步更新 managed unit 的 `ReadWritePaths`。
 
 ### 部署 / 交叉编译
 
@@ -564,6 +588,7 @@ dictation/
 │   ├── model.rs
 │   ├── cache.rs
 │   ├── lesson/mod.rs
+│   ├── lesson/import.rs    # CLI 与 HTTP 共用的导入/校验
 │   ├── plan.rs
 │   ├── audio/mod.rs
 │   ├── render.rs
@@ -645,9 +670,14 @@ DOUBAO_RESOURCE_ID=seed-tts-2.0
 DOUBAO_VOICE_ZH=zh_female_vv_uranus_bigtts
 DOUBAO_VOICE_EN=en_female_stokie_uranus_bigtts
 # DOUBAO_MODEL=seed-tts-2.0-standard   # 仅复刻音色时需要
+
+# 可选：保护写操作（导入/生成/取消）；不设则局域网开放
+# DICTATION_API_TOKEN=...
 ```
 
 密钥永不写入仓库；缺失时提示可用 `--provider mock`。
+密钥由 `serve` 独占读取（`/etc/dictation/env`，0600），agent 与 CLI 都不需要；
+也可用 systemd `LoadCredential` 注入，代码优先读 `$CREDENTIALS_DIRECTORY`。
 
 ---
 
@@ -679,8 +709,11 @@ DOUBAO_VOICE_EN=en_female_stokie_uranus_bigtts
 - 所有用户可见文案用中文；代码标识符用英文。
 - 时间/路径字段可序列化、跨平台。
 - 不把 API key、孩子照片、真实姓名提交到仓库。
-- **agent 写入必须走 CLI**；不要要求 agent 直接读写 `/srv`、`/opt`。
-  路径从 `config.toml` 解析，不硬编码。
+- **agent 写入必须走 HTTP API**（`POST /api/lessons` 等），不 exec CLI、不读写
+  `/srv`、`/opt`；路径只由服务端从 `config.toml` 解析，不硬编码。
+  CLI 是运维/本地调试入口，可以要求本机持有密钥。
+- **HTTP 契约先改 `docs/P1-CONTRACT.md` 再写代码**；导入校验必须 CLI 与 HTTP 共用
+  同一份实现（`lesson::import`），不允许复制。
 - **所有新 CLI 必须 agent-first**：支持 `--json`、非交互、可脚本化；
   破坏性操作默认 dry-run，必须显式 `--apply`/`--force`；错误用
   `{"error": ...}` + 非零退出；路径/配置走 `AppConfig`。

@@ -37,19 +37,44 @@ release 构建通过。
 3. **拍照批改**：`Grader` trait + 多模态模型 + 置信度 + 人工确认。
 4. **记忆曲线细化**：`review_cap` 接到服务端、FSRS、按教材/单元限定范围。
 
-### 发布 v0.1.0-rc.1（进行中）
+### 发布 v0.1.0-rc.2（进行中）
 
+- [x] rc.1：CI 全流程、pre-release、从 release 安装验证
 - [x] 文档设备泛化 + 最低配置要求
 - [x] 密钥/运行时文件扫描（`.env`、`data/`、`lessons/`、`cache/`、`demo/` 均 gitignore）
 - [x] Git 仓库初始化：`https://github.com/babydragon/dictation`（public）
 - [x] License：MIT（依赖均为宽松许可）
-- [x] GitHub Actions：测试 → x86_64/riscv64 构建 → tgz → release/pre-release
-- [x] `install.sh`：下载/校验/幂等安装/保留配置
-- [x] 本地 mock release 安装、二次幂等、dry-run、checksum 失败验证
-- [x] 首次 commit + push + tag `v0.1.0-rc.1`
-- [x] GitHub Actions 全流程通过；pre-release 已发布
-- [x] 从 GitHub release 实测 `install.sh --root` 安装；x86 二进制 rc.1、RISC-V 资产校验通过
+- [x] `install.sh --data-root`：支持 `/srv/dictation` 或 `/var/lib/dictation`
+- [x] 配置/unit 自动使用 data-root；已有 config/env/data 保留
+- [x] 本地 `--root + --data-root /var/lib/dictation` 幂等实测
+- [x] 删除旧 `v0.1.0-rc.1` release + tag
+
+### S1：agent 走 HTTP + 密钥收口（rc.2 内容）
+
+设计目标：agent 零文件系统依赖（不 exec、不读路径），TTS key 只在服务进程。
+
+- [x] 文档先行：`docs/P1-CONTRACT.md` 新增 P2 端点契约
+- [x] `AGENTS.md`：D13 改为 HTTP；新增 D13b 密钥归属；架构图/目录/env/约定同步
+- [x] `skills/dictation-prep/SKILL.md` 改为 HTTP 流程；CLI 降为运维入口
+- [x] `README.md` / `INSTALL.md` / `deploy/env.example` / unit 同步
+- [x] 测试先行：契约里的 P2 用例（导入、生成、job、token、cancel、body 解析）
+- [x] 代码：抽出 `lesson::import`，CLI 与 HTTP 共用校验
+- [x] 代码：`serve` 增加 `POST /api/lessons`、`generate`、`GET /api/jobs/{id}`、`cancel`
+- [x] 代码：`Config` 支持 `$CREDENTIALS_DIRECTORY` 回退
+- [x] 代码：`DICTATION_API_TOKEN` 可选鉴权（常量时间比较，鉴权先于 body 解析）
+- [x] `install.sh`：`EFFECTIVE_BASE` 以 `config.toml` 为准，修 unit/config 不一致
+- [x] 全量验证：fmt / clippy / 143 tests / JS / bash -n / x86 + riscv64 构建 / E2E curl
+- [ ] commit + push + tag `v0.1.0-rc.2` 并触发 Action
+- [ ] 从 rc.2 release 再验一次 x86/RISC-V 资产
 - [ ] 在目标 SBC 上真实安装 + systemd 启动（待上板）
+
+### 后续（S1 未覆盖）
+
+- [ ] 结果查询 HTTP 化：`GET /api/results`、`GET /api/results/{id}/wrong`
+      （目前仍需主机侧 CLI 读 SQLite）
+- [ ] 逐词生成进度（给 `RenderOptions` 加回调）
+- [ ] 生成任务持久化（当前仅内存，重启后丢失；靠 cache/manifest 幂等恢复）
+- [ ] `install.sh` 增加 `/usr/local/bin` symlink（仅本机 CLI 便利，agent 不需要）
 
 ---
 
@@ -295,6 +320,46 @@ release 构建通过。
   实测安装成功；二进制 `dictation 0.1.0-rc.1`，LICENSE/skill/deploy/web 均安装，
   权限 2775/0750/600 正确。
 - 待办：在目标 SBC 上真实执行（systemd、开机自启、手机访问）。
+
+### 2026-11-06（S1：agent 走 HTTP + 密钥收口）
+
+背景：agent 的 fs 白名单很窄，`/usr/local/bin` 的软链接会被 `realpath` 解析后
+拒绝；同时 TTS key 原本既不属于服务（旧 `serve` 不生成），也不属于 CLI
+（`/etc/dictation/env` 是 0600 root）。改成服务端生成后两个问题一起消失。
+
+- 文档先行：`docs/P1-CONTRACT.md` 新增「P2 服务端生成」契约（4 端点、
+  状态机、鉴权、并发、保留策略）；`AGENTS.md` D13/D13b、架构图、目录、
+  env、开发约定同步；skill 全面改为 HTTP 流程；README/INSTALL/
+  `deploy/env.example`/unit 同步。
+- `src/lesson/import.rs`：把 CLI 的校验与落盘抽成 `lesson::import`，
+  CLI 与 HTTP 共用；`ImportOutcome` 分离 `dir_name`（可外发）与 `dir_path`。
+- `src/server/mod.rs`：`build_router()` 可无 socket 构建；新增
+  `POST /api/lessons`、`POST /api/lessons/{id}/generate`、
+  `GET /api/jobs/{id}`、`POST /api/lessons/{id}/generate/cancel`。
+  内存 job 表 + 串行信号量（并发 1）+ 队列上限 4；
+  `manifest.json` 比词表新则 `skipped`；同课进行中复用同一 job。
+- 鉴权：`DICTATION_API_TOKEN` 可选；常量时间比较；**鉴权先于 body 解析**，
+  坏 body 不再返回 axum 纯文本 415/400。
+- `src/config.rs`：`read_secret` 优先读 `$CREDENTIALS_DIRECTORY/<NAME>`，
+  回退环境变量；unit 里提供注释掉的 `LoadCredential` 用法。
+- `install.sh`：`EFFECTIVE_BASE` 以已装 `config.toml` 的 `[paths].base` 为准，
+  `--data-root` 只影响新装；unit `ReadWritePaths`、数据目录、`useradd --home`
+  跟随配置；冲突时打印迁移步骤。
+- 验证：143 tests（lib 134 + bin 9）、fmt/clippy、JS、`bash -n`、
+  x86 与 riscv64 构建通过；用 release 二进制实测导入→生成→轮询→跳过、
+  401 优先级、路径穿越 400、绝对路径不外泄。
+- 已删除 `v0.1.0-rc.1` 的 release 与 tag。
+
+### 2026-11-06（v0.1.0-rc.2：--data-root）
+
+- `install.sh` 新增 `--data-root <dir>`，默认 `/srv/dictation`，支持
+  `/var/lib/dictation`。
+- 新生成的 `config.toml` 的 `paths.base`、managed unit 的 `ReadWritePaths`
+  自动使用该目录；已有 config/unit/data 保留。
+- 本地 mock release 实测：
+  `--root ... --data-root /var/lib/dictation --no-systemd` 安装成功，
+  config base 与 unit ReadWritePaths 均为 `/var/lib/dictation`，二次安装配置不变。
+- 版本 `0.1.0-rc.2`；待 commit + tag 发布。
 
 ### 2026-11-06（v0.1.0-rc.1 发布准备）
 

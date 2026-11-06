@@ -285,6 +285,7 @@ async fn main() -> Result<()> {
                 lessons_dir: dir.unwrap_or_else(|| app.lessons_dir.clone()),
                 web_dir: web.unwrap_or_else(|| app.web_dir.clone()),
                 data_path: data.unwrap_or_else(|| app.db_path()),
+                cache_dir: app.cache_dir.clone(),
                 host: host.unwrap_or_else(|| app.host.clone()),
                 port: port.unwrap_or(app.port),
             };
@@ -682,15 +683,6 @@ struct ImportPayload {
     force: bool,
 }
 
-#[derive(Debug)]
-struct ImportOutcome {
-    dir: PathBuf,
-    title: String,
-    item_count: usize,
-    total_ms: u32,
-    created: bool,
-}
-
 fn cmd_lesson_import(app: &AppConfig, options: ImportOptions) -> Result<()> {
     let json = options.json;
     match import_lesson(app, options) {
@@ -699,7 +691,7 @@ fn cmd_lesson_import(app: &AppConfig, options: ImportOptions) -> Result<()> {
                 println!(
                     "{}",
                     serde_json::to_string(&json!({
-                        "dir": outcome.dir.display().to_string(),
+                        "dir": outcome.dir_path.display().to_string(),
                         "title": outcome.title,
                         "item_count": outcome.item_count,
                         "total_ms": outcome.total_ms,
@@ -712,7 +704,7 @@ fn cmd_lesson_import(app: &AppConfig, options: ImportOptions) -> Result<()> {
                     if outcome.created { "导入" } else { "覆盖" },
                     outcome.title
                 );
-                println!("  目录：{}", outcome.dir.display());
+                println!("  目录：{}", outcome.dir_path.display());
                 println!(
                     "  {} 条，预计 {}（{} ms）",
                     outcome.item_count,
@@ -731,7 +723,9 @@ fn cmd_lesson_import(app: &AppConfig, options: ImportOptions) -> Result<()> {
     }
 }
 
-fn import_lesson(app: &AppConfig, options: ImportOptions) -> Result<ImportOutcome> {
+/// Thin CLI wrapper around [`lesson::import::import`]; the validation and
+/// file-writing logic is shared with the HTTP API.
+fn import_lesson(app: &AppConfig, options: ImportOptions) -> Result<lesson::import::ImportOutcome> {
     let (title, dir_arg, text, toml_text, force) = match options.payload.as_deref() {
         Some(spec) => {
             if options.title.is_some()
@@ -767,117 +761,16 @@ fn import_lesson(app: &AppConfig, options: ImportOptions) -> Result<ImportOutcom
         }
     };
 
-    let title = title.trim().to_string();
-    if title.is_empty() {
-        bail!("title 不能为空");
-    }
-    if text.trim().is_empty() {
-        bail!("text 不能为空（去掉空行后没有任何词条）");
-    }
-
-    let dir_name = match dir_arg {
-        Some(dir) => {
-            let dir = dir.trim().to_string();
-            app_config::validate_dir_name(&dir)?;
-            dir
-        }
-        None => app_config::safe_dir_name(&title),
-    };
-    let target = app_config::resolve_lesson_dir(&app.lessons_dir, &dir_name)?;
-
-    // Validate the payload before touching the filesystem.
-    let lesson = lesson::parse_with_toml(
-        &text,
-        &target.join("lesson.txt"),
-        Some(&title),
-        toml_text.as_deref(),
-    )?;
-
-    let existed = target.exists();
-    if existed && !force {
-        bail!(
-            "课时已存在：{}（加 --force 覆盖，或换一个 --dir）",
-            target.display()
-        );
-    }
-
-    fs::create_dir_all(&app.lessons_dir)
-        .with_context(|| format!("创建课时根目录失败: {}", app.lessons_dir.display()))?;
-    fs::create_dir_all(&target)
-        .with_context(|| format!("创建课时目录失败: {}", target.display()))?;
-
-    let root = fs::canonicalize(&app.lessons_dir)
-        .with_context(|| format!("解析课时根目录失败: {}", app.lessons_dir.display()))?;
-    let canonical_target = fs::canonicalize(&target)
-        .with_context(|| format!("解析课时目录失败: {}", target.display()))?;
-    if !canonical_target.starts_with(&root) {
-        bail!("目标目录不在课时根目录下：{}", target.display());
-    }
-
-    let mut body = String::new();
-    let text_body = text.strip_prefix('\u{feff}').unwrap_or(&text);
-    // Persist the title as a heading so `lesson plan/gen` (which parse the file
-    // later) see the same title the agent imported.
-    let heading = format!("# {title}");
-    let first_line = text_body
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .map(|line| line.trim().to_string());
-    if first_line.as_deref() != Some(heading.as_str()) {
-        body.push_str(&heading);
-        body.push_str("\n\n");
-    }
-    body.push_str(text_body);
-    if !body.ends_with('\n') {
-        body.push('\n');
-    }
-    write_atomic(&canonical_target.join("lesson.txt"), body.as_bytes())?;
-
-    let toml_path = canonical_target.join("lesson.toml");
-    match toml_text.as_deref().filter(|raw| !raw.trim().is_empty()) {
-        Some(raw) => {
-            let mut toml_body = raw.to_string();
-            if !toml_body.ends_with('\n') {
-                toml_body.push('\n');
-            }
-            write_atomic(&toml_path, toml_body.as_bytes())?;
-        }
-        None => {
-            if toml_path.exists() {
-                fs::remove_file(&toml_path)
-                    .with_context(|| format!("删除旧 lesson.toml 失败: {}", toml_path.display()))?;
-            }
-        }
-    }
-
-    let item_count = lesson.items.len();
-    let total_ms = plan::estimate(&lesson).total_ms;
-
-    Ok(ImportOutcome {
-        dir: canonical_target,
-        title: lesson.title,
-        item_count,
-        total_ms,
-        created: !existed,
-    })
-}
-
-/// Write through a unique temp file + rename, so a crash never leaves a
-/// half-written lesson behind.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path.parent().context("目标路径没有父目录")?;
-    let name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| "lesson".to_string());
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let tmp = parent.join(format!(".{name}.tmp-{}", &short[..8]));
-    fs::write(&tmp, bytes).with_context(|| format!("写入失败: {}", tmp.display()))?;
-    if let Err(err) = fs::rename(&tmp, path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(err).with_context(|| format!("写入失败: {}", path.display()));
-    }
-    Ok(())
+    lesson::import::import(
+        &app.lessons_dir,
+        lesson::import::ImportRequest {
+            title: Some(title),
+            text,
+            toml: toml_text,
+            dir: dir_arg,
+            force,
+        },
+    )
 }
 
 fn read_input(spec: &str) -> Result<String> {
@@ -1462,7 +1355,11 @@ mod tests {
         path
     }
 
-    fn import(app: &AppConfig, payload_path: &Path, force: bool) -> Result<ImportOutcome> {
+    fn import(
+        app: &AppConfig,
+        payload_path: &Path,
+        force: bool,
+    ) -> Result<lesson::import::ImportOutcome> {
         import_lesson(
             app,
             ImportOptions {
@@ -1488,18 +1385,18 @@ mod tests {
         assert_eq!(outcome.item_count, 2);
         assert!(outcome.total_ms > 0);
         assert_eq!(
-            outcome.dir,
+            outcome.dir_path,
             app.lessons_dir.join("第5课").canonicalize().unwrap()
         );
 
-        let lesson_text = fs::read_to_string(outcome.dir.join("lesson.txt")).unwrap();
+        let lesson_text = fs::read_to_string(outcome.dir_path.join("lesson.txt")).unwrap();
         assert!(
             lesson_text.starts_with("# 第5课\n\n摇晃\n粗壮\n"),
             "title is persisted as a heading: {lesson_text:?}"
         );
-        let toml_text = fs::read_to_string(outcome.dir.join("lesson.toml")).unwrap();
+        let toml_text = fs::read_to_string(outcome.dir_path.join("lesson.toml")).unwrap();
         assert!(toml_text.contains("rate = 0.9"));
-        let parsed = lesson::parse_file(&outcome.dir.join("lesson.txt")).unwrap();
+        let parsed = lesson::parse_file(&outcome.dir_path.join("lesson.txt")).unwrap();
         assert_eq!(parsed.title, "第5课");
         assert_eq!(parsed.config.gap_ms, 2_000);
     }
@@ -1560,8 +1457,8 @@ mod tests {
         let app = app_config(temp.path());
         let payload = write_payload(temp.path(), r#"{"title":"第6课/上","text":"窗户\n操场\n"}"#);
         let outcome = import(&app, &payload, false).unwrap();
-        assert!(outcome.dir.ends_with("第6课_上"));
-        assert!(outcome.dir.starts_with(&app.lessons_dir));
+        assert!(outcome.dir_path.ends_with("第6课_上"));
+        assert!(outcome.dir_path.starts_with(&app.lessons_dir));
     }
 
     #[test]

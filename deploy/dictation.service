@@ -11,6 +11,8 @@ User=dictation
 Group=dictation
 WorkingDirectory=/opt/dictation
 EnvironmentFile=-/etc/dictation/env
+# 可选、更严格：密钥不进 environ，也不传给子进程
+# LoadCredential=DOUBAO_API_KEY:/etc/dictation/credentials/doubao_api_key
 ExecStart=/opt/dictation/dictation --config /etc/dictation/config.toml serve
 Restart=on-failure
 RestartSec=2

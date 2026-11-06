@@ -8,11 +8,11 @@
 
 ## 测试版安装（发布包）
 
-版本使用 `-rc.x` 表示非正式测试版，例如 `v0.1.0-rc.1`。
+版本使用 `-rc.x` 表示非正式测试版，例如 `v0.1.0-rc.2`。
 ```bash
 # 指定测试版
-curl -fsSL https://github.com/babydragon/dictation/releases/download/v0.1.0-rc.1/install.sh \
-  | sudo bash -s -- --version v0.1.0-rc.1
+curl -fsSL https://github.com/babydragon/dictation/releases/download/v0.1.0-rc.2/install.sh \
+  | sudo bash -s -- --version v0.1.0-rc.2
 
 # 最新正式版
 curl -fsSL https://github.com/babydragon/dictation/releases/latest/download/install.sh \
@@ -26,6 +26,12 @@ curl -fsSL https://github.com/babydragon/dictation/releases/latest/download/inst
 - 安装到 `/opt/dictation`、`/srv/dictation`、`/etc/dictation`；
 - 保留已有 `config.toml`、env、课时和数据库；
 - 安装/更新 systemd unit 并重启服务。
+
+数据目录默认 `/srv/dictation`；如果更喜欢 FHS 的服务状态目录，可以：
+
+```bash
+... | sudo bash -s -- --version v0.1.0-rc.2 --data-root /var/lib/dictation
+```
 
 `--dry-run` 只下载/校验并打印计划，不写系统；`--no-systemd` 跳过服务安装。
 详见 [`INSTALL.md`](INSTALL.md)。
@@ -150,7 +156,35 @@ cargo run -- serve
 
 演示课时：`lessons/第5课`（20 词，约 3:24）。这是运行时数据，不会提交到仓库。
 
-> 服务默认监听 `0.0.0.0`，仅限家庭局域网使用；没有账号/鉴权，不要暴露到公网。
+> 服务默认监听 `0.0.0.0`，仅限家庭局域网使用；没有账号体系，不要暴露到公网。
+> 需要时可用 `DICTATION_API_TOKEN` 保护导入/生成接口。
+
+## HTTP API（agent 用）
+
+`serve` 同时是 agent 的唯一入口：导入词表、生成音频、查进度都走 HTTP，
+agent 不需要文件系统权限，也不需要 `dictation` 在 PATH 里。
+
+```bash
+API=http://127.0.0.1:8080
+
+curl -sS "$API/api/health"
+
+# 导入（201 新建 / 200 覆盖 / 409 已存在）
+curl -sS -X POST "$API/api/lessons" -H 'content-type: application/json' -d '{
+  "title": "第5课",
+  "text": "摇晃\n粗壮\n毕竟\n",
+  "toml": "rate = 0.9\ngap = \"6s\"\n"
+}'
+
+# 生成（202 返回 job_id；已是最新则 skipped）
+curl -sS -X POST "$API/api/lessons/第5课/generate" -H 'content-type: application/json' -d '{"full_track": true}'
+
+# 轮询
+curl -sS "$API/api/jobs/<job_id>"
+```
+
+设置 `DICTATION_API_TOKEN` 后，写操作需带 `X-Dictation-Token`。
+完整契约见 [`docs/P1-CONTRACT.md`](docs/P1-CONTRACT.md)。
 
 ## 命令
 
@@ -161,13 +195,14 @@ cargo run -- serve
 | `dictation new "第5课"` | 生成词表模板 |
 | `dictation serve` | 启动局域网播放器 + 自检/错词复习 |
 | `dictation config show` | 显示解析后的路径/server 配置 |
-| `dictation lesson import --payload -` | agent 从 stdin 交 JSON，CLI 写入配置目录 |
+| `dictation lesson import --payload -` | 主机侧导入（运维/调试；agent 改用 HTTP） |
 | `dictation lesson plan/gen/list` | 按 title 预览/生成/列课时 |
 | `dictation result list/show/wrong` | 查最近听写、逐项结果、错词 JSON |
 | `dictation clean --unused [--apply]` | 清未引用缓存；默认 dry-run |
 
-`/etc/dictation/config.toml` 管理 `paths`/`server`；agent 不直接读写主机目录，
-通过 `lesson import` 交给 CLI。详见 [`INSTALL.md`](INSTALL.md) 和
+`/etc/dictation/config.toml` 管理 `paths`/`server`。**agent 通过 HTTP API 写入**
+（`POST /api/lessons`、`POST /api/lessons/{id}/generate`），不 exec CLI、
+不读写主机目录；CLI 保留为运维入口。详见 [`INSTALL.md`](INSTALL.md) 和
 [`skills/dictation-prep/SKILL.md`](skills/dictation-prep/SKILL.md)。
 
 ## License

@@ -18,11 +18,15 @@
 
 | 范围 | 文件 |
 |---|---|
-| 服务端 | `Cargo.toml`、`src/lib.rs`、`src/main.rs`、`src/db.rs`、`src/server/mod.rs` |
+| 服务端 | `Cargo.toml`、`src/lib.rs`、`src/main.rs`、`src/db.rs`、`src/server/mod.rs`、`src/lesson/import.rs` |
 | 前端 | `web/index.html`、`web/style.css`、`web/app.js`、`web/manifest.webmanifest` |
 | 契约/文档 | `docs/P1-CONTRACT.md`、`AGENTS.md`、`README.md` |
 
 服务端与前端不要互相修改对方的文件。
+
+服务端写权限：`serve` 除读 `lessons/` 外，还会**写** `lessons/<课时>/`（导入与
+生成）和 `cache/`；`data/` 由服务独占。systemd `ReadWritePaths` 必须等于
+`config.toml` 的 `paths.base`。
 
 ## 服务端 CLI
 
@@ -206,6 +210,121 @@ CREATE TABLE IF NOT EXISTS review_state (
 - `GET /app.js`、`/style.css`、`/manifest.webmanifest` 等 → 对应文件。
 - API 与 `/media` 优先于静态 fallback。
 
+## P2 服务端生成（S1）
+
+agent 不再持有 TTS 密钥、也不再需要文件系统权限：导入与合成全部走 HTTP，
+密钥只存在于 `serve` 进程。
+
+### 鉴权
+
+- `DICTATION_API_TOKEN` **未设置**：写操作开放（家庭局域网默认）。
+- **设置后**：下列端点要求请求头 `X-Dictation-Token: <token>`；缺失或不符返回
+  `401 {"error":"未授权"}`。`GET` 端点不需要。
+- 比较必须等长且常量时间；不要把 token 写进日志。
+- 鉴权先于请求体解析：缺少/错误 token 时，即使 body 非法或 Content-Type 不对，也返回 401。
+- 受保护端点：
+  - `POST /api/lessons`
+  - `POST /api/lessons/{id}/generate`
+  - `POST /api/lessons/{id}/generate/cancel`
+
+### `POST /api/lessons`
+
+body 与 CLI `lesson import --payload` 的 JSON 相同：
+
+```json
+{
+  "title": "第5课 词语听写",
+  "dir": "第5课",
+  "text": "摇晃\n粗壮\n毕竟\n",
+  "toml": "rate = 0.9\ngap = \"6s\"\n",
+  "force": false
+}
+```
+
+- 校验规则与 CLI 完全一致（共用 `lesson::import`）：`title` 必填、`text` 非空、
+  单条 ≤200 字符、重复词保留首次并 warn、`dir` 生成安全目录名。
+- 成功：`201`（新建）/ `200`（`force=true` 覆盖）
+
+```json
+{ "created": true, "dir": "第5课", "title": "第5课 词语听写", "item_count": 20 }
+```
+
+- `dir` 是**相对目录名**，不返回主机绝对路径。
+- 已存在且 `force=false` → `409 {"error":"课时已存在","dir":"第5课"}`。
+- 校验失败 → `400 {"error":"..."}`。
+
+### `POST /api/lessons/{id}/generate`
+
+`{id}` 解析顺序：先按 `lessons/` 下的**目录名**精确匹配；匹配不到再按 12 位
+`lessons.id` 查 DB。两种都匹配不到 → `404`。
+
+body 全部可选：
+
+```json
+{ "force": false, "full_track": true, "provider": "doubao" }
+```
+
+空 body 视为默认值；非空 body 一律按 JSON 解析，忽略请求声明的 Content-Type。
+解析失败返回 `400 {"error":"请求体无效：..."}`。
+
+- `provider` 省略时用 `DICTATION_PROVIDER`（默认 `qwen`）。
+- `force=false` 且 `manifest.json` 比 `lesson.txt`/`lesson.toml` 新 →
+  不重新合成，直接：
+
+```json
+{ "job_id": null, "status": "done", "skipped": true, "lesson": "第5课" }
+```
+
+- 已存在 `queued`/`running` 的同课任务 → 返回同一个 `job_id`，不重复计费。
+- 否则入队，`202`：
+
+```json
+{ "job_id": "6f1c...", "status": "queued", "lesson": "第5课" }
+```
+
+- `503 {"error":"未配置 TTS 密钥（/etc/dictation/env）"}`：`serve` 启动时
+  `Config::from_env()` 拿不到 key。
+- `429 {"error":"生成队列已满"}`：排队上限 4。
+
+### `GET /api/jobs/{job_id}`
+
+```json
+{
+  "job_id": "6f1c...",
+  "status": "running",
+  "lesson": "第5课",
+  "queued_at": "2026-11-06T18:00:00+08:00",
+  "started_at": "2026-11-06T18:00:01+08:00",
+  "finished_at": null,
+  "result": null,
+  "error": null
+}
+```
+
+- `status`：`queued | running | done | error | cancelled`。
+- `done` 时 `result`：
+
+```json
+{ "total_ms": 181160, "tts_calls": 20, "cache_hits": 3, "clips": 23 }
+```
+
+- `error` 时 `error` 是中文单行原因；不返回堆栈。
+- 未知或已过期 job → `404`。
+- job 仅在内存：完成后保留 1 小时，最多 100 条；服务重启后丢失（重触发即可，
+  `cache/` 与 `manifest.json` 已落盘，不会重复计费）。
+
+### `POST /api/lessons/{id}/generate/cancel`
+
+- 只对 `queued` 生效，返回 `{"status":"cancelled"}`。
+- `running` → `409 {"error":"任务已在执行，无法取消"}`。
+- 未知 job/课时 → `404`。
+
+### 并发与资源
+
+- 全局同时只跑 **1** 个生成任务（SBC 双核）；其余排队。
+- 生成在后台 task 中执行，不阻塞其他 API。
+- 完成后无需通知：下次 `GET /api/lessons` 即可看到新课。
+
 ## SessionManifest
 
 服务端返回给播放器的 JSON。课时示例：
@@ -308,6 +427,18 @@ done
   验证 `review_state` 到期时间、创建 review session。
 - 路径穿越测试：`../` 404。
 - 重复 check 409。
+
+P2 生成：
+- `POST /api/lessons`：新建 201、重复 409、`force=true` 200、非法 payload 400；
+  响应里不含绝对路径。
+- `POST /api/lessons/{id}/generate`：mock provider 下 `202` → 轮询到 `done`，
+  `manifest.json` 与 `clips/` 落盘；再触发一次 `skipped=true`；
+- 同课并发触发两次返回同一 `job_id`。
+- 未配置 key（`Config::from_env` 缺 key）→ `503`。
+- `DICTATION_API_TOKEN` 设置后：无 header 401、错误 token 401、正确 token 放行；
+  `GET` 不受影响。
+- `cancel`：排队可取消，running 409。
+- 导入校验与 CLI 共用，同一份 payload 两条路径结果一致。
 
 前端：
 - 用真实服务端手动走一遍：首页 → 播放 → 完成 → 检查 → 提交 → 首页复习入口。

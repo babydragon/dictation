@@ -29,6 +29,11 @@ BASE_URL="${DICTATION_BASE_URL:-}"
 NO_SYSTEMD=0
 DRY_RUN=0
 ROOT_PREFIX=""
+DATA_ROOT="/srv/dictation"
+# 服务实际使用的数据根：优先取已存在 config.toml 的 [paths].base；
+# 只有新装配置时才由 --data-root 决定。install_config 之后解析。
+EFFECTIVE_BASE=""
+DATA_DIR=""
 TMP_DIR=""
 
 log()  { printf '==> %s\n' "$*"; }
@@ -48,8 +53,12 @@ dictation installer
   --base-url <url>      从镜像/本地 HTTP 目录下载（目录内需有资产和 SHA256SUMS）
   --no-systemd          只安装文件，不操作 systemd
   --dry-run             只打印将要执行的操作，不写安装目标（不要求 root）
-  --root <dir>          安装到自定义前缀：<dir>/opt、<dir>/srv、<dir>/etc；
+  --root <dir>          安装到自定义前缀：<dir>/opt、<dir><data-root>、<dir>/etc；
                         同时跳过用户/组和 systemd（用于测试）
+  --data-root <dir>     可写数据根目录，默认 /srv/dictation；只对“新装配置”生效。
+                        若 /etc/dictation/config.toml 已存在，其 [paths].base 优先，
+                        unit 的 ReadWritePaths 会跟随配置（不会改写已有配置）
+                        也可以设为 /var/lib/dictation
   -h, --help            显示本帮助
 
 环境变量:
@@ -79,6 +88,8 @@ while [ $# -gt 0 ]; do
     --dry-run)      DRY_RUN=1; shift ;;
     --root)         require_value "$1" "${2:-}"; ROOT_PREFIX="$2"; shift 2 ;;
     --root=*)       ROOT_PREFIX="${1#*=}"; shift ;;
+    --data-root)    require_value "$1" "${2:-}"; DATA_ROOT="$2"; shift 2 ;;
+    --data-root=*)  DATA_ROOT="${1#*=}"; shift ;;
     -h|--help)      usage; exit 0 ;;
     *)              die "未知参数: $1（用 --help 查看用法）" ;;
   esac
@@ -93,6 +104,18 @@ if [ -n "$ROOT_PREFIX" ]; then
   [ -n "$ROOT_PREFIX" ] || die "--root 不能是 /"
 fi
 
+DATA_ROOT="${DATA_ROOT%/}"
+case "$DATA_ROOT" in
+  /) die "--data-root 不能是 /" ;;
+  /*) ;;
+  *) die "--data-root 需要绝对路径: $DATA_ROOT" ;;
+esac
+case "$DATA_ROOT" in
+  *"/../"*|*"/.."|*" "*|*$'\t'*) die "--data-root 不能包含 .. 或空白: $DATA_ROOT" ;;
+esac
+[[ "$DATA_ROOT" =~ ^/[A-Za-z0-9._/-]+$ ]] \
+  || die "--data-root 只支持字母、数字、._/-: $DATA_ROOT"
+
 if [ "$DRY_RUN" -eq 0 ] && [ -z "$ROOT_PREFIX" ] && [ "$(id -u)" -ne 0 ]; then
   die "安装需要 root；请用 sudo 运行，或先用 --root <dir> / --dry-run 预览"
 fi
@@ -103,7 +126,7 @@ if [ -n "$ROOT_PREFIX" ]; then
 fi
 
 OPT_DIR="$ROOT_PREFIX/opt/dictation"
-SRV_DIR="$ROOT_PREFIX/srv/dictation"
+# DATA_DIR 依赖 EFFECTIVE_BASE（install_config 之后才能确定），见 resolve_effective_base。
 ETC_DIR="$ROOT_PREFIX/etc/dictation"
 UNIT_DIR="$ROOT_PREFIX/etc/systemd/system"
 UNIT_FILE="$UNIT_DIR/dictation.service"
@@ -123,6 +146,65 @@ run() {
   else
     "$@"
   fi
+}
+
+# 数据根必须是绝对路径、不含 .. 和空白，且字符集受限（与 --data-root 一致）。
+validate_base_path() {
+  local p="$1"
+  [ -n "$p" ] || return 1
+  case "$p" in
+    /) return 1 ;;
+    /*) ;;
+    *) return 1 ;;
+  esac
+  case "$p" in
+    *"/../"*|*"/.."|*" "*|*$'\t'*) return 1 ;;
+  esac
+  [[ "$p" =~ ^/[A-Za-z0-9._/-]+$ ]] || return 1
+  return 0
+}
+
+# parse_config_base <config.toml>
+# 打印 [paths] 段里的 base 值；解析不到则打印空。
+# 容错：CRLF、注释、单/双引号、行尾空白、base 位于同段其他键之后。
+parse_config_base() {
+  local file="$1"
+  [ -f "$file" ] || return 0
+  awk -v sq="'" '
+    function trim(s) { sub(/^[ \t\r]+/, "", s); sub(/[ \t\r]+$/, "", s); return s }
+    function unquote(v,   q, i) {
+      v = trim(v)
+      q = substr(v, 1, 1)
+      if (q == "\"" || q == sq) {
+        v = substr(v, 2)
+        i = index(v, q)
+        if (i > 0) v = substr(v, 1, i - 1)
+        return trim(v)
+      }
+      sub(/[ \t]*#.*$/, "", v)
+      return trim(v)
+    }
+    {
+      sub(/\r$/, "")
+      t = trim($0)
+    }
+    t == "" || t ~ /^#/ { next }
+    t ~ /^\[/ {
+      sect = t
+      sub(/^\[[ \t]*/, "", sect)
+      sub(/[ \t]*\].*$/, "", sect)
+      sect = trim(sect)
+      next
+    }
+    # 只认顶层或 [paths] 段；其他段的 base 忽略。
+    sect != "" && sect != "paths" { next }
+    t ~ /^base[ \t]*=/ {
+      v = t
+      sub(/^base[ \t]*=[ \t]*/, "", v)
+      v = unquote(v)
+      if (v != "") print v
+    }
+  ' "$file" 2>/dev/null | tail -n1
 }
 
 group_exists() {
@@ -321,7 +403,8 @@ ensure_user() {
   if id -u dictation >/dev/null 2>&1; then
     log "用户 dictation 已存在"
   else
-    run useradd --system --gid dictation --home /srv/dictation \
+    [ -n "$EFFECTIVE_BASE" ] || die "内部错误：EFFECTIVE_BASE 未初始化"
+    run useradd --system --gid dictation --home "$EFFECTIVE_BASE" \
       --shell /usr/sbin/nologin dictation
   fi
   if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
@@ -378,7 +461,14 @@ install_config() {
   if [ -e "$ETC_DIR/config.toml" ]; then
     log "保留现有配置: $ETC_DIR/config.toml"
   else
-    run install -m 0644 "$SRC/deploy/config.example" "$ETC_DIR/config.toml"
+    if [ "$DATA_ROOT" = "/srv/dictation" ]; then
+      run install -m 0644 "$SRC/deploy/config.example" "$ETC_DIR/config.toml"
+    else
+      # 替换整行 base（容忍引号/空白变化），而不是只匹配默认值。
+      sed -E "s|^[[:space:]]*base[[:space:]]*=.*\$|base = \"$DATA_ROOT\"|" \
+        "$SRC/deploy/config.example" > "$TMP_DIR/config.toml"
+      run install -m 0644 "$TMP_DIR/config.toml" "$ETC_DIR/config.toml"
+    fi
     log "已安装 $ETC_DIR/config.toml（请按需编辑）"
   fi
 
@@ -390,11 +480,58 @@ install_config() {
   fi
 }
 
+# 确定服务真正会用的数据根：已有配置的 [paths].base 优先于 --data-root。
+# 之后 unit 的 ReadWritePaths、数据目录、useradd --home、汇总都基于它，
+# 保证 unit 与 config 永不打架（ProtectSystem=strict 下写不进去）。
+resolve_effective_base() {
+  local cfg="$ETC_DIR/config.toml" parsed=""
+
+  EFFECTIVE_BASE="$DATA_ROOT"
+
+  if [ -e "$cfg" ]; then
+    parsed="$(parse_config_base "$cfg" || true)"
+    if [ -z "$parsed" ]; then
+      warn "无法从 $cfg 解析 [paths].base；回退到 --data-root $EFFECTIVE_BASE"
+      warn "请手动确认 $cfg 的 [paths].base 与 unit 的 ReadWritePaths 一致"
+    elif validate_base_path "$parsed"; then
+      EFFECTIVE_BASE="$parsed"
+      if [ "$parsed" != "$DATA_ROOT" ]; then
+        warn "现有配置的 [paths].base = \"$parsed\" 与 --data-root $DATA_ROOT 不一致"
+        warn "以现有配置为准：数据目录和 unit ReadWritePaths 都使用 $parsed（不改写配置）"
+        warn "如需迁移到 $DATA_ROOT："
+        warn "  1) systemctl stop dictation"
+        warn "  2) rsync -aHAX --numeric-ids $parsed/ $DATA_ROOT/"
+        warn "  3) 编辑 $cfg，把 [paths].base 改为 \"$DATA_ROOT\""
+        warn "  4) 重新运行本安装脚本（省略 --data-root 即可）"
+      fi
+    else
+      warn "配置中的 base 不可用（需绝对路径、无 .. 和空白）: '$parsed'"
+      warn "回退到 --data-root $EFFECTIVE_BASE；请手动修正 $cfg"
+    fi
+  fi
+
+  if [ -n "$ROOT_PREFIX" ]; then
+    DATA_DIR="$ROOT_PREFIX$EFFECTIVE_BASE"
+  else
+    DATA_DIR="$EFFECTIVE_BASE"
+  fi
+
+  local src_desc="--data-root"
+  if [ -e "$cfg" ]; then
+    src_desc="配置 [paths].base"
+  fi
+  log "数据根: $EFFECTIVE_BASE（来自 $src_desc）"
+}
+
 install_unit() {
   log "安装 systemd unit"
+  [ -n "$EFFECTIVE_BASE" ] || die "内部错误：EFFECTIVE_BASE 未初始化"
+  local unit_src="$TMP_DIR/dictation.service"
+  sed "s|/srv/dictation|$EFFECTIVE_BASE|g" "$SRC/deploy/dictation.service" > "$unit_src"
+
   if [ ! -e "$UNIT_FILE" ]; then
     run install -d -m 0755 "$UNIT_DIR"
-    run install -m 0644 "$SRC/deploy/dictation.service" "$UNIT_FILE"
+    run install -m 0644 "$unit_src" "$UNIT_FILE"
     log "已安装 $UNIT_FILE"
     return 0
   fi
@@ -403,7 +540,7 @@ install_unit() {
   first="$(head -n1 "$UNIT_FILE" 2>/dev/null || true)"
   case "$first" in
     *"$UNIT_MARKER"*)
-      run install -m 0644 "$SRC/deploy/dictation.service" "$UNIT_FILE"
+      run install -m 0644 "$unit_src" "$UNIT_FILE"
       log "已更新 managed unit: $UNIT_FILE"
       ;;
     *)
@@ -413,20 +550,21 @@ install_unit() {
 }
 
 install_data_dirs() {
-  log "准备数据目录 $SRV_DIR"
-  run install -d -m 0755 "$SRV_DIR"
-  run install -d -m 2775 "$SRV_DIR/lessons"
-  run install -d -m 2775 "$SRV_DIR/cache"
-  run install -d -m 0750 "$SRV_DIR/data"
+  [ -n "$DATA_DIR" ] || die "内部错误：DATA_DIR 未初始化"
+  log "准备数据目录 $DATA_DIR"
+  run install -d -m 0755 "$DATA_DIR"
+  run install -d -m 2775 "$DATA_DIR/lessons"
+  run install -d -m 2775 "$DATA_DIR/cache"
+  run install -d -m 0750 "$DATA_DIR/data"
 
   if [ -n "$ROOT_PREFIX" ]; then
     log "跳过数据目录 chown（--root 模式）"
   elif id -u dictation >/dev/null 2>&1; then
-    run chown -R dictation:dictation "$SRV_DIR"
-    run chmod 2775 "$SRV_DIR/lessons" "$SRV_DIR/cache"
-    run chmod 0750 "$SRV_DIR/data"
+    run chown -R dictation:dictation "$DATA_DIR"
+    run chmod 2775 "$DATA_DIR/lessons" "$DATA_DIR/cache"
+    run chmod 0750 "$DATA_DIR/data"
   else
-    warn "用户 dictation 不存在，跳过 chown；请手动修正 $SRV_DIR 属主"
+    warn "用户 dictation 不存在，跳过 chown；请手动修正 $DATA_DIR 属主"
   fi
 }
 
@@ -482,9 +620,10 @@ health_check() {
   return 0
 }
 
-ensure_user
 install_files
 install_config
+resolve_effective_base
+ensure_user
 install_unit
 install_data_dirs
 setup_systemd
@@ -494,7 +633,8 @@ log "完成"
 printf '\n'
 printf '程序:   %s\n' "$OPT_DIR/dictation"
 printf '配置:   %s\n' "$ETC_DIR/config.toml"
-printf '数据:   %s\n' "$SRV_DIR"
+printf '数据根: %s\n' "$EFFECTIVE_BASE"
+printf '数据:   %s\n' "$DATA_DIR"
 printf '前端:   http://<本机IP>:8080\n'
 printf '\n'
 printf '下一步:\n'

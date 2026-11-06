@@ -1,66 +1,71 @@
 ---
 name: dictation-prep
-description: 把老师消息、课本照片、杂乱词表整理成 dictation 项目可用的课时，并通过 CLI 交给主机写入；也可查询听写结果、提取错词做记忆分析、清理 TTS 缓存。用于“准备听写”“整理词表”“生成听写音频”“分析错词”“看听写结果”“清理缓存”等场景。
+description: 把老师消息、课本照片、杂乱词表整理成 dictation 项目可用的课时，并通过 dictation 服务的 HTTP API 导入词表、触发音频生成；也可查询听写结果、提取错词做记忆分析、清理 TTS 缓存。用于“准备听写”“整理词表”“生成听写音频”“分析错词”“看听写结果”“清理缓存”等场景。
 ---
 
-# 听写词表准备（CLI 导入版）
+# 听写词表准备（HTTP API 版）
 
 你的任务不是教孩子，而是把家长手里的**原始材料**变成 `dictation` 能吃的
-**纯文本词表 + 课时设置**，然后通过 CLI 交给主机写入。
+**纯文本词表 + 课时设置**，然后通过 `serve` 的 HTTP API 导入并生成。
 
-> **不要用文件工具直接读写 `/srv`、`/opt` 或主机上的任何路径。**
-> agent 可能在沙箱里，没有主机目录权限。所有写入都通过 `dictation lesson import`
-> 完成；CLI 会按 `/etc/dictation/config.toml`（或 `DICTATION_CONFIG`）解析路径。
+> **不要执行 CLI，不要用文件工具读写主机路径。**
+> agent 通常在沙箱里，文件白名单很窄；`/usr/local/bin` 的软链接也会被
+> `realpath` 解析成 `/opt/dictation/...` 后被拒绝。所有操作只走 HTTP，
+> 落盘由服务进程负责。
 
-## 输入
+## 服务地址与鉴权
 
-- 老师发的微信文字，带“1. 2. 3.”、“读两遍”、“听写第5课”等。
-- 课本/作业本照片（你有视觉能力时直接读）。
-- 家长随口列的一串词。
-- 已经整理好的列表，但格式混乱。
+- 默认 `http://127.0.0.1:8080`；服务在另一台机器时问家长要局域网地址。
+- 可用 `DICTATION_API_URL` 覆盖（含协议和端口，不带结尾 `/`）。
+- 服务端若设置了 `DICTATION_API_TOKEN`，写操作需要请求头
+  `X-Dictation-Token: <token>`。**只在本次会话的内存里用**：
+  不要写进文件、不要回显到聊天、不要提交到仓库。
 
 ## 输出方式
 
-CLI 会把内容写到配置里的 `lessons` 目录，并返回实际路径。你不需要知道
-`/srv/dictation` 是否存在，也不需要 `mkdir`。
+三步：导入 → 生成 → 轮询。
 
 ```bash
-dictation lesson import --payload - --json
+API="${DICTATION_API_URL:-http://127.0.0.1:8080}"
+AUTH=()
+[ -n "${DICTATION_API_TOKEN:-}" ] && AUTH=(-H "X-Dictation-Token: $DICTATION_API_TOKEN")
+
+# 1. 导入：201 新建 / 200 覆盖 / 409 已存在
+curl -sS -X POST "$API/api/lessons" "${AUTH[@]}" \
+  -H 'content-type: application/json' -d @payload.json
+
+# 2. 生成：202 返回 job_id；已是最新则 {"status":"done","skipped":true}
+curl -sS -X POST "$API/api/lessons/第5课/generate" "${AUTH[@]}" \
+  -H 'content-type: application/json' -d '{"full_track": true}'
+
+# 3. 轮询：queued → running → done/error
+curl -sS "$API/api/jobs/<job_id>"
 ```
 
-stdin 是一个 JSON：
+`payload.json`：
 
 ```json
 {
   "title": "第5课 词语听写",
-  "dir": "第5课",                     // 可选；不给则从 title 生成安全目录名
+  "dir": "第5课",
   "text": "摇晃\n粗壮\n毕竟\n",
   "toml": "rate = 0.9\ngap = \"6s\"\nrepeat = 2\n",
   "force": false
 }
 ```
 
-- `text`：**一行一个词**，保持老师给的顺序；不要加标题行（CLI 会写 `# title`）。
+- `text`：**一行一个词**，保持老师给的顺序；不要加标题行（服务端会写 `# title`）。
 - `toml`：可选；不写则用默认设置。字符串里的换行用 `\n`。
-- `force`：默认 `false`；目标课时已存在时 import 会报错。确认要覆盖后再设 `true`。
+- `dir`：可选；不给则从 `title` 生成安全目录名。
+- `force`：默认 `false`；已存在返回 `409 {"error":"课时已存在","dir":"..."}`，
+  确认要覆盖后再设 `true`。
 - 成功返回：
 
 ```json
-{
-  "created": true,
-  "dir": "/srv/dictation/lessons/第5课",
-  "title": "第5课 词语听写",
-  "item_count": 20,
-  "total_ms": 181160
-}
+{ "created": true, "dir": "第5课", "title": "第5课 词语听写", "item_count": 20 }
 ```
 
-如果 `dictation` 不在 PATH，用 `/opt/dictation/dictation`。
-配置不在默认位置时，先让 CLI 通过环境变量找到它：
-
-```bash
-export DICTATION_CONFIG=/path/to/config.toml
-```
+响应里**没有主机绝对路径**，你也不需要知道它在 `/srv` 还是 `/var/lib`。
 
 ## 硬规则
 
@@ -71,8 +76,8 @@ export DICTATION_CONFIG=/path/to/config.toml
 - 英文单词/短语保持原样；不要把英文翻译成中文。
 - 不要自动加拼音；只有家长明确要求时才生成答案纸。
 - 不要自动加 `rate=` / `gap=`；只有明确需要放慢/加长时才加。
-- **不要绕过 CLI 写文件**；不要尝试读取主机路径来“确认一下”。
-- **先 import，后 gen。** import 只写词表/设置，不调 TTS；`gen` 才花钱。
+- **不要绕过 API 写文件**；不要尝试读取主机路径来“确认一下”。
+- **先 import，后 generate。** import 只写词表/设置，不调 TTS；generate 才花钱。
 
 ## 归一化规则
 
@@ -107,7 +112,8 @@ review_cap = 5
 - 默认不逐题播报“第 N 个”。
 - 开场白/结束语由程序按内容语言自动选择（全英文 → 英文，否则中文）；
   不要自己往 `text` 里加题号或结束语。
-- **不要把 `DICTATION_PROVIDER` 写进 `lesson.toml`**；provider 由 CLI 环境/参数决定。
+- **不要把 `DICTATION_PROVIDER` 写进 `lesson.toml`**；provider 由服务端配置
+  （`/etc/dictation/env`）或 generate 请求的 `provider` 字段决定。
 
 需要调整的典型情况：
 
@@ -120,62 +126,72 @@ review_cap = 5
 ## 工作流
 
 1. 读取原始材料，按规则生成 `text` 和可选的 `toml` 字符串。
-2. 可选：先查重/确认已有课时：
+2. 可选：先确认是否已有同名课时：
    ```bash
-   dictation lesson list --json
+   curl -sS "$API/api/lessons"     # { "lessons": [ { "id", "title", "item_count", "total_ms" } ] }
    ```
-3. 把 JSON 通过 stdin 交给 CLI：
+3. 导入：
    ```bash
-   dictation lesson import --payload - --json
+   curl -sS -X POST "$API/api/lessons" "${AUTH[@]}" \
+     -H 'content-type: application/json' -d @payload.json
    ```
    例：
    ```bash
-   printf '%s' '{"title":"第5课","text":"摇晃\n粗壮\n","toml":"rate = 0.9\ngap = \"6s\"\n"}' \
-     | dictation lesson import --payload - --json
+   curl -sS -X POST "$API/api/lessons" \
+     -H 'content-type: application/json' \
+     -d '{"title":"第5课","text":"摇晃\n粗壮\n","toml":"rate = 0.9\ngap = \"6s\"\n"}'
    ```
-4. 把 import 返回的信息用 3–5 行回报给家长：
-   - 实际目录 `dir`
+4. 把导入结果用 3–5 行回报给家长：
+   - 目录名 `dir`（只说名字，不用说绝对路径）
    - 词数 `item_count`
-   - 预计总时长 `total_ms`
    - 是否有重复/超长/疑似多音字
    - 本次 `rate` / `gap` / `repeat`
 5. **等待家长确认。**
-6. 确认后生成音频：
+6. 确认后生成：
    ```bash
-   dictation lesson gen --title "第5课" --provider doubao --full-track
+   curl -sS -X POST "$API/api/lessons/第5课/generate" "${AUTH[@]}" \
+     -H 'content-type: application/json' -d '{"full_track": true}'
    ```
-   - 如果 `title` 带空格/特殊字符，用 `--dir` 指定 import 返回的目录名。
-   - 未配置 API key 时用 `--provider mock` 验证流程，并提醒家长这不是最终音频。
-   - 生成失败（缺 key/网络）时报告错误，不要在聊天里索要 key。
-7. 回报产物：`manifest.json` 路径、`full.mp3`、片段数量、TTS 调用/缓存命中。
+   - 返回 `202 {"job_id":"...","status":"queued"}` → 每 3–5 秒轮询
+     `GET /api/jobs/<job_id>`，直到 `done` 或 `error`。
+   - 返回 `{"status":"done","skipped":true}` → 已是最新，不用重复生成。
+   - 返回 `503` → 服务端没配 TTS 密钥。**不要索要 key**，告诉家长去
+     `/etc/dictation/env` 配置后重启服务。
+   - 想只验证流程：请求里带 `"provider": "mock"`，并提醒家长这不是最终音频。
+7. 回报产物：`total_ms`、`tts_calls`、`cache_hits`；
+   提醒家长前端刷新即可看到新课。
 
-如果 import 报“课时已存在”：
+如果导入报“课时已存在”（`409`）：
 
 - 默认不要覆盖；问家长是否要更新。
-- 确认更新后，重新 import 并在 payload 里设 `"force": true`。
-- 覆盖后需要重新 `lesson gen`，否则音频还是旧的。
+- 确认更新后，重新导入并在 payload 里设 `"force": true`。
+- 覆盖后必须重新 generate，否则音频还是旧的。
 
 ## 更新已有课时
 
 ```bash
-dictation lesson list --json          # 找 title/dir
-dictation lesson import --payload - --json   # force=true
-dictation lesson gen --title "第5课" --provider doubao --full-track
+curl -sS "$API/api/lessons"                                  # 找 title/dir
+curl -sS -X POST "$API/api/lessons" "${AUTH[@]}" ... -d @payload.json   # force=true
+curl -sS -X POST "$API/api/lessons/第5课/generate" "${AUTH[@]}" -d '{}'
 ```
 
-不要用文件工具直接改 `lesson.txt`；所有修改都走 import。
+不要用文件工具直接改 `lesson.txt`；所有修改都走导入 API。
 
-## 在 SBC / 沙箱里运行
+## 在沙箱 / 受限环境里运行
 
-- 只要 agent 能执行 `dictation`，CLI 会以当前用户权限写入配置里的
-  `/srv/dictation/lessons`；agent 不需要主机目录读取权限。
-- 你的用户需要在 `dictation` 组（安装时设置）；加组后重新登录。
-- TTS key 由 CLI 进程的环境提供（例如 `~/.config/dictation/env`）；
-  agent 不要读取或打印 key。
-- 如果沙箱**完全不能执行主机 CLI**，停止，并向家长说明需要在主机侧执行；
-  不要尝试猜路径或用文件工具绕过。
+- 只需要能访问 `http://<主机>:8080`，**不需要**挂载 `/opt/dictation`、
+  不需要 `dictation` 在 PATH、不需要读 `/etc/dictation/config.toml`。
+- 密钥由服务进程持有；你这一侧不需要、也不应该拿到 TTS key。
+- 如果连 HTTP 都不通：停止，告诉家长需要放行服务地址或改用本机 CLI；
+  不要猜路径、不要用文件工具绕过。
+- CLI（`dictation lesson import` / `lesson gen`）是主机侧运维入口，
+  只在家长明确要求本机操作时使用。
 
 ## 查询听写结果 / 分析错词
+
+> **需要主机侧 CLI（读 SQLite）。** 这一块目前还没有 HTTP 端点，只有能访问
+> `data/dictation.db` 的本机进程才能查。在沙箱里时，请家长在主机上执行并把
+> JSON 贴给你，不要试图自己找 DB 路径。
 
 家长说“看下这次听写”“分析一下错词”“为什么这些词老错”时：
 
@@ -210,6 +226,8 @@ dictation result wrong --latest --json
 - 如果 `result list` 为空或 `wrong` 报“还没提交检查”，直接说明，不要编造结果。
 
 ## 清理 TTS 缓存
+
+> **需要主机侧 CLI（写 `cache/`）。** 破坏性操作，默认 dry-run，确认后加 `--apply`。
 
 缓存是内容哈希目录，删掉未引用的条目不会影响已生成课时的 `clips/`。
 **默认是 dry-run，只有 `--apply` 才删。**

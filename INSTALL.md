@@ -10,8 +10,8 @@
 测试版使用 `-rc.x`：
 
 ```bash
-curl -fsSL https://github.com/babydragon/dictation/releases/download/v0.1.0-rc.1/install.sh \
-  | sudo bash -s -- --version v0.1.0-rc.1
+curl -fsSL https://github.com/babydragon/dictation/releases/download/v0.1.0-rc.2/install.sh \
+  | sudo bash -s -- --version v0.1.0-rc.2
 
 # 最新正式版
 curl -fsSL https://github.com/babydragon/dictation/releases/latest/download/install.sh \
@@ -31,11 +31,18 @@ curl -fsSL https://github.com/babydragon/dictation/releases/latest/download/inst
 常用参数：
 
 ```bash
-install.sh --version v0.1.0-rc.1   # 指定 rc
+install.sh --version v0.1.0-rc.2   # 指定 rc
 install.sh --dry-run               # 只下载/校验/打印计划
 install.sh --no-systemd            # 只安装文件，不装服务
 install.sh --repo owner/repo       # 覆盖默认仓库
+install.sh --data-root /var/lib/dictation  # 数据目录改到 /var/lib
 ```
+
+数据目录默认 `/srv/dictation`（`lessons/data/cache`）。
+`/srv` 适合“对外提供的内容”，`/var/lib/dictation` 适合“服务自身状态”；
+两种都支持。`--data-root` 会同时写入新生成的 `config.toml` 和 managed unit 的
+`ReadWritePaths`。已有 `config.toml` 不会被覆盖；如果你之前已经安装到
+`/srv`，想迁移，先停服务，把目录 `rsync` 到新位置，再改 config/unit。
 
 最低要求（服务端）：
 
@@ -54,8 +61,9 @@ install.sh --repo owner/repo       # 覆盖默认仓库
 | A. 本机运行 | 先在电脑上试用、生成课时 | `target/release/dictation` + `web/` |
 | B. SBC 常驻 | 家里手机/平板随时访问 | RISC-V 二进制 + `web/` + `lessons/` + systemd |
 
-推荐分工：**电脑负责 `dictation gen` 生成课时，SBC 只跑 `dictation serve`**。
-这样 SBC 不需要 TTS key，也不需要 ffmpeg。
+推荐分工：电脑负责生成课时、SBC 常驻服务；也可以在 SBC 上直接生成
+（`serve` 内置生成，agent 通过 HTTP 触发，不需要在设备上开 shell）。
+若只在电脑生成，SBC 不需要 TTS key，也不需要 ffmpeg。
 
 ---
 
@@ -413,14 +421,14 @@ unit 默认：
 - 配置：`--config /etc/dictation/config.toml`
 - 程序/前端：`/opt/dictation/dictation`、`/opt/dictation/web`
 - 课时/数据/缓存：由 config 的 `paths` 决定（默认 `/srv/dictation/...`）
-- `EnvironmentFile=-/etc/dictation/env`（可选；`serve` 不需要 key）
-- `ProtectSystem=strict`，只允许写 `/srv/dictation`
+- `EnvironmentFile=-/etc/dictation/env`（服务端生成需要 TTS key；只用播放可不填）
+- `ProtectSystem=strict`，只允许写 `ReadWritePaths`（等于 config 的 `paths.base`）
 
-### 4.2 可选：API key 环境文件
+### 4.2 API key 环境文件
 
-`/etc/dictation/env` 是给 **systemd 服务**的；`serve` 本身不需要 TTS key。
-只有在服务进程里也要生成音频时才需要它。若你以普通用户/agent 在 SBC 上生成，
-用 `~/.config/dictation/env`（见 3.6），不要和服务的 env 混用。
+`/etc/dictation/env` 是给 **systemd 服务**的。服务端生成（agent 通过
+`POST /api/lessons/{id}/generate` 触发）由 `serve` 进程执行，所以 TTS key
+**必须放在这里**；密钥只存在于服务进程，agent 不需要也不应该持有。
 
 ```bash
 sudo install -d -m 0750 /etc/dictation
@@ -430,6 +438,11 @@ sudoedit /etc/dictation/env
 
 > systemd `EnvironmentFile` 只接受 `KEY=VALUE`，不要写 `export`。
 > 文件权限建议 `root:root 0600`；systemd 会在降权前读取。
+>
+> 要更严格可用 `LoadCredential`：把 key 写到
+> `/etc/dictation/credentials/doubao_api_key`，在 unit 里启用注释掉的
+> `LoadCredential=DOUBAO_API_KEY:...`，然后从 env 里删掉该行。
+> 这样密钥不进 `environ`，也不会被 `ffmpeg` 子进程继承。
 
 ### 4.3 启动/检查
 
@@ -469,26 +482,41 @@ set -a; source .env; set +a
 dictation gen lesson.txt --provider doubao --out lessons/第5课 --full-track
 ```
 
-### 5.2 agent 推荐：CLI 导入
+### 5.2 agent 推荐：HTTP 导入 + 服务端生成
 
-agent 不需要读写主机目录，只把内容通过 stdin 交给 CLI：
+agent 不需要读写主机目录、也不需要 CLI，只调服务：
 
 ```bash
-# 在开发机/或 SBC 上，配置由 /etc/dictation/config.toml 或 DICTATION_CONFIG 决定
-printf '%s' '{
+API=http://127.0.0.1:8080
+
+curl -sS -X POST "$API/api/lessons" -H 'content-type: application/json' -d '{
   "title":"第5课 词语听写",
   "text":"摇晃\n粗壮\n毕竟\n",
   "toml":"rate = 0.9\ngap = \"6s\"\nrepeat = 2\n"
-}' | dictation lesson import --payload - --json
+}'
+# → {"created":true,"dir":"第5课","title":"第5课 词语听写","item_count":20}
 
-dictation lesson plan --title "第5课 词语听写" --json
-dictation lesson gen --title "第5课 词语听写" --provider doubao --full-track
+curl -sS -X POST "$API/api/lessons/第5课/generate" \
+  -H 'content-type: application/json' -d '{"full_track":true}'
+# → {"job_id":"...","status":"queued"}
+
+curl -sS "$API/api/jobs/<job_id>"
+# → status: queued → running → done
 ```
 
-- `lesson import` 只写 `lesson.txt` / `lesson.toml`，不调 TTS；返回实际目录和预计时长。
-- 已存在时加 `--force` 才覆盖；覆盖后要重新 `lesson gen`。
-- `lesson list --json` 可查已有课时。
-- 完整 payload 格式见 [`skills/dictation-prep/SKILL.md`](skills/dictation-prep/SKILL.md)。
+- 导入只写 `lesson.txt` / `lesson.toml`，不调 TTS；已存在返回 `409`，
+  确认覆盖时 payload 里带 `"force": true`。
+- 生成在服务进程内完成，key 只从 `/etc/dictation/env` 读；agent 不接触。
+- 同课重复触发会复用进行中的任务，不会重复计费。
+- 完整 payload 与状态机见 [`docs/P1-CONTRACT.md`](docs/P1-CONTRACT.md)。
+
+CLI 等价操作（本机运维，需要自己持有 key）：
+
+```bash
+printf '%s' '{"title":"第5课 词语听写","text":"摇晃\n粗壮\n"}' \
+  | dictation lesson import --payload - --json
+dictation lesson gen --title "第5课 词语听写" --provider doubao --full-track
+```
 
 ### 5.3 同步到 SBC
 
@@ -511,9 +539,10 @@ ssh k1 'sudo mkdir -p /srv/dictation/lessons && \
 ## 6. 安装 agent skill
 
 skill 文件：[`skills/dictation-prep/SKILL.md`](skills/dictation-prep/SKILL.md)。
-作用：把老师消息/课本照片/杂乱列表归一化成 JSON payload，交给
-`dictation lesson import` 写入配置目录；确认后再 `dictation lesson gen`。
-agent 不需要主机目录读写权限。
+作用：把老师消息/课本照片/杂乱列表归一化成 JSON，通过 **HTTP API** 导入
+（`POST /api/lessons`）并触发生成（`POST /api/lessons/{id}/generate`）。
+agent 不需要文件系统权限，也不需要 `dictation` 在 PATH 里，只要网络能到
+`http://<主机>:8080`。
 
 ### OpenCode 项目级
 
@@ -536,39 +565,44 @@ cp skills/dictation-prep/SKILL.md ~/.config/opencode/skills/dictation-prep/
 - 把 `SKILL.md` 放进该 agent 的 skills/instructions 目录；
 - 或直接把内容粘进自定义指令/系统提示。
 
-### 确保 `dictation` 在 PATH
+### 关于 PATH（可选）
+
+agent 走 HTTP，**不需要** `dictation` 在 PATH。只有你本机手动跑命令时才有用：
 
 ```bash
 sudo ln -sf /opt/dictation/dictation /usr/local/bin/dictation
 dictation --version
 ```
 
-如果不想装到 PATH，把 skill 里的 `dictation ...` 改成
-`cargo run -- ...`（在项目根目录执行）。
-
 安装后对 agent 说「准备听写」或「整理词表」即可触发。
-skill 会先 `lesson import` 写词表/设置，再把预计时长给你确认；
-确认后才 `lesson gen` 调 TTS。
+skill 会先导入词表/设置，把词数和时长给你确认；确认后才触发生成。TTS key
+由服务进程读取，agent 全程不接触。
 
 ### 在 SBC 上让 agent 生成
 
-前提：agent 能执行主机上的 `dictation` 命令。推荐在开发机生成后同步；
-如果确实要让 SBC 上的 agent 生成：
+推荐直接用服务端生成（agent 不碰文件系统）：
 
 ```bash
-# 你的用户（不是 dictation）执行
-id          # 应看到 dictation 组；没有就 usermod -aG 后重新登录
-umask 0002
-set -a; . ~/.config/dictation/env; set +a
-export DICTATION_CONFIG=/etc/dictation/config.toml   # 如果不是默认位置
+API=http://127.0.0.1:8080
+curl -sS -X POST "$API/api/lessons" -H 'content-type: application/json' -d @payload.json
+curl -sS -X POST "$API/api/lessons/第5课/generate" -H 'content-type: application/json' -d '{"full_track": true}'
+curl -sS "$API/api/jobs/<job_id>"
 ```
 
-skill 通过 CLI 把内容写进 config 的 `lessons` 目录（默认
-`/srv/dictation/lessons`），并 `gen` 到同一目录。
-服务会扫描到新 `manifest.json`，**不需要重启**。
+- key 在 `/etc/dictation/env`，由 `serve` 读取；
+- 生成串行执行（同时 1 个任务），完成后服务会扫描到新 `manifest.json`，
+  **不需要重启**；
+- 若设置了 `DICTATION_API_TOKEN`，写请求要带 `X-Dictation-Token`。
+
+需要本机 CLI 生成（运维/调试）时，才在自己的 shell 里持有 key：
+
+```bash
+umask 0002
+set -a; . ~/.config/dictation/env; set +a
+export DICTATION_CONFIG=/etc/dictation/config.toml
+```
 
 `data/` 不要给 agent 写：SQLite 由服务独占。
-如果沙箱**完全不能执行主机 CLI**，只能在主机侧执行；不要用文件工具绕过。
 
 ---
 
@@ -656,9 +690,13 @@ sudo tar czf dictation-lessons-$(date +%F).tgz -C /srv/dictation lessons
 
 ## 10. 安全
 
-- 服务**没有账号/鉴权**，只适合家庭局域网；不要暴露到公网。
-- API key 放 `.env`、`~/.config/dictation/env` 或 `/etc/dictation/env`，权限 600，不提交 git。
-- `/srv/dictation/data/` 有孩子听写对错记录；`/srv/dictation/lessons/` 有词表与音频；定期备份。
+- 服务默认**没有账号体系**，只适合家庭局域网；不要暴露到公网。
+- 需要时用 `DICTATION_API_TOKEN` 保护写接口（导入/生成/取消），
+  `GET` 仍开放；token 放 `/etc/dictation/env`，不要写进 skill 或仓库。
+- API key 只放 `/etc/dictation/env`（0600），由服务进程读取；agent 不接触。
+  更严格可用 systemd `LoadCredential`。
+- `/srv/dictation/data/`（或 `/var/lib/dictation/data/`）有孩子听写对错记录；
+  `lessons/` 有词表与音频；定期备份。
 - 拍照批改尚未实现；将来照片默认本地存，上传云端需显式开关。
 
 ---

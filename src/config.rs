@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
@@ -62,14 +62,14 @@ impl Config {
             default_provider,
             cache_dir,
             qwen: QwenConfig {
-                api_key: env_nonempty("DASHSCOPE_API_KEY"),
+                api_key: read_secret("DASHSCOPE_API_KEY"),
                 endpoint: env_or("QWEN_TTS_ENDPOINT", DEFAULT_QWEN_ENDPOINT),
                 model: env_or("QWEN_TTS_MODEL", DEFAULT_QWEN_MODEL),
                 voice_zh: env_or("QWEN_VOICE_ZH", DEFAULT_QWEN_VOICE_ZH),
                 voice_en: env_or("QWEN_VOICE_EN", DEFAULT_QWEN_VOICE_EN),
             },
             doubao: DoubaoConfig {
-                api_key: env_nonempty("DOUBAO_API_KEY"),
+                api_key: read_secret("DOUBAO_API_KEY"),
                 endpoint: env_or("DOUBAO_TTS_ENDPOINT", DEFAULT_DOUBAO_ENDPOINT),
                 resource_id: env_or("DOUBAO_RESOURCE_ID", DEFAULT_DOUBAO_RESOURCE_ID),
                 model: env_nonempty("DOUBAO_MODEL"),
@@ -128,6 +128,23 @@ impl Config {
     }
 }
 
+/// Read a secret from systemd's credential directory first, then the
+/// environment. `CREDENTIALS_DIRECTORY` is set by systemd's
+/// `LoadCredential=`; files are read directly so the key never enters
+/// `environ` or child processes.
+pub fn read_secret(name: &str) -> Option<String> {
+    let dir = std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from);
+    read_secret_in(dir.as_deref(), name).or_else(|| env_nonempty(name))
+}
+
+/// Testable core of [`read_secret`]: read `dir/<name>`, trimmed, if present.
+pub fn read_secret_in(dir: Option<&Path>, name: &str) -> Option<String> {
+    let dir = dir?;
+    let raw = std::fs::read_to_string(dir.join(name)).ok()?;
+    let value = raw.trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
 fn env_nonempty(key: &str) -> Option<String> {
     std::env::var(key)
         .ok()
@@ -145,4 +162,43 @@ pub fn require<'a>(value: Option<&'a String>, key: &str) -> Result<&'a str> {
         .map(String::as_str)
         .filter(|s| !s.trim().is_empty())
         .with_context(|| format!("缺少环境变量 {key}；可设置后重试，或使用 --provider mock"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn credentials_directory_takes_precedence_over_env() {
+        let temp = tempfile::tempdir().unwrap();
+        let name = "DICTATION_TEST_SECRET_FROM_FILE";
+        fs::write(temp.path().join(name), "  from-file\n").unwrap();
+
+        assert_eq!(
+            read_secret_in(Some(temp.path()), name).as_deref(),
+            Some("from-file")
+        );
+        assert_eq!(read_secret_in(None, name), None, "没有凭据目录时返回 None");
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(
+            read_secret_in(Some(empty.path()), name),
+            None,
+            "凭据文件缺失时不 panic"
+        );
+    }
+
+    #[test]
+    fn secret_falls_back_to_environment() {
+        let name = "DICTATION_TEST_SECRET_ENV_ONLY";
+        std::env::set_var(name, "from-env");
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(
+            read_secret_in(Some(empty.path()), name).as_deref(),
+            None,
+            "凭据目录里没有该文件"
+        );
+        assert_eq!(read_secret(name).as_deref(), Some("from-env"));
+        std::env::remove_var(name);
+    }
 }
