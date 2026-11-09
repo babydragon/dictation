@@ -12,11 +12,11 @@
 # 已有的 config/env 和 lessons/data/cache 内容不会被覆盖或删除。
 #
 # 用法示例：
-#   curl -fsSL https://github.com/OWNER/REPO/releases/download/v0.1.0-rc.1/install.sh \
-#     | sudo bash -s -- --version v0.1.0-rc.1
-#   sudo ./install.sh --version v0.1.0-rc.1
-#   sudo ./install.sh --base-url http://192.168.1.10:8000 --version v0.1.0-rc.1
-#   ./install.sh --root /tmp/dictation-test --no-systemd --version v0.1.0-rc.1
+#   curl -fsSL https://github.com/OWNER/REPO/releases/download/v0.1.0/install.sh \
+#     | sudo bash -s -- --version v0.1.0
+#   sudo ./install.sh --version v0.1.0
+#   sudo ./install.sh --base-url http://192.168.1.10:8000 --version v0.1.0
+#   ./install.sh --root /tmp/dictation-test --no-systemd --version v0.1.0
 #
 set -euo pipefail
 
@@ -48,7 +48,7 @@ dictation installer
   install.sh [选项]
 
 选项:
-  --version <tag>       指定 release tag（如 v0.1.0-rc.1）；默认取最新稳定版
+  --version <tag>       指定 release tag（如 v0.1.0）；默认取最新稳定版
   --repo <owner/repo>   GitHub 仓库；默认已由发布流程写入
   --base-url <url>      从镜像/本地 HTTP 目录下载（目录内需有资产和 SHA256SUMS）
   --no-systemd          只安装文件，不操作 systemd

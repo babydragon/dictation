@@ -6,15 +6,16 @@
 > [`TODO.md`](TODO.md)；安装/交叉编译/systemd 见 [`INSTALL.md`](INSTALL.md)。
 > 本文件只放快速上手。
 
-## 测试版安装（发布包）
+## 安装（发布包）
 
-版本使用 `-rc.x` 表示非正式测试版，例如 `v0.1.0-rc.2`。
+当前正式版 `v0.1.0`；预发布使用 `-rc.x`（例如 `v0.1.0-rc.2`）。
+
 ```bash
-# 指定测试版
-curl -fsSL https://github.com/babydragon/dictation/releases/download/v0.1.0-rc.2/install.sh \
-  | sudo bash -s -- --version v0.1.0-rc.2
+# 指定版本（推荐，可复现）
+curl -fsSL https://github.com/babydragon/dictation/releases/download/v0.1.0/install.sh \
+  | sudo bash -s -- --version v0.1.0
 
-# 最新正式版
+# 最新正式版（自动解析 latest，不含 pre-release）
 curl -fsSL https://github.com/babydragon/dictation/releases/latest/download/install.sh \
   | sudo bash
 ```
@@ -30,7 +31,7 @@ curl -fsSL https://github.com/babydragon/dictation/releases/latest/download/inst
 数据目录默认 `/srv/dictation`；如果更喜欢 FHS 的服务状态目录，可以：
 
 ```bash
-... | sudo bash -s -- --version v0.1.0-rc.2 --data-root /var/lib/dictation
+... | sudo bash -s -- --version v0.1.0 --data-root /var/lib/dictation
 ```
 
 `--dry-run` 只下载/校验并打印计划，不写系统；`--no-systemd` 跳过服务安装。

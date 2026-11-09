@@ -37,7 +37,17 @@ release 构建通过。
 3. **拍照批改**：`Grader` trait + 多模态模型 + 置信度 + 人工确认。
 4. **记忆曲线细化**：`review_cap` 接到服务端、FSRS、按教材/单元限定范围。
 
-### 发布 v0.1.0-rc.2（进行中）
+### 发布 v0.1.0（正式版）
+
+本地 agent 已按 HTTP 闭环验证通过（导入 → 生成 → 播放/自检）。
+
+- [ ] `Cargo.toml` / `Cargo.lock` 升到 `0.1.0`
+- [ ] README/INSTALL/install.sh 示例改为 `v0.1.0`
+- [ ] 全量验证：fmt / clippy / tests / JS / bash -n / x86 + riscv64
+- [ ] commit + push + tag `v0.1.0`；CI 不带 `--prerelease`
+- [ ] 校验 release 资产、`README` 的 latest 链接、`--data-root` 安装
+
+### 发布 v0.1.0-rc.2（已完成）
 
 - [x] rc.1：CI 全流程、pre-release、从 release 安装验证
 - [x] 文档设备泛化 + 最低配置要求

@@ -555,7 +555,9 @@ port = 8080
 
 ### 发布
 
-- 测试版版本号用 `vX.Y.Z-rc.N`（如 `v0.1.0-rc.1`）；tag 与 `Cargo.toml` 一致。
+- 版本号：正式版 `vX.Y.Z`，测试版 `vX.Y.Z-rc.N`（如 `v0.1.0-rc.2`）；
+  tag 必须与 `Cargo.toml` 一致，CI 会校验。
+- CI 对 `-rc`/`-alpha`/`-beta` 自动加 `--prerelease`，其余为正式 release。
 - GitHub Actions：测试 → 构建 x86_64 + riscv64 → 打包 tgz → 创建
   release/pre-release 并上传。
 - 资产包含二进制、`web/`、`deploy/`、skill、`INSTALL.md`、`install.sh`、
