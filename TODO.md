@@ -40,6 +40,7 @@ release 构建通过。
 3. **拍照批改**：`Grader` trait + 多模态模型 + 置信度 + 人工确认。
 4. **记忆曲线细化**：`review_cap` 接到服务端、FSRS、按教材/单元限定范围。
 5. **本地 TTS（可选）**：断网兜底，SBC 上选型与实测。
+6. **F8 外网分享**：Cloudflare Pages + R2，独立会话实施；要点见 §5 F8。
 
 ### 发布 v0.1.0（正式版）
 
@@ -133,7 +134,7 @@ release 构建通过。
 - [ ] 错词本 / 答案纸打印。
 - [ ] FSRS（当前 1/2/4/7/15/30 天简化间隔）。
 
-## 5. F5-F7 计划
+## 5. F5-F8 计划
 
 ### F5 家长模式 / 答案纸
 
@@ -163,12 +164,89 @@ release 构建通过。
 - 状态：SBC 安装 + systemd 自启 + 手机访问 + 服务端生成已验收；
   本地 TTS 仍未做。
 
-### F8 外网分享（计划中，未实现）
+### F8 外网分享（Cloudflare Pages + R2，计划中，未实现）
 
-- 把课时发布到 Cloudflare Pages（壳）+ R2（音频），旅途/非家庭网络也能听写。
-- 只读发布，不做 R2 写接口、不做多租户；v1 不加访问控制。
-- 结果导出/导入回路，回家后并入复习。
-- 设计细节待实施时写进契约文档。
+目标：课时发布到 CF，非家庭网络也能给孩子听写；结果导出后回家导入，形成复习闭环。
+详细契约见本地工作稿 `docs/P2-SHARE.md`（未入库，独立会话实施时先读它）。
+
+**架构与边界**
+
+- 双通道：Pages 只放壳（`web/` + 生成的 `config.js` + `_headers`）；R2 只放数据。
+  发布新课时不重新部署 Pages；R2 是唯一真相源，本地不留发布账本。
+- 只读发布，不做 R2 写接口、不做多租户；v1 不加访问控制（以后一条 WAF 规则即可）。
+- 静态站不包含复习词（`review` 恒 false），复习仍靠本地 SQLite。
+
+**发布物**（`<dataBase>/`）
+
+- `lessons/index.json`：`{schema_version,updated_at,lessons[{id,title,item_count,total_ms,path,content_hash,published_at}]}`，派生缓存，可重建。
+- `lessons/<id>/lesson.json`：与 `SessionManifest` 同形；新增 `schema_version`/`lesson_id`/`content_hash`，省略 `session_id` 与 `base`；`full_track` 仅 `--with-full` 时出现。
+- `lessons/<id>/clips/*.wav`：沿用内容哈希命名；**不传 `full.wav`**（约 9.8MB/课）。
+- `<id>` = `sha256(目录名)` 前 12 位，与内容无关，重发只覆盖同一前缀。
+- `content_hash` = 规范化 JSON 的 sha256（键排序、无空白；排除 `generated_at`/`total_ms`/自身）。
+
+**发布流程（增量、幂等、只增不删）**
+
+1. 解析课时 → 校验 manifest 与 clips 完整（缺 clip 直接报错，不发布残缺课）
+2. GET 远端 `lesson.json`；hash 相同 → `skipped`（除非 `--force`）
+3. 逐 clip `HEAD`，缺失才 `PUT`（`audio/wav`, `Cache-Control: immutable`）
+4. `PUT lesson.json` = 提交点（`no-cache`）
+5. GET → merge → `PUT index.json`（最后一步）
+   - 顺序不可颠倒；失败只需重跑（幂等），错误带 `stage/uploaded/committed`
+- 永不删除：重发/改名只新增 key；`unpublish` 只摘 index 条目，`--purge --apply` 才删对象
+- 串行：进程内 Mutex + `publish.lock`，不依赖 R2 条件写
+- 校验与修复：`--status` 报告 `missing`/`orphan`；`--reindex` 从 R2 重建 index（不读本地）
+
+**配置与凭据**
+
+- `config.toml` 新增 `[publish]`：`enabled`/`data_base`/`pages_base`/`bucket`/`pages_project`/`shell_dir`；
+  未配置 → `503 {"error":"未配置发布目标（config.toml [publish]）"}`，不影响本地播放/生成。
+- `/etc/dictation/env`（0600）：`R2_ACCOUNT_ID`/`R2_ACCESS_KEY_ID`/`R2_SECRET_ACCESS_KEY`（可选 `R2_BUCKET`/`R2_DATA_BASE`）。
+- 沿用 D13b：`$CREDENTIALS_DIRECTORY` → 环境变量回退；agent 不接触凭证，只调 HTTP。
+
+**静态前端**
+
+- 注入 `config.js`：`DICTATION_MODE='static'`、`DICTATION_DATA_BASE=...`（不用 query 参数，避免刷新/加主屏丢失）。
+- 只替换 5 个调用：`lessons()`/`createSession()`/`reviewSummary()`（恒 0）/`createReview()`（不支持）/`check()`（本地判分）。
+- 深链 `?l=<lesson_id>` 直接进播放页；失效回落列表并提示“这一课可能已下线”。
+- 保留时间轴、暂停/重听、断点续听、检查页、结果页。
+
+**结果回传**
+
+- 导出 `dictation.result/v1`（自包含 items + `content_hash` + `finished_at`）；移动端三级降级：`navigator.share` → `Blob` 下载 → 文本框复制。
+- `POST /api/results/import`：幂等键 = 规范化 `{content_hash,finished_at,student,items[position/text/correct]}` 的 sha256，忽略客户端 id；
+  已导入 → `duplicate`；时间基准用 `finished_at`（未来 >5 分钟钳制为 now）；单事务写 `sessions(kind=imported)` + `session_items` + `attempts(source=import)` + `review_state`。
+- CLI 等价：`dictation result import <file|-> --json`。
+
+**CLI（agent-first）**
+
+```bash
+dictation publish <课时> [--dry-run] [--force] [--with-full] [--json]
+dictation publish --all | --shell | --status | --reindex [--json]
+dictation unpublish <课时> [--purge --apply] [--json]
+dictation result import <file|-> [--json]
+```
+
+**CF 侧一次性配置**
+
+- Pages 项目 + R2 自定义域（**关闭 `r2.dev` 公开域名**）
+- R2 CORS：仅 `GET`，`AllowedOrigins` = Pages 域名（`<audio>` 不需要，`fetch(lesson.json)` 需要）
+- 缓存：clips `immutable`、`lesson.json`/`index.json` `no-cache`；可选 Cache Rule 缓存 `/clips/`
+- Pages `_headers`：`Referrer-Policy: no-referrer`，壳资源短缓存
+- 额度：100 课 ≈ 145MB、发布 2400 次 A 类、40 人×30 天 ≈ 2.6 万 B 类，免费版余量充足
+
+**实施时必须同步**
+
+- `skills/dictation-prep/SKILL.md`：流程加“发布 → 返回分享链接”；说明不碰 R2 凭证；503 不重试、404 先导入/生成、重复发布 `skipped` 不算错
+- `AGENTS.md` 加一条设计决策（壳/数据双通道，R2 为真相源）
+- `README.md` / `INSTALL.md` 补 CF 一次性配置步骤
+
+**待定（实施时确认）**
+
+1. 发布锁文件位置（`<data>/publish.lock` vs 系统 tmp）
+2. `publish --shell` 依赖本机 `wrangler` 还是走 Cloudflare API（Direct Upload 签名复杂度）
+3. R2 凭证是否复用 `/etc/dictation/env`、是否用 `LoadCredential`
+4. 「导入结果」入口放首页还是独立页
+5. `index.json` 是否记录 `with_full`/音频版本
 
 ---
 
