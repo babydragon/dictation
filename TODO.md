@@ -31,21 +31,25 @@ release 构建通过。
 
 ## 2. 下一步（按优先级）
 
-1. **SBC 部署**：交叉编译已通过；下一步把二进制 + `web/` 拷到 SBC，
-   实际启动、浏览器访问、systemd 常驻；再做本地 TTS 选型。
+> SBC 部署已验收（安装 + systemd 自启 + 手机访问 + 服务端生成），
+> 不再是待办。离线本地 TTS 仍为可选增强。
+
+1. **结果查询 HTTP 化**：`GET /api/results`、`GET /api/results/{id}/wrong`。
+   沙箱里的 agent 读不到 SQLite，`result list/show/wrong` 目前只能主机侧跑。
 2. **家长模式 / 答案纸**：运行中调 gap/rate/repeat；A4 一列 20 题、带题号。
 3. **拍照批改**：`Grader` trait + 多模态模型 + 置信度 + 人工确认。
 4. **记忆曲线细化**：`review_cap` 接到服务端、FSRS、按教材/单元限定范围。
+5. **本地 TTS（可选）**：断网兜底，SBC 上选型与实测。
 
 ### 发布 v0.1.0（正式版）
 
 本地 agent 已按 HTTP 闭环验证通过（导入 → 生成 → 播放/自检）。
 
-- [ ] `Cargo.toml` / `Cargo.lock` 升到 `0.1.0`
-- [ ] README/INSTALL/install.sh 示例改为 `v0.1.0`
-- [ ] 全量验证：fmt / clippy / tests / JS / bash -n / x86 + riscv64
-- [ ] commit + push + tag `v0.1.0`；CI 不带 `--prerelease`
-- [ ] 校验 release 资产、`README` 的 latest 链接、`--data-root` 安装
+- [x] `Cargo.toml` / `Cargo.lock` 升到 `0.1.0`
+- [x] README/INSTALL/install.sh 示例改为 `v0.1.0`
+- [x] 全量验证：fmt / clippy / 143 tests / JS / bash -n / x86 + riscv64
+- [x] commit + push + tag `v0.1.0`；CI 未加 `--prerelease`
+- [x] 校验 release 资产、`latest` 链接、`--data-root` 安装、HTTP 生成
 
 ### 发布 v0.1.0-rc.2（已完成）
 
@@ -76,7 +80,8 @@ release 构建通过。
 - [x] 全量验证：fmt / clippy / 143 tests / JS / bash -n / x86 + riscv64 构建 / E2E curl
 - [x] commit + push + tag `v0.1.0-rc.2` 并触发 Action（`5479cd7`，run `42196618526`）
 - [x] 从 rc.2 release 再验一次 x86/RISC-V 资产（checksum、ELF、`--data-root` 安装、HTTP 生成）
-- [ ] 在目标 SBC 上真实安装 + systemd 启动（待上板）
+- [x] 在目标 SBC 上真实安装 + systemd 开机自启 + 手机访问 + 服务端生成
+      （已验收；设备上运行 v0.1.0 系列）
 
 ### 后续（S1 未覆盖）
 
@@ -155,6 +160,15 @@ release 构建通过。
 - 本地 TTS 可选：端侧 Qwen3-TTS-0.6B（SBC 未官方验收，需实测）或
   sherpa-onnx + VITS；云端 TTS 仍是日常首选。
 - 断网降级。
+- 状态：SBC 安装 + systemd 自启 + 手机访问 + 服务端生成已验收；
+  本地 TTS 仍未做。
+
+### F8 外网分享（计划中，未实现）
+
+- 把课时发布到 Cloudflare Pages（壳）+ R2（音频），旅途/非家庭网络也能听写。
+- 只读发布，不做 R2 写接口、不做多租户；v1 不加访问控制。
+- 结果导出/导入回路，回家后并入复习。
+- 设计细节待实施时写进契约文档。
 
 ---
 
@@ -194,6 +208,7 @@ release 构建通过。
 ### 6.4 实机
 
 - 用户在自己的手机/平板 验证：听音、暂停/重听、检查标错正常。
+- SBC 实机：安装、systemd 开机自启、局域网访问、HTTP 导入 + 生成全部正常。
 
 ---
 
@@ -331,6 +346,24 @@ release 构建通过。
   权限 2775/0750/600 正确。
 - 待办：在目标 SBC 上真实执行（systemd、开机自启、手机访问）。
 
+### 2026-11-09（SBC 部署验收）
+
+- 目标 SBC 上完成：安装、`systemd` 开机自启、手机/平板局域网访问。
+- 服务端生成在设备上实测通过（HTTP 导入 → 生成 → 播放/自检）。
+- agent 侧闭环已在真实 agent 环境验证，不再需要文件系统权限。
+- 结论：v0.1.0 可作为家庭日常使用版本；离线本地 TTS 仍为可选增强。
+
+### 2026-11-09（v0.1.0 正式版）
+
+- 本地 agent 用 HTTP 闭环验证通过（导入 → 生成 → 播放/自检）。
+- `Cargo.toml` / `Cargo.lock` → `0.1.0`；README/INSTALL/install.sh 示例同步。
+- 提交 `ca5a6f4`，tag `v0.1.0`；Action `42557388437` 全流程通过，`prerelease=false`。
+- 资产：x86_64（4.4MB）、riscv64gc（3.9MB）、`install.sh`、`SHA256SUMS`；
+  `sha256sum -c` 通过，RISC-V 为 ELF64 RISC-V。
+- `releases/latest` 已指向 `v0.1.0`，`latest/download/install.sh` 可用。
+- 从 release 实测：`--root ... --data-root /var/lib/dictation` 安装成功
+  （base 与 ReadWritePaths 一致），安装后二进制跑通导入 → 生成 → done。
+
 ### 2026-11-06（v0.1.0-rc.2 已发布）
 
 - 提交 `5479cd7`，tag `v0.1.0-rc.2`；Action `42196618526` 全流程通过
@@ -432,7 +465,8 @@ release 构建通过。
         - `libsqlite3-sys` bundled C SQLite 由 zig cc 编译成功。
         - `ring` 的 C/asm 在 riscv64 编译成功。
         - 仅有 linker warning：`ignoring deprecated linker optimization setting '1'`。
-  - [ ] 在 SBC 板上实际运行（qemu 未安装，未做用户态执行）。
+  - [x] 在 SBC 板上实际运行：安装、systemd 开机自启、手机访问、
+        服务端生成（HTTP 导入 → 生成）均已实测。
   - [ ] 记录无法替代的例外与理由（`libsqlite3-sys` 目前保留）。
 
 ## 9. 代码层已知小缺口
