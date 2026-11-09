@@ -168,7 +168,7 @@ jobs:
             install -m 0755 "${binary}" "dist/pkg/${name}/dictation"
             cp -a web/. "dist/pkg/${name}/web/"
             install -m 0644 deploy/dictation.service deploy/config.example deploy/env.example "dist/pkg/${name}/deploy/"
-            install -m 0644 docs/P1-CONTRACT.md "dist/pkg/${name}/docs/"
+            install -m 0644 docs/http-api.md docs/player.md "dist/pkg/${name}/docs/"
             install -m 0644 skills/dictation-prep/SKILL.md "dist/pkg/${name}/skills/dictation-prep/"
             install -m 0644 INSTALL.md README.md LICENSE "dist/pkg/${name}/"
             install -m 0755 dist/install.sh "dist/pkg/${name}/install.sh"

@@ -510,7 +510,7 @@ curl -sS "$API/api/jobs/<job_id>"
   确认覆盖时 payload 里带 `"force": true`。
 - 生成在服务进程内完成，key 只从 `/etc/dictation/env` 读；agent 不接触。
 - 同课重复触发会复用进行中的任务，不会重复计费。
-- 完整 payload 与状态机见 [`docs/P1-CONTRACT.md`](docs/P1-CONTRACT.md)。
+- 完整 payload 与状态机见 [`docs/http-api.md`](docs/http-api.md)。
 
 CLI 等价操作（本机运维，需要自己持有 key）：
 

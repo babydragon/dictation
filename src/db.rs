@@ -16,7 +16,6 @@ use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use tracing::warn;
 
-use crate::manifest::Manifest;
 use crate::model::Lang;
 
 /// Maximum number of due words in one review session.
@@ -95,10 +94,27 @@ CREATE INDEX IF NOT EXISTS idx_review_due ON review_state(due_at);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LessonEntry {
     pub id: String,
+    /// Relative directory name (`第5课`); safe to expose to clients.
+    pub dir_name: String,
+    /// Absolute host path, used for filesystem access only; never returned.
     pub dir: String,
     pub title: String,
     pub item_count: usize,
     pub total_ms: u32,
+}
+
+impl LessonEntry {
+    /// Projection shared with the CLI (`lesson::list`); the HTTP list endpoint
+    /// serializes this so both surfaces stay identical.
+    pub fn listing(&self) -> crate::lesson::list::Listing {
+        crate::lesson::list::Listing {
+            id: self.id.clone(),
+            dir: self.dir_name.clone(),
+            title: self.title.clone(),
+            item_count: self.item_count,
+            total_ms: self.total_ms,
+        }
+    }
 }
 
 /// One row of `session_items` plus the fields the response needs.
@@ -250,48 +266,23 @@ impl Db {
 
     /// Scan `lessons_dir` for `*/manifest.json`, upsert and return them sorted
     /// by title. Directories with a broken manifest are skipped with a warning.
+    ///
+    /// The filesystem read and the ordering come from [`crate::lesson::list::scan`]
+    /// so the CLI (`lesson list`) and `GET /api/lessons` cannot drift apart.
     pub fn scan_lessons(&self, lessons_dir: &Path) -> Result<Vec<LessonEntry>> {
-        let mut entries = Vec::new();
-        if lessons_dir.is_dir() {
-            for entry in fs::read_dir(lessons_dir)
-                .with_context(|| format!("读取课时目录失败: {}", lessons_dir.display()))?
-            {
-                let entry = entry?;
-                let path = entry.path();
-                if !path.is_dir() {
-                    continue;
-                }
-                let manifest_path = path.join("manifest.json");
-                if !manifest_path.is_file() {
-                    continue;
-                }
-                let raw = match fs::read_to_string(&manifest_path) {
-                    Ok(raw) => raw,
-                    Err(err) => {
-                        warn!("跳过 {}：读取 manifest 失败（{err}）", path.display());
-                        continue;
-                    }
-                };
-                let manifest: Manifest = match serde_json::from_str(&raw) {
-                    Ok(manifest) => manifest,
-                    Err(err) => {
-                        warn!("跳过 {}：manifest 解析失败（{err}）", path.display());
-                        continue;
-                    }
-                };
-                let dir_name = path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                entries.push(LessonEntry {
-                    id: lesson_id(&dir_name),
-                    dir: path.to_string_lossy().to_string(),
-                    title: manifest.title,
-                    item_count: manifest.items.len(),
-                    total_ms: manifest.total_ms,
-                });
-            }
-        }
+        let listings = crate::lesson::list::scan(lessons_dir)?;
+
+        let entries: Vec<LessonEntry> = listings
+            .into_iter()
+            .map(|listing| LessonEntry {
+                id: listing.id,
+                dir_name: listing.dir.clone(),
+                dir: lessons_dir.join(&listing.dir).to_string_lossy().to_string(),
+                title: listing.title,
+                item_count: listing.item_count,
+                total_ms: listing.total_ms,
+            })
+            .collect();
 
         let now = now_secs();
         let conn = self.conn()?;
@@ -318,7 +309,6 @@ impl Db {
         }
         tx.commit()?;
 
-        entries.sort_by(|a, b| a.title.cmp(&b.title).then_with(|| a.id.cmp(&b.id)));
         Ok(entries)
     }
 
@@ -329,9 +319,15 @@ impl Db {
                 "SELECT id, dir, title, item_count, total_ms FROM lessons WHERE id = ?1",
                 [id],
                 |row| {
+                    let dir: String = row.get(1)?;
+                    let dir_name = Path::new(&dir)
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                        .unwrap_or_default();
                     Ok(LessonEntry {
                         id: row.get(0)?,
-                        dir: row.get(1)?,
+                        dir_name,
+                        dir,
                         title: row.get(2)?,
                         item_count: row.get::<_, i64>(3)? as usize,
                         total_ms: row.get::<_, i64>(4)? as u32,
@@ -891,7 +887,7 @@ fn upsert_word(conn: &Connection, item: &NewItem, now: i64) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{self, ManifestClip, ManifestDefaults, ManifestItem};
+    use crate::manifest::{self, Manifest, ManifestClip, ManifestDefaults, ManifestItem};
     use std::path::PathBuf;
 
     fn sample_manifest(title: &str, count: usize) -> Manifest {

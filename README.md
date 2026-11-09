@@ -182,10 +182,15 @@ curl -sS -X POST "$API/api/lessons/第5课/generate" -H 'content-type: applicati
 
 # 轮询
 curl -sS "$API/api/jobs/<job_id>"
+
+# 结果查询（只读，GET 不需要 token）
+curl -sS "$API/api/results?limit=10"        # 最近已提交检查的听写
+curl -sS "$API/api/results/latest"          # 最近一次完整结果
+curl -sS "$API/api/results/latest/wrong"    # 只取错词
 ```
 
 设置 `DICTATION_API_TOKEN` 后，写操作需带 `X-Dictation-Token`。
-完整契约见 [`docs/P1-CONTRACT.md`](docs/P1-CONTRACT.md)。
+完整契约见 [`docs/http-api.md`](docs/http-api.md)。
 
 ## 命令
 

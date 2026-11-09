@@ -8,5 +8,6 @@ pub mod manifest;
 pub mod model;
 pub mod plan;
 pub mod render;
+pub mod result_view;
 pub mod server;
 pub mod tts;

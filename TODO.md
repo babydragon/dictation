@@ -4,7 +4,7 @@
 > `AGENTS.md` 只保留稳定设计与约定；每次工作完成后更新本文件，不要为了进度去改
 > `AGENTS.md`（除非设计本身变了）。
 >
-> 最后更新：2026-10-22
+> 最后更新：2026-11-09
 
 ---
 
@@ -22,10 +22,12 @@
 | SBC 交叉编译审计（-sys） | ✅ `cargo zigbuild` 编译通过；待板上运行验证 |
 | Agent 导入（config.toml + CLI） | ✅ `lesson import/plan/gen/list` + `config show` |
 | 结果查询 / 错词导出 | ✅ `result list/show/wrong`，JSON 供大模型分析 |
+| 结果查询 HTTP 化 | ✅ `GET /api/results[/{id}|/latest][/wrong]`，与 CLI 同一序列化 |
+| CLI/HTTP 一致性 | ✅ 导入、列表、结果共用实现；约定见 `docs/http-api.md` |
 | 缓存清理 | ✅ `clean --unused/--older-than`，默认 dry-run |
 | 断点续听 | ✅ localStorage 保存 session + item，7 天有效 |
 
-当前测试：`cargo test` **127 passed**（118 lib + 9 bin）；clippy / fmt 干净；
+当前测试：`cargo test` **156 passed**（147 lib + 9 bin）；clippy / fmt 干净；
 release 构建通过。
 演示课时：`lessons/第5课`（20 词，3:24，运行时数据，不提交）。
 
@@ -34,13 +36,11 @@ release 构建通过。
 > SBC 部署已验收（安装 + systemd 自启 + 手机访问 + 服务端生成），
 > 不再是待办。离线本地 TTS 仍为可选增强。
 
-1. **结果查询 HTTP 化**：`GET /api/results`、`GET /api/results/{id}/wrong`。
-   沙箱里的 agent 读不到 SQLite，`result list/show/wrong` 目前只能主机侧跑。
-2. **家长模式 / 答案纸**：运行中调 gap/rate/repeat；A4 一列 20 题、带题号。
-3. **拍照批改**：`Grader` trait + 多模态模型 + 置信度 + 人工确认。
-4. **记忆曲线细化**：`review_cap` 接到服务端、FSRS、按教材/单元限定范围。
-5. **本地 TTS（可选）**：断网兜底，SBC 上选型与实测。
-6. **F8 外网分享**：Cloudflare Pages + R2，独立会话实施；要点见 §5 F8。
+1. **家长模式 / 答案纸**：运行中调 gap/rate/repeat；A4 一列 20 题、带题号。
+2. **拍照批改**：`Grader` trait + 多模态模型 + 置信度 + 人工确认。
+3. **记忆曲线细化**：`review_cap` 接到服务端、FSRS、按教材/单元限定范围。
+4. **本地 TTS（可选）**：断网兜底，SBC 上选型与实测。
+5. **F8 外网分享**：Cloudflare Pages + R2，独立会话实施；要点见 §5 F8。
 
 ### 发布 v0.1.0（正式版）
 
@@ -68,11 +68,11 @@ release 构建通过。
 
 设计目标：agent 零文件系统依赖（不 exec、不读路径），TTS key 只在服务进程。
 
-- [x] 文档先行：`docs/P1-CONTRACT.md` 新增 P2 端点契约
+- [x] 文档先行：`docs/http-api.md` 新增服务端生成端点契约
 - [x] `AGENTS.md`：D13 改为 HTTP；新增 D13b 密钥归属；架构图/目录/env/约定同步
 - [x] `skills/dictation-prep/SKILL.md` 改为 HTTP 流程；CLI 降为运维入口
 - [x] `README.md` / `INSTALL.md` / `deploy/env.example` / unit 同步
-- [x] 测试先行：契约里的 P2 用例（导入、生成、job、token、cancel、body 解析）
+- [x] 测试先行：契约里的服务端生成用例（导入、生成、job、token、cancel、body 解析）
 - [x] 代码：抽出 `lesson::import`，CLI 与 HTTP 共用校验
 - [x] 代码：`serve` 增加 `POST /api/lessons`、`generate`、`GET /api/jobs/{id}`、`cancel`
 - [x] 代码：`Config` 支持 `$CREDENTIALS_DIRECTORY` 回退
@@ -86,8 +86,8 @@ release 构建通过。
 
 ### 后续（S1 未覆盖）
 
-- [ ] 结果查询 HTTP 化：`GET /api/results`、`GET /api/results/{id}/wrong`
-      （目前仍需主机侧 CLI 读 SQLite）
+- [x] 结果查询 HTTP 化：`GET /api/results`、`GET /api/results/{id}/wrong`
+      （agent 不再需要主机侧 CLI 读 SQLite）
 - [ ] 逐词生成进度（给 `RenderOptions` 加回调）
 - [ ] 生成任务持久化（当前仅内存，重启后丢失；靠 cache/manifest 幂等恢复）
 - [ ] `install.sh` 增加 `/usr/local/bin` symlink（仅本机 CLI 便利，agent 不需要）
@@ -167,7 +167,7 @@ release 构建通过。
 ### F8 外网分享（Cloudflare Pages + R2，计划中，未实现）
 
 目标：课时发布到 CF，非家庭网络也能给孩子听写；结果导出后回家导入，形成复习闭环。
-详细契约见本地工作稿 `docs/P2-SHARE.md`（未入库，独立会话实施时先读它）。
+详细契约见本地工作稿 `docs/share-publish.md`（未入库，独立会话实施时先读它）。
 
 **架构与边界**
 
@@ -254,7 +254,7 @@ dictation result import <file|-> [--json]
 
 ### 6.1 自动化
 
-- `cargo test`：127 passed（截至 2026-10-22）。
+- `cargo test`：156 passed（147 lib + 9 bin，截至 2026-11-09）。
 - `cargo clippy --all-targets -- -D warnings`：0 warning。
 - `cargo fmt --check`：通过。
 - `cargo build --release`：通过。
@@ -326,7 +326,7 @@ dictation result import <file|-> [--json]
 - 修复：逐块解码再拼 PCM；仅当块内是半个 quantum 才回退拼接。
 - 新增回归测试；`PIPELINE_VERSION` 升到 5。
 
-### 2026-10-20（P1 v1）
+### 2026-10-20（播放器 v1）
 
 - axum + SQLite；课时/session/check/review/media/static。
 - 儿童端五态：首页/播放/完成/检查/结果。
@@ -442,6 +442,52 @@ dictation result import <file|-> [--json]
 - 从 release 实测：`--root ... --data-root /var/lib/dictation` 安装成功
   （base 与 ReadWritePaths 一致），安装后二进制跑通导入 → 生成 → done。
 
+### 2026-11-09（结果查询 HTTP 化）
+
+- 契约先行：`docs/http-api.md` 新增「结果查询」段（5 个 GET 端点、
+  查询参数、错误码、与 CLI JSON 一致性的实现约定），测试计划同步。
+- 测试先行：`src/server/mod.rs` 新增 5 个 router 测试（空库、列表+详情+latest、
+  `all=true`、非法参数/未知 id、token 不保护 GET），共 142 lib tests。
+- 新增 `src/result_view.rs`：`format_unix`/`session_json`/`item_json`/`wrong_json`
+  + 3 个单测；`main.rs` 的 `result` 子命令改为调用它，删除重复实现。
+- `src/server/mod.rs` 新增路由：
+  - `GET /api/results?limit=20&all=false`（limit 1–100，非法 → 400，
+    不静默夹取；无记录 → 200 空列表）
+  - `GET /api/results/{id}` / `GET /api/results/latest`
+  - `GET /api/results/{id}/wrong` / `GET /api/results/latest/wrong`
+  - 未知 id 404；`latest` 无已提交记录 404；未提交 session 的 `/wrong` 409。
+- 实测：把真实 `data/dictation.db` 复制到 `/tmp` 后起 `serve`，`/api/results`、
+  `latest`、`latest/wrong` 返回 200；`limit=0` 400、未知 id 404；
+  HTTP 输出与 `dictation result show|wrong --json` **逐字段完全相同**。
+- 验证：`cargo fmt --check`、`cargo clippy --all-targets -D warnings`、
+  `cargo test` 151 passed、`node --check web/app.js` 均通过。
+
+### 2026-11-09（CLI/HTTP 一致性）
+
+- 契约：`docs/http-api.md` 新增「CLI 与 HTTP 的一致性约定」；`GET /api/lessons`
+  改为返回 `id` + `dir`，排序 `title → dir`，与 CLI 同一实现。
+- 新增 `src/lesson/list.rs`：`scan`（唯一文件系统读取）+ `json`（唯一序列化），
+  3 个单测（排序、跳过坏 manifest、空目录、固定字段集合）。
+- `db::scan_lessons` 改为调用 `lesson::list::scan`，只保留 upsert；
+  `LessonEntry` 增 `dir_name`（相对目录名），`dir` 仍是绝对路径且不外发。
+- `GET /api/lessons` 与 `dictation lesson list --json` 字段统一为
+  `{id, dir, title, item_count, total_ms}`；新增 2 个 parity 测试。
+- `AGENTS.md` §16 增加强制约定：同一能力两侧共用实现；运维类操作新增/修改必须
+  两侧同步、语义一致。§13 目录补 `lesson/list.rs`、`result_view.rs`。
+- skill 的课时列表说明补齐 `dir` 字段与用途。
+- 验证：fmt / clippy / 156 tests / `node --check` 通过。
+
+### 2026-11-09（文档按功能拆分）
+
+- `docs/P1-CONTRACT.md` 拆成两份功能文档：
+  - `docs/http-api.md`：服务端 HTTP API、SQLite schema、鉴权、CLI/HTTP 一致性约定；
+  - `docs/player.md`：客户端播放器与自检交互（SessionManifest、时间轴、检查页、
+    首页、断点续听）。
+- 本地工作稿 `docs/P2-SHARE.md` → `docs/share-publish.md`（仍未入库）。
+- 同步交叉引用：`AGENTS.md`、`README.md`、`INSTALL.md`、`TODO.md`、skill；
+  源码注释去掉 P1/P2/P3 阶段标签。
+- 顺手修正 `player.md` 中过期的「v1 不自动混入下一课」，与已实现行为对齐。
+
 ### 2026-11-06（v0.1.0-rc.2 已发布）
 
 - 提交 `5479cd7`，tag `v0.1.0-rc.2`；Action `42196618526` 全流程通过
@@ -462,7 +508,7 @@ dictation result import <file|-> [--json]
 拒绝；同时 TTS key 原本既不属于服务（旧 `serve` 不生成），也不属于 CLI
 （`/etc/dictation/env` 是 0600 root）。改成服务端生成后两个问题一起消失。
 
-- 文档先行：`docs/P1-CONTRACT.md` 新增「P2 服务端生成」契约（4 端点、
+- 文档先行：`docs/http-api.md` 新增「服务端生成」契约（4 端点、
   状态机、鉴权、并发、保留策略）；`AGENTS.md` D13/D13b、架构图、目录、
   env、开发约定同步；skill 全面改为 HTTP 流程；README/INSTALL/
   `deploy/env.example`/unit 同步。

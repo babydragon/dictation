@@ -74,7 +74,7 @@ pub struct LessonConfig {
     pub voice_en: Option<String>,
     pub voice_mixed: Option<String>,
     pub cue: Cue,
-    /// Maximum number of due review words mixed into a session (P2).
+    /// Maximum number of due review words mixed into a session.
     pub review_cap: u8,
 }
 

@@ -128,8 +128,9 @@ review_cap = 5
 1. 读取原始材料，按规则生成 `text` 和可选的 `toml` 字符串。
 2. 可选：先确认是否已有同名课时：
    ```bash
-   curl -sS "$API/api/lessons"     # { "lessons": [ { "id", "title", "item_count", "total_ms" } ] }
+   curl -sS "$API/api/lessons"     # { "lessons": [ { "id", "dir", "title", "item_count", "total_ms" } ] }
    ```
+   `id` 用于调 API，`dir` 是相对目录名；判断是否重复用 `title`/`dir`，不要猜 id。
 3. 导入：
    ```bash
    curl -sS -X POST "$API/api/lessons" "${AUTH[@]}" \
@@ -189,24 +190,26 @@ curl -sS -X POST "$API/api/lessons/第5课/generate" "${AUTH[@]}" -d '{}'
 
 ## 查询听写结果 / 分析错词
 
-> **需要主机侧 CLI（读 SQLite）。** 这一块目前还没有 HTTP 端点，只有能访问
-> `data/dictation.db` 的本机进程才能查。在沙箱里时，请家长在主机上执行并把
-> JSON 贴给你，不要试图自己找 DB 路径。
+> 走 HTTP，**不需要读 SQLite**。GET 端点不受 `DICTATION_API_TOKEN` 保护，
+> 请求时不需要带鉴权头。主机侧 `dictation result ... --json` 输出与这些端点
+> 逐字段相同，但 agent 应优先用 HTTP。
 
 家长说“看下这次听写”“分析一下错词”“为什么这些词老错”时：
 
 ```bash
-# 最近已提交检查的听写
-dictation result list --json
-
-# 某次完整结果
-dictation result show --latest --json
-# 或
-dictation result show <session_id> --json
-
-# 只取错词（推荐给大模型）
-dictation result wrong --latest --json
+curl -sS "$API/api/results?limit=10"            # 最近已提交检查的听写
+curl -sS "$API/api/results/latest"              # 最近一次完整结果
+curl -sS "$API/api/results/<session_id>"        # 指定 session
+curl -sS "$API/api/results/latest/wrong"        # 只取错词（推荐给大模型）
+curl -sS "$API/api/results/<session_id>/wrong"
 ```
+
+- 默认只返回已提交检查的 session；家长要“还没提交的那次”时加 `all=true`。
+- `limit` 必须是 1–100；越界返回 400，**不要**自己重试同一个非法值。
+- `404 {"error":"session 不存在"}` /
+  `{"error":"还没有已提交检查的听写记录"}`：直接转述，不要猜 id 或反复重试。
+- `409 {"error":"本次听写还没提交检查"}`：这次听写没有提交检查，没有对错可分析。
+- `session.id` 是完整 id，从列表取；**不要**用 8 位短 id 拼 URL。
 
 `wrong_words` 里每个错词包含：
 
@@ -218,12 +221,12 @@ dictation result wrong --latest --json
 
 分析规则：
 
-- **只使用 CLI 返回的 `wrong_words`**，不要自己补词或猜错因。
+- **只使用接口返回的 `wrong_words`**，不要自己补词或猜错因。
 - 可以按类型归纳：同音字、形近字、笔顺、前后鼻音、英文拼写/发音。
 - 给出具体记忆钩子：拆字、组词、对比、造句、口诀；不要泛泛说“多读多写”。
 - 可以建议下次复习顺序/分组，但**不要**直接修改课时或调用 gen；
   需要新增复习课时时，先按前面流程生成并让家长确认。
-- 如果 `result list` 为空或 `wrong` 报“还没提交检查”，直接说明，不要编造结果。
+- 如果 `/api/results` 为空或 `/wrong` 返回 409，直接说明，不要编造结果。
 
 ## 清理 TTS 缓存
 

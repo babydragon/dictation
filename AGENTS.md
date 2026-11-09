@@ -453,7 +453,7 @@ lessons/第5课/
 - 首页另有“错词复习”入口，可单独练。
 - 后续可换 FSRS；接口保持不变。
 
-**实际 SQLite schema 与 API 以 [`docs/P1-CONTRACT.md`](docs/P1-CONTRACT.md) 为准。**
+**实际 SQLite schema 与 API 以 [`docs/http-api.md`](docs/http-api.md) 为准。**
 
 ---
 
@@ -574,7 +574,8 @@ dictation/
 ├── AGENTS.md              # 本文件：稳定设计
 ├── TODO.md                # 进度/验收/日志
 ├── docs/
-│   └── P1-CONTRACT.md     # P1 API/SQLite 契约
+│   ├── http-api.md        # 服务端 HTTP API / SQLite / 一致性契约
+│   └── player.md          # 儿童端播放器与自检交互
 ├── deploy/
 │   ├── dictation.service  # systemd unit
 │   ├── config.example     # /etc/dictation/config.toml
@@ -591,11 +592,13 @@ dictation/
 │   ├── cache.rs
 │   ├── lesson/mod.rs
 │   ├── lesson/import.rs    # CLI 与 HTTP 共用的导入/校验
+│   ├── lesson/list.rs      # CLI 与 HTTP 共用的课时列表/排序/JSON
 │   ├── plan.rs
 │   ├── audio/mod.rs
 │   ├── render.rs
 │   ├── manifest.rs
 │   ├── db.rs
+│   ├── result_view.rs      # CLI 与 HTTP 共用的结果 JSON
 │   ├── server/mod.rs
 │   └── tts/{mod,doubao,qwen,mock}.rs
 ├── web/
@@ -714,8 +717,19 @@ DOUBAO_VOICE_EN=en_female_stokie_uranus_bigtts
 - **agent 写入必须走 HTTP API**（`POST /api/lessons` 等），不 exec CLI、不读写
   `/srv`、`/opt`；路径只由服务端从 `config.toml` 解析，不硬编码。
   CLI 是运维/本地调试入口，可以要求本机持有密钥。
-- **HTTP 契约先改 `docs/P1-CONTRACT.md` 再写代码**；导入校验必须 CLI 与 HTTP 共用
+- **HTTP 契约先改 `docs/http-api.md` 再写代码**；导入校验必须 CLI 与 HTTP 共用
   同一份实现（`lesson::import`），不允许复制。
+- **同一能力同时有 CLI 与 HTTP 入口时，必须共用实现，语义一致**：
+  - 读取/序列化放库里（`lesson::import`、`lesson::list`、`result_view`、`render`），
+    CLI 与 `serve` 只做参数解析与输出；
+  - 运维类操作（`lesson import/list/plan/gen`、`result list/show/wrong`、
+    `config show`、`clean`，以及以后新增的 publish 等）**新增或修改时必须两侧同步**，
+    只改一侧视为未完成；
+  - 字段名、字段值、单位、排序、过滤、幂等行为一致；错误按载体映射但含义相同
+    （HTTP 状态码 + `{"error"}` / CLI exit 1 + stderr `{"error"}`）；
+  - 允许的差异只有运行时能力（job 队列/并发/取消、鉴权、媒体、session 与 check；
+    CLI 侧的 `clean`/`plan`/`new`/`config show` 与路径模式 `gen`），且必须在契约写明。
+  - 检查清单见 `docs/http-api.md` 的「CLI 与 HTTP 的一致性约定」。
 - **所有新 CLI 必须 agent-first**：支持 `--json`、非交互、可脚本化；
   破坏性操作默认 dry-run，必须显式 `--apply`/`--force`；错误用
   `{"error": ...}` + 非零退出；路径/配置走 `AppConfig`。

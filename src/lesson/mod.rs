@@ -8,6 +8,7 @@ use serde::Deserialize;
 use crate::model::{Cue, Item, Lang, Lesson, LessonConfig};
 
 pub mod import;
+pub mod list;
 
 /// Optional `lesson.toml` schema. Every field is optional so that a partial
 /// file only overrides what the parent wrote.

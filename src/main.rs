@@ -10,12 +10,12 @@ use serde_json::json;
 use dictation::app_config::{self, AppConfig};
 use dictation::cache::{self, Cache};
 use dictation::config::Config;
-use dictation::db::{Db, SessionResult, SessionSummary, WrongWord};
+use dictation::db::{Db, SessionResult, WrongWord};
 use dictation::lesson;
-use dictation::manifest::Manifest;
 use dictation::model::{Lang, Lesson, ProviderKind};
 use dictation::plan::{self, Plan};
 use dictation::render::{self, RenderOptions};
+use dictation::result_view::{format_unix, item_json, session_json, wrong_json};
 use dictation::tts;
 
 #[derive(Debug, Parser)]
@@ -79,7 +79,7 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
     },
-    /// 播放器服务（P1）
+    /// 播放器与自检服务
     Serve {
         /// 课时根目录，默认取配置文件
         #[arg(long)]
@@ -826,61 +826,12 @@ fn cmd_lesson_plan(
     cmd_plan(&path, json)
 }
 
-#[derive(Debug)]
-struct LessonSummary {
-    dir: String,
-    title: String,
-    item_count: usize,
-    total_ms: u32,
-}
-
 fn cmd_lesson_list(app: &AppConfig, json: bool) -> Result<()> {
-    let mut lessons = Vec::new();
-    if app.lessons_dir.is_dir() {
-        for entry in fs::read_dir(&app.lessons_dir)
-            .with_context(|| format!("读取课时目录失败: {}", app.lessons_dir.display()))?
-        {
-            let entry = entry?;
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let manifest_path = path.join("manifest.json");
-            if !manifest_path.is_file() {
-                continue;
-            }
-            let manifest: Manifest = match fs::read_to_string(&manifest_path)
-                .ok()
-                .and_then(|raw| serde_json::from_str(&raw).ok())
-            {
-                Some(manifest) => manifest,
-                None => continue,
-            };
-            let dir = path
-                .file_name()
-                .map(|name| name.to_string_lossy().to_string())
-                .unwrap_or_default();
-            lessons.push(LessonSummary {
-                dir,
-                title: manifest.title,
-                item_count: manifest.items.len(),
-                total_ms: manifest.total_ms,
-            });
-        }
-    }
-    lessons.sort_by(|a, b| a.title.cmp(&b.title).then_with(|| a.dir.cmp(&b.dir)));
+    let lessons = lesson::list::scan(&app.lessons_dir)?;
 
     if json {
         let value = json!({
-            "lessons": lessons
-                .iter()
-                .map(|lesson| json!({
-                    "dir": lesson.dir,
-                    "title": lesson.title,
-                    "item_count": lesson.item_count,
-                    "total_ms": lesson.total_ms,
-                }))
-                .collect::<Vec<_>>(),
+            "lessons": lessons.iter().map(lesson::list::json).collect::<Vec<_>>(),
         });
         println!("{}", serde_json::to_string_pretty(&value)?);
     } else if lessons.is_empty() {
@@ -905,18 +856,6 @@ fn cmd_lesson_list(app: &AppConfig, json: bool) -> Result<()> {
 // result: read-only views over the SQLite session history
 // ---------------------------------------------------------------------------
 
-/// Unix seconds → RFC3339 in +08:00, stable for both humans and models.
-fn format_unix(secs: i64) -> String {
-    let offset = time::UtcOffset::from_hms(8, 0, 0).unwrap_or(time::UtcOffset::UTC);
-    match time::OffsetDateTime::from_unix_timestamp(secs) {
-        Ok(datetime) => datetime
-            .to_offset(offset)
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap_or_else(|_| secs.to_string()),
-        Err(_) => secs.to_string(),
-    }
-}
-
 fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
 }
@@ -930,47 +869,6 @@ fn open_result_db(app: &AppConfig) -> Result<Db> {
         );
     }
     Db::open(&path)
-}
-
-fn session_json(session: &SessionSummary) -> serde_json::Value {
-    json!({
-        "id": session.id,
-        "kind": session.kind,
-        "title": session.title,
-        "created_at": format_unix(session.created_at),
-        "finished_at": session.finished_at.map(format_unix),
-        "item_count": session.item_count,
-        "correct": session.correct,
-        "wrong": session.wrong,
-    })
-}
-
-fn item_json(item: &dictation::db::ResultItem) -> serde_json::Value {
-    json!({
-        "position": item.position,
-        "text": item.text,
-        "lang": item.lang,
-        "review": item.review,
-        "origin_lesson": item.origin_lesson,
-        "grade": item.grade,
-        "correct": item.grade.as_deref().map(|grade| grade == "good"),
-        "source": item.source,
-    })
-}
-
-fn wrong_json(word: &WrongWord) -> serde_json::Value {
-    json!({
-        "position": word.position,
-        "text": word.text,
-        "lang": word.lang,
-        "review": word.review,
-        "origin_lesson": word.origin_lesson,
-        "grade": word.grade,
-        "source": word.source,
-        "lapses": word.lapses,
-        "interval_days": word.interval_days,
-        "due_at": word.due_at.map(format_unix),
-    })
 }
 
 fn cmd_result_list(app: &AppConfig, json_output: bool, limit: u32, all: bool) -> Result<()> {

@@ -1,4 +1,4 @@
-//! P1 HTTP service: lesson list, sessions, review scheduling and media.
+//! HTTP service: lesson list, sessions, review scheduling and media.
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use axum::body::Bytes;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Path as UrlPath, State};
+use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::{header, HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -22,11 +22,12 @@ use tracing::{info, warn};
 
 use crate::cache::Cache;
 use crate::config::Config;
-use crate::db::{self, CheckError, Db, NewItem, SessionRecord};
+use crate::db::{self, CheckError, Db, NewItem, SessionRecord, SessionResult};
 use crate::lesson::import as lesson_import;
 use crate::manifest::{Manifest, ManifestClip, ManifestDefaults};
 use crate::model::ProviderKind;
 use crate::render::{self, RenderOptions};
+use crate::result_view;
 use crate::tts;
 
 const REVIEW_LEAD_IN_MS: u32 = 3_000;
@@ -168,6 +169,11 @@ fn router(state: AppState) -> Router {
         .route("/api/lessons/{id}/generate/cancel", post(cancel_generation))
         .route("/api/jobs/{id}", get(get_job))
         .route("/api/review/summary", get(review_summary))
+        .route("/api/results", get(list_results))
+        .route("/api/results/latest", get(latest_result))
+        .route("/api/results/latest/wrong", get(latest_result_wrong))
+        .route("/api/results/{id}", get(result_detail))
+        .route("/api/results/{id}/wrong", get(result_wrong))
         .route("/api/sessions", post(create_session))
         .route("/api/sessions/review", post(create_review_session))
         .route("/api/sessions/{id}/check", post(check_session))
@@ -947,14 +953,7 @@ async fn list_lessons(State(state): State<AppState>) -> Result<Json<Value>, ApiE
     .await?;
     let lessons: Vec<Value> = lessons
         .iter()
-        .map(|lesson| {
-            json!({
-                "id": lesson.id,
-                "title": lesson.title,
-                "item_count": lesson.item_count,
-                "total_ms": lesson.total_ms,
-            })
-        })
+        .map(|lesson| crate::lesson::list::json(&lesson.listing()))
         .collect();
     Ok(Json(json!({ "lessons": lessons })))
 }
@@ -969,6 +968,135 @@ async fn review_summary(State(state): State<AppState>) -> Result<Json<Value>, Ap
         "wrong_count": summary.wrong_count,
         "review_count": summary.review_count,
     })))
+}
+
+// ---------------------------------------------------------------------------
+// Result query (read-only, same JSON as `dictation result ... --json`)
+// ---------------------------------------------------------------------------
+
+const RESULTS_DEFAULT_LIMIT: u32 = 20;
+const RESULTS_MAX_LIMIT: u32 = 100;
+const RESULTS_LIMIT_MESSAGE: &str = "limit 必须是 1–100 的整数";
+
+#[derive(Debug, Default, Deserialize)]
+struct ResultsQuery {
+    limit: Option<String>,
+    all: Option<String>,
+}
+
+fn parse_results_limit(raw: Option<&str>) -> Result<u32, ApiError> {
+    let Some(raw) = raw else {
+        return Ok(RESULTS_DEFAULT_LIMIT);
+    };
+    let limit: u32 = raw
+        .trim()
+        .parse()
+        .map_err(|_| ApiError::bad_request(RESULTS_LIMIT_MESSAGE))?;
+    if !(1..=RESULTS_MAX_LIMIT).contains(&limit) {
+        return Err(ApiError::bad_request(RESULTS_LIMIT_MESSAGE));
+    }
+    Ok(limit)
+}
+
+fn parse_results_all(raw: Option<&str>) -> Result<bool, ApiError> {
+    match raw.map(str::trim) {
+        None => Ok(false),
+        Some("true" | "1") => Ok(true),
+        Some("false" | "0") => Ok(false),
+        Some(_) => Err(ApiError::bad_request("all 只能是 true/false/1/0")),
+    }
+}
+
+async fn list_results(
+    State(state): State<AppState>,
+    Query(query): Query<ResultsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let limit = parse_results_limit(query.limit.as_deref())?;
+    let include_unfinished = parse_results_all(query.all.as_deref())?;
+    let sessions = run_db(state.db.clone(), move |db| {
+        db.list_sessions(limit, include_unfinished)
+            .map_err(ApiError::internal)
+    })
+    .await?;
+    Ok(Json(json!({
+        "sessions": sessions
+            .iter()
+            .map(result_view::session_json)
+            .collect::<Vec<_>>(),
+    })))
+}
+
+enum ResultRef {
+    Id(String),
+    Latest,
+}
+
+async fn load_result(db: Arc<Db>, reference: ResultRef) -> Result<SessionResult, ApiError> {
+    run_db(db, move |db| match reference {
+        ResultRef::Id(id) => {
+            let id = id.trim();
+            if id.is_empty() {
+                return Err(ApiError::bad_request("session id 不能为空"));
+            }
+            db.session_result(id)
+                .map_err(ApiError::internal)?
+                .ok_or_else(|| ApiError::not_found("session 不存在"))
+        }
+        ResultRef::Latest => {
+            let latest = db
+                .latest_finished_session()
+                .map_err(ApiError::internal)?
+                .ok_or_else(|| ApiError::not_found("还没有已提交检查的听写记录"))?;
+            db.session_result(&latest.id)
+                .map_err(ApiError::internal)?
+                .ok_or_else(|| ApiError::not_found("session 不存在"))
+        }
+    })
+    .await
+}
+
+fn detail_json(result: &SessionResult) -> Value {
+    json!({
+        "session": result_view::session_json(&result.summary),
+        "items": result.items.iter().map(result_view::item_json).collect::<Vec<_>>(),
+        "wrong_words": result.wrong_words.iter().map(result_view::wrong_json).collect::<Vec<_>>(),
+    })
+}
+
+fn wrong_view_json(result: &SessionResult) -> Result<Value, ApiError> {
+    if result.summary.finished_at.is_none() {
+        return Err(ApiError::conflict("本次听写还没提交检查"));
+    }
+    Ok(json!({
+        "session": result_view::session_json(&result.summary),
+        "wrong_words": result.wrong_words.iter().map(result_view::wrong_json).collect::<Vec<_>>(),
+    }))
+}
+
+async fn result_detail(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let result = load_result(state.db.clone(), ResultRef::Id(id)).await?;
+    Ok(Json(detail_json(&result)))
+}
+
+async fn latest_result(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let result = load_result(state.db.clone(), ResultRef::Latest).await?;
+    Ok(Json(detail_json(&result)))
+}
+
+async fn result_wrong(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let result = load_result(state.db.clone(), ResultRef::Id(id)).await?;
+    Ok(Json(wrong_view_json(&result)?))
+}
+
+async fn latest_result_wrong(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let result = load_result(state.db.clone(), ResultRef::Latest).await?;
+    Ok(Json(wrong_view_json(&result)?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1462,7 +1590,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // P2 / S1: import + background generation over HTTP
+    // Import + background generation over HTTP
     // ------------------------------------------------------------------
 
     use axum::body::Body;
@@ -2040,5 +2168,333 @@ mod tests {
         assert_eq!(payload.items[1].repeat_gap_ms, 1_200);
         assert_eq!(payload.defaults.lead_in_ms, 3_000);
         assert_eq!(payload.total_ms, 25_900);
+    }
+
+    // ------------------------------------------------------------------
+    // CLI/HTTP parity: lesson listing
+    // ------------------------------------------------------------------
+
+    fn write_lesson_manifest(root: &Path, dir: &str, title: &str, items: usize, total_ms: u32) {
+        let path = root.join(dir);
+        fs::create_dir_all(&path).unwrap();
+        let manifest = Manifest {
+            version: 1,
+            title: title.to_string(),
+            generated_at: "2026-11-09T12:00:00+08:00".to_string(),
+            defaults: ManifestDefaults {
+                gap_ms: 6_000,
+                repeat: 2,
+                repeat_gap_ms: 1_200,
+                lead_in_ms: 3_000,
+                intro_gap_ms: 1_500,
+            },
+            intro: None,
+            intro_text: None,
+            outro: None,
+            outro_text: None,
+            items: (1..=items)
+                .map(|index| crate::manifest::ManifestItem {
+                    index,
+                    text: format!("词{index}"),
+                    lang: crate::model::Lang::Zh,
+                    announce: None,
+                    clips: vec![ManifestClip {
+                        path: format!("clips/{index:02}-abcd.wav"),
+                        duration_ms: 1_000,
+                    }],
+                    repeat: 2,
+                    repeat_gap_ms: 1_200,
+                    gap_ms: 6_000,
+                })
+                .collect(),
+            full_track: None,
+            total_ms,
+        };
+        crate::manifest::write(&path.join("manifest.json"), &manifest).unwrap();
+    }
+
+    #[tokio::test]
+    async fn lessons_endpoint_is_the_shared_listing() {
+        let temp = tempfile::tempdir().unwrap();
+        let opts = test_opts(&temp);
+        fs::create_dir_all(&opts.lessons_dir).unwrap();
+        write_lesson_manifest(&opts.lessons_dir, "第6课", "第6课", 2, 20_000);
+        write_lesson_manifest(&opts.lessons_dir, "第5课", "第5课 词语听写", 3, 30_000);
+        // Same title, different dir: tie-break by dir.
+        write_lesson_manifest(&opts.lessons_dir, "第5课副本", "第5课 词语听写", 1, 10_000);
+        let app = router(test_state(&opts, None, None));
+
+        let body = body_json(app.clone().oneshot(get_req("/api/lessons")).await.unwrap()).await;
+
+        let shared = crate::lesson::list::scan(&opts.lessons_dir).unwrap();
+        let expected: Vec<Value> = shared.iter().map(crate::lesson::list::json).collect();
+        assert_eq!(
+            body,
+            json!({ "lessons": expected }),
+            "HTTP 必须与 lesson::list 完全一致"
+        );
+
+        let lessons = body["lessons"].as_array().unwrap();
+        let dirs: Vec<&str> = lessons
+            .iter()
+            .map(|lesson| lesson["dir"].as_str().unwrap())
+            .collect();
+        assert_eq!(dirs, ["第5课", "第5课副本", "第6课"]);
+        assert_eq!(lessons[0]["id"], db::lesson_id("第5课"));
+        assert!(lessons[0].get("dir_path").is_none());
+        assert!(
+            !body
+                .to_string()
+                .contains(&temp.path().display().to_string()),
+            "响应不能包含主机绝对路径: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lessons_endpoint_is_empty_without_lessons() {
+        let temp = tempfile::tempdir().unwrap();
+        let opts = test_opts(&temp);
+        let app = router(test_state(&opts, None, None));
+
+        let body = body_json(app.clone().oneshot(get_req("/api/lessons")).await.unwrap()).await;
+        assert_eq!(body, json!({ "lessons": [] }));
+    }
+
+    // ------------------------------------------------------------------
+    // Result query over HTTP
+    // ------------------------------------------------------------------
+
+    fn seed_session(
+        state: &AppState,
+        items: &[NewItem],
+        results: Option<&[(usize, bool)]>,
+    ) -> String {
+        let record = state
+            .db
+            .create_lesson_session("lesson000001", "第5课", items)
+            .unwrap();
+        if let Some(results) = results {
+            state.db.check_session(&record.id, results).unwrap();
+        }
+        record.id
+    }
+
+    fn result_items() -> Vec<NewItem> {
+        vec![
+            test_item("摇晃", false, "lesson000001"),
+            test_item("粗壮", false, "lesson000001"),
+        ]
+    }
+
+    #[tokio::test]
+    async fn results_list_is_empty_by_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let opts = test_opts(&temp);
+        let app = router(test_state(&opts, None, None));
+
+        let response = app.clone().oneshot(get_req("/api/results")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await, json!({ "sessions": [] }));
+
+        let response = app
+            .clone()
+            .oneshot(get_req("/api/results/latest"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            body_json(response).await["error"],
+            "还没有已提交检查的听写记录"
+        );
+    }
+
+    #[tokio::test]
+    async fn results_list_and_detail_expose_checked_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let opts = test_opts(&temp);
+        let state = test_state(&opts, None, None);
+        let app = router(state.clone());
+
+        let session_id = seed_session(&state, &result_items(), Some(&[(1, true), (2, false)]));
+
+        let body = body_json(app.clone().oneshot(get_req("/api/results")).await.unwrap()).await;
+        let sessions = body["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["id"], session_id.as_str());
+        assert_eq!(sessions[0]["kind"], "lesson");
+        assert_eq!(sessions[0]["title"], "第5课");
+        assert_eq!(sessions[0]["item_count"], 2);
+        assert_eq!(sessions[0]["correct"], 1);
+        assert_eq!(sessions[0]["wrong"], 1);
+        let finished = sessions[0]["finished_at"].as_str().unwrap();
+        assert!(
+            finished.contains('T') && finished.ends_with("+08:00"),
+            "finished_at 必须是 RFC3339: {finished}"
+        );
+
+        let detail = body_json(
+            app.clone()
+                .oneshot(get_req(&format!("/api/results/{session_id}")))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(detail["session"]["id"], session_id.as_str());
+        let items = detail["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["text"], "摇晃");
+        assert_eq!(items[0]["grade"], "good");
+        assert_eq!(items[0]["correct"], true);
+        assert_eq!(items[1]["grade"], "again");
+        assert_eq!(items[1]["correct"], false);
+
+        let wrong = detail["wrong_words"].as_array().unwrap();
+        assert_eq!(wrong.len(), 1);
+        assert_eq!(wrong[0]["text"], "粗壮");
+        assert_eq!(wrong[0]["lapses"], 1);
+        assert_eq!(wrong[0]["interval_days"], 1);
+        assert!(wrong[0]["due_at"].as_str().unwrap().ends_with("+08:00"));
+
+        let latest = body_json(
+            app.clone()
+                .oneshot(get_req("/api/results/latest"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(latest["session"]["id"], session_id.as_str());
+
+        let latest_wrong = body_json(
+            app.clone()
+                .oneshot(get_req("/api/results/latest/wrong"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(latest_wrong["wrong_words"].as_array().unwrap().len(), 1);
+        assert!(
+            latest_wrong.get("items").is_none(),
+            "wrong 视图不返回 items: {latest_wrong}"
+        );
+
+        let only_wrong = body_json(
+            app.clone()
+                .oneshot(get_req(&format!("/api/results/{session_id}/wrong")))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(only_wrong, latest_wrong);
+    }
+
+    #[tokio::test]
+    async fn results_all_includes_unfinished_sessions() {
+        let temp = tempfile::tempdir().unwrap();
+        let opts = test_opts(&temp);
+        let state = test_state(&opts, None, None);
+        let app = router(state.clone());
+
+        let unfinished = seed_session(&state, &result_items(), None);
+        let finished = seed_session(&state, &result_items(), Some(&[(1, true), (2, true)]));
+
+        let body = body_json(app.clone().oneshot(get_req("/api/results")).await.unwrap()).await;
+        let sessions = body["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1, "默认只看已提交检查的 session");
+        assert_eq!(sessions[0]["id"], finished.as_str());
+
+        let body = body_json(
+            app.clone()
+                .oneshot(get_req("/api/results?all=true&limit=10"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let sessions = body["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 2);
+        let pending = sessions
+            .iter()
+            .find(|session| session["id"] == unfinished.as_str())
+            .expect("all=true 必须包含未提交的 session");
+        assert!(pending["finished_at"].is_null());
+
+        let detail = body_json(
+            app.clone()
+                .oneshot(get_req(&format!("/api/results/{unfinished}")))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(detail["items"][0]["grade"].is_null());
+        assert!(detail["items"][0]["correct"].is_null());
+
+        let response = app
+            .clone()
+            .oneshot(get_req(&format!("/api/results/{unfinished}/wrong")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(body_json(response).await["error"], "本次听写还没提交检查");
+    }
+
+    #[tokio::test]
+    async fn results_reject_invalid_query_and_unknown_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let opts = test_opts(&temp);
+        let app = router(test_state(&opts, None, None));
+
+        for uri in [
+            "/api/results?limit=0",
+            "/api/results?limit=101",
+            "/api/results?limit=abc",
+            "/api/results?limit=",
+        ] {
+            let response = app.clone().oneshot(get_req(uri)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(
+                body_json(response).await["error"],
+                "limit 必须是 1–100 的整数",
+                "{uri}"
+            );
+        }
+
+        let response = app
+            .clone()
+            .oneshot(get_req("/api/results?all=maybe"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body_json(response).await["error"],
+            "all 只能是 true/false/1/0"
+        );
+
+        for uri in ["/api/results/nope", "/api/results/nope/wrong"] {
+            let response = app.clone().oneshot(get_req(uri)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+            assert_eq!(
+                body_json(response).await["error"],
+                "session 不存在",
+                "{uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn results_get_is_not_protected_by_token() {
+        let temp = tempfile::tempdir().unwrap();
+        let opts = test_opts(&temp);
+        let state = test_state(&opts, None, Some("s3cret"));
+        let app = router(state.clone());
+        let session_id = seed_session(&state, &result_items(), Some(&[(1, true), (2, true)]));
+
+        let list = app.clone().oneshot(get_req("/api/results")).await.unwrap();
+        assert_eq!(list.status(), StatusCode::OK);
+
+        let wrong = app
+            .clone()
+            .oneshot(get_req(&format!("/api/results/{session_id}/wrong")))
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::OK);
     }
 }
