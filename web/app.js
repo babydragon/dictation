@@ -247,6 +247,7 @@
               lessons: MOCK_LESSONS.map((l) => ({
                 id: l.id,
                 title: l.title,
+                subject: 'chinese',
                 item_count: l.words.length,
                 total_ms: l.words.length * 4500 + 3200,
               })),
@@ -254,7 +255,14 @@
             return;
           }
           if (path === '/api/review/summary' && method === 'GET') {
-            resolve({ due_count: mockDue, wrong_count: mockWrong, review_count: mockReviewCount() });
+            resolve({
+              due_count: mockDue,
+              wrong_count: mockWrong,
+              review_count: mockReviewCount(),
+              subjects: mockReviewCount() > 0
+                ? [{ subject: 'chinese', due_count: mockDue, wrong_count: mockWrong, review_count: mockReviewCount(), oldest_overdue_days: 1 }]
+                : [],
+            });
             return;
           }
           if (path === '/api/sessions' && method === 'POST') {
@@ -326,7 +334,8 @@
     lessons: () => request('/api/lessons'),
     reviewSummary: () => request('/api/review/summary'),
     createSession: (lessonId) => request('/api/sessions', { method: 'POST', body: { lesson_id: lessonId } }),
-    createReview: () => request('/api/sessions/review', { method: 'POST', body: {} }),
+    createReview: (subject) => request('/api/sessions/review', { method: 'POST', body: { subject: subject } }),
+    getSession: (sessionId) => request('/api/sessions/' + encodeURIComponent(sessionId)),
     check: (sessionId, results) =>
       request('/api/sessions/' + encodeURIComponent(sessionId) + '/check', {
         method: 'POST',
@@ -342,6 +351,8 @@
   const state = {
     lessons: [],
     reviewCount: 0,
+    reviewSubjects: [],
+    deepLink: null,
     marked: new Set(),
     busy: false,
     submitting: false,
@@ -941,16 +952,27 @@
     try { localStorage.setItem(LAST_LESSON_KEY, id); } catch (e) { /* ignore */ }
   }
 
-  function reviewCard(count) {
+  function subjectLabel(subject) {
+    if (subject === 'chinese') return '语文';
+    if (subject === 'english') return '英语';
+    return '';
+  }
+
+  function reviewCard(count, subject, oldest) {
+    const label = subjectLabel(subject);
+    const title = label ? '错词复习 · ' + label : '错词复习';
+    let meta = '共 ' + count + ' 个词';
+    if (oldest > 0) meta += ' · 最久 ' + oldest + ' 天未复习';
+    meta += '，再听一遍';
     const card = el('button', { class: 'card card-review', type: 'button' }, [
       el('span', { class: 'review-count', text: String(count) }),
       el('div', { class: 'card-main' }, [
-        el('p', { class: 'card-title', text: '错词复习' }),
-        el('p', { class: 'card-meta', text: '共 ' + count + ' 个词，再听一遍' }),
+        el('p', { class: 'card-title', text: title }),
+        el('p', { class: 'card-meta', text: meta }),
       ]),
       el('span', { class: 'chev' }, [iconEl('chev')]),
     ]);
-    card.addEventListener('click', () => startReview(card));
+    card.addEventListener('click', () => startReview(card, subject));
     return card;
   }
 
@@ -995,9 +1017,34 @@
     toast('已清除上次进度');
   }
 
+  function deepLinkCard(manifest) {
+    const items = manifest.items || [];
+    const subject = subjectLabel(manifest.subject);
+    const meta = [];
+    if (subject) meta.push(subject);
+    meta.push((items.length || 0) + ' 个词');
+    meta.push('点击开始');
+    const card = el('button', { class: 'card', type: 'button' }, [
+      el('div', { class: 'card-main' }, [
+        el('p', { class: 'card-title', text: manifest.title || '复习' }),
+        el('p', { class: 'card-meta', text: meta.join(' · ') }),
+      ]),
+      el('span', { class: 'chev' }, [iconEl('chev')]),
+    ]);
+    card.addEventListener('click', () => {
+      state.deepLink = null;
+      unlockAudio();
+      startPlayback(manifest);
+      try { history.replaceState({}, '', location.pathname); } catch (e) { /* ignore */ }
+    });
+    return card;
+  }
+
   function lessonCard(lesson, isLast) {
     const count = Number(lesson.item_count || 0);
     const meta = [];
+    const subject = subjectLabel(lesson.subject);
+    if (subject) meta.push(subject);
     if (isLast) meta.push('上次');
     meta.push(count + ' 个词');
     if (lesson.total_ms) meta.push('约 ' + approxText(lesson.total_ms));
@@ -1040,7 +1087,13 @@
     const frag = document.createDocumentFragment();
     const resume = readResume();
 
-    if (state.reviewCount > 0) frag.appendChild(reviewCard(state.reviewCount));
+    if (state.deepLink) frag.appendChild(deepLinkCard(state.deepLink));
+
+    state.reviewSubjects.forEach((entry) => {
+      if (entry.count > 0) {
+        frag.appendChild(reviewCard(entry.count, entry.subject, entry.oldest));
+      }
+    });
     if (resume) frag.appendChild(resumeCard(resume));
 
     frag.appendChild(el('p', { class: 'section-label', text: '课时' }));
@@ -1055,6 +1108,18 @@
     }
 
     setChildren(els.homeBody, frag);
+  }
+
+  async function bootHome() {
+    const sessionId = new URLSearchParams(location.search).get('s');
+    if (sessionId) {
+      try {
+        state.deepLink = await API.getSession(sessionId);
+      } catch (err) {
+        toast('这一课可能已下线');
+      }
+    }
+    await loadHome();
   }
 
   async function loadHome() {
@@ -1083,6 +1148,15 @@
     const hasReviewCount = summary && summary.review_count !== null && summary.review_count !== undefined;
     const reviewTotal = summary ? (hasReviewCount ? summary.review_count : summary.due_count) : 0;
     state.reviewCount = Math.max(0, Number(reviewTotal) || 0);
+
+    const grouped = summary && Array.isArray(summary.subjects) ? summary.subjects : [];
+    state.reviewSubjects = grouped.length
+      ? grouped.map((entry) => ({
+          subject: entry.subject,
+          count: Math.max(0, Number(entry.review_count) || 0),
+          oldest: Math.max(0, Number(entry.oldest_overdue_days) || 0),
+        }))
+      : (state.reviewCount > 0 ? [{ subject: 'chinese', count: state.reviewCount, oldest: 0 }] : []);
     renderHome();
   }
 
@@ -1112,13 +1186,13 @@
     }
   }
 
-  async function startReview(card) {
+  async function startReview(card, subject) {
     if (state.busy) return;
     state.busy = true;
     card.disabled = true;
     unlockAudio();
     try {
-      const manifest = await API.createReview();
+      const manifest = await API.createReview(subject);
       state.busy = false;
       card.disabled = false;
       startPlayback(manifest);
@@ -1416,7 +1490,7 @@
     els['home-date'].textContent = todayLabel();
 
     bindEvents();
-    loadHome();
+    bootHome();
   }
 
   boot();

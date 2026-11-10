@@ -357,6 +357,7 @@ umask 0002
 # CLI 默认读取 /etc/dictation/config.toml；不在默认位置才需要 DICTATION_CONFIG
 printf '%s' '{
   "title":"第5课",
+  "subject":"chinese",
   "text":"摇晃\n粗壮\n",
   "toml":"rate = 0.9\ngap = \"6s\"\n"
 }' | /opt/dictation/dictation lesson import --payload - --json
@@ -515,7 +516,7 @@ curl -sS "$API/api/jobs/<job_id>"
 CLI 等价操作（本机运维，需要自己持有 key）：
 
 ```bash
-printf '%s' '{"title":"第5课 词语听写","text":"摇晃\n粗壮\n"}' \
+printf '%s' '{"title":"第5课 词语听写","subject":"chinese","text":"摇晃\n粗壮\n"}' \
   | dictation lesson import --payload - --json
 dictation lesson gen --title "第5课 词语听写" --provider doubao --full-track
 ```

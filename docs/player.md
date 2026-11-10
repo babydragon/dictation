@@ -13,7 +13,8 @@
 - 检查页：显示本次所有词；只标错，未标默认正确；每行可单听；提交后落库。
 - 记录：SQLite 存 attempts 与 review_state。
 - 错词复习：首页入口，按到期错词生成一个复习 session。
-- 自动混入下一课：本课之后追加最多 5 个待复习词（`review=true`，音频仍来自原课）。
+- 自动混入下一课：本课之后追加按比例（25%，上限 8）的待复习词
+  （`review=true`，音频仍来自原课）。
 - 断点续听：`localStorage` 保存 session + 当前 item，7 天内可继续。
 - 不做：拍照批改、答案纸打印、账号、多用户、离线 Service Worker。
 
@@ -36,6 +37,9 @@
   "session_id": "5b0d...",
   "kind": "lesson",
   "title": "第5课",
+  "subject": "chinese",
+  "grade": 3,
+  "term": 1,
   "base": "/media/a1b2c3d4e5f6",
   "defaults": {
     "gap_ms": 6000,
@@ -66,6 +70,7 @@
 ```
 
 - 播放器 URL = `item.base + "/" + clip.path`；intro/outro 用顶层 `base`。
+- `subject` 为 `chinese`/`english`；`grade`/`term` 可能为 `null`。复习 session 沿用请求的科目。
 - 复习 session：`kind="review"`、`title="错词复习"`、`intro=null`、`outro=null`；
   item 的 `base` 可能不同（来自原课），`review=true`。
 - `total_ms` 包含本课 + 自动混入的复习词；播放器仍以实际音频时长为准。
@@ -113,8 +118,9 @@ done
 ## 首页
 
 - 顶部：`听写`。
-- 如果 `due_count > 0`：显示醒目的 `错词复习 (N)` 卡片，点击 POST `/api/sessions/review` 并进入播放器。
-- 课时卡片：标题、词数、预计时长；点击 POST `/api/sessions` 并进入播放器。
+- 按科目分别显示 `错词复习 (N)` 卡片（`语文` / `英语`），点击 POST
+  `/api/sessions/review`（body 带 `subject`）并进入播放器；没有积压的科目不显示。
+- 课时卡片：标题、科目、词数、预计时长；点击 POST `/api/sessions` 并进入播放器。
 - 空状态：`还没有课时，先用 dictation gen 生成一课`。
 - 加载失败：显示重试按钮。
 

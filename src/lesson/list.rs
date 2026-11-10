@@ -20,6 +20,10 @@ pub struct Listing {
     /// Relative directory name; safe to expose (never an absolute host path).
     pub dir: String,
     pub title: String,
+    /// `chinese` / `english`.
+    pub subject: String,
+    pub grade: Option<u8>,
+    pub term: Option<u8>,
     pub item_count: usize,
     pub total_ms: u32,
 }
@@ -69,7 +73,10 @@ pub fn scan(root: &Path) -> Result<Vec<Listing>> {
             listings.push(Listing {
                 id: lesson_id(&dir),
                 dir,
-                title: manifest.title,
+                title: manifest.title.clone(),
+                subject: manifest.subject().as_str().to_string(),
+                grade: manifest.grade,
+                term: manifest.term,
                 item_count: manifest.items.len(),
                 total_ms: manifest.total_ms,
             });
@@ -85,6 +92,9 @@ pub fn json(listing: &Listing) -> Value {
         "id": listing.id,
         "dir": listing.dir,
         "title": listing.title,
+        "subject": listing.subject,
+        "grade": listing.grade,
+        "term": listing.term,
         "item_count": listing.item_count,
         "total_ms": listing.total_ms,
     })
@@ -102,6 +112,10 @@ mod tests {
         Manifest {
             version: 1,
             title: title.to_string(),
+            subject: None,
+            grade: None,
+            term: None,
+            review_cap: 8,
             generated_at: "2026-11-09T12:00:00+08:00".to_string(),
             defaults: ManifestDefaults {
                 gap_ms: 6_000,
@@ -181,6 +195,9 @@ mod tests {
             id: "a1b2c3d4e5f6".to_string(),
             dir: "第5课".to_string(),
             title: "第5课 词语听写".to_string(),
+            subject: "chinese".to_string(),
+            grade: Some(3),
+            term: Some(1),
             item_count: 20,
             total_ms: 181_160,
         };
@@ -188,8 +205,11 @@ mod tests {
         assert_eq!(value["id"], "a1b2c3d4e5f6");
         assert_eq!(value["dir"], "第5课");
         assert_eq!(value["title"], "第5课 词语听写");
+        assert_eq!(value["subject"], "chinese");
+        assert_eq!(value["grade"], 3);
+        assert_eq!(value["term"], 1);
         assert_eq!(value["item_count"], 20);
         assert_eq!(value["total_ms"], 181_160);
-        assert_eq!(value.as_object().unwrap().len(), 5, "字段集合固定: {value}");
+        assert_eq!(value.as_object().unwrap().len(), 8, "字段集合固定: {value}");
     }
 }

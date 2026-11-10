@@ -199,6 +199,15 @@ enum LessonCommand {
         /// 覆盖已存在的课时
         #[arg(long)]
         force: bool,
+        /// 科目：chinese / english（必填；--payload 时从 payload 读取）
+        #[arg(long, value_name = "SUBJECT")]
+        subject: Option<String>,
+        /// 年级 1–6（可选）
+        #[arg(long, value_name = "1-6")]
+        grade: Option<u8>,
+        /// 学期 1=上 / 2=下（可选）
+        #[arg(long, value_name = "1|2")]
+        term: Option<u8>,
         /// 输出 JSON
         #[arg(long)]
         json: bool,
@@ -302,6 +311,9 @@ async fn main() -> Result<()> {
                 toml,
                 dir,
                 force,
+                subject,
+                grade,
+                term,
                 json,
             } => cmd_lesson_import(
                 &app,
@@ -312,6 +324,9 @@ async fn main() -> Result<()> {
                     toml,
                     dir,
                     force,
+                    subject,
+                    grade,
+                    term,
                     json,
                 },
             ),
@@ -668,12 +683,21 @@ struct ImportOptions {
     toml: Option<String>,
     dir: Option<String>,
     force: bool,
+    subject: Option<String>,
+    grade: Option<u8>,
+    term: Option<u8>,
     json: bool,
 }
 
 #[derive(Debug, Deserialize)]
 struct ImportPayload {
     title: String,
+    #[serde(default)]
+    subject: String,
+    #[serde(default)]
+    grade: Option<u8>,
+    #[serde(default)]
+    term: Option<u8>,
     #[serde(default)]
     dir: Option<String>,
     text: String,
@@ -693,6 +717,9 @@ fn cmd_lesson_import(app: &AppConfig, options: ImportOptions) -> Result<()> {
                     serde_json::to_string(&json!({
                         "dir": outcome.dir_path.display().to_string(),
                         "title": outcome.title,
+                        "subject": outcome.subject,
+                        "grade": outcome.grade,
+                        "term": outcome.term,
                         "item_count": outcome.item_count,
                         "total_ms": outcome.total_ms,
                         "created": outcome.created,
@@ -705,6 +732,15 @@ fn cmd_lesson_import(app: &AppConfig, options: ImportOptions) -> Result<()> {
                     outcome.title
                 );
                 println!("  目录：{}", outcome.dir_path.display());
+                println!(
+                    "  科目：{}{}",
+                    outcome.subject,
+                    match (outcome.grade, outcome.term) {
+                        (Some(grade), Some(term)) => format!("  {grade} 年级 {term} 学期"),
+                        (Some(grade), None) => format!("  {grade} 年级"),
+                        _ => String::new(),
+                    }
+                );
                 println!(
                     "  {} 条，预计 {}（{} ms）",
                     outcome.item_count,
@@ -726,14 +762,22 @@ fn cmd_lesson_import(app: &AppConfig, options: ImportOptions) -> Result<()> {
 /// Thin CLI wrapper around [`lesson::import::import`]; the validation and
 /// file-writing logic is shared with the HTTP API.
 fn import_lesson(app: &AppConfig, options: ImportOptions) -> Result<lesson::import::ImportOutcome> {
-    let (title, dir_arg, text, toml_text, force) = match options.payload.as_deref() {
+    let (title, dir_arg, text, toml_text, force, subject, grade, term) = match options
+        .payload
+        .as_deref()
+    {
         Some(spec) => {
             if options.title.is_some()
                 || options.text.is_some()
                 || options.toml.is_some()
                 || options.dir.is_some()
+                || options.subject.is_some()
+                || options.grade.is_some()
+                || options.term.is_some()
             {
-                bail!("--payload 不能与 --title/--text/--toml/--dir 同时使用");
+                bail!(
+                        "--payload 不能与 --title/--text/--toml/--dir/--subject/--grade/--term 同时使用"
+                    );
             }
             let raw = read_input(spec)?;
             let payload: ImportPayload =
@@ -744,6 +788,9 @@ fn import_lesson(app: &AppConfig, options: ImportOptions) -> Result<lesson::impo
                 payload.text,
                 payload.toml,
                 payload.force || options.force,
+                payload.subject,
+                payload.grade,
+                payload.term,
             )
         }
         None => {
@@ -757,7 +804,19 @@ fn import_lesson(app: &AppConfig, options: ImportOptions) -> Result<lesson::impo
                 Some(spec) => Some(read_input(spec)?),
                 None => None,
             };
-            (title, options.dir, text, toml_text, options.force)
+            let subject = options
+                .subject
+                .context("缺少 --subject（chinese|english）")?;
+            (
+                title,
+                options.dir,
+                text,
+                toml_text,
+                options.force,
+                subject,
+                options.grade,
+                options.term,
+            )
         }
     };
 
@@ -769,6 +828,9 @@ fn import_lesson(app: &AppConfig, options: ImportOptions) -> Result<lesson::impo
             toml: toml_text,
             dir: dir_arg,
             force,
+            subject,
+            grade,
+            term,
         },
     )
 }
@@ -826,6 +888,14 @@ fn cmd_lesson_plan(
     cmd_plan(&path, json)
 }
 
+fn subject_label(subject: &str) -> &str {
+    match subject {
+        "chinese" => "语文",
+        "english" => "英语",
+        other => other,
+    }
+}
+
 fn cmd_lesson_list(app: &AppConfig, json: bool) -> Result<()> {
     let lessons = lesson::list::scan(&app.lessons_dir)?;
 
@@ -838,11 +908,15 @@ fn cmd_lesson_list(app: &AppConfig, json: bool) -> Result<()> {
         println!("{} 下还没有已生成的课时", app.lessons_dir.display());
         println!("先运行：dictation --config <config> lesson import --payload -");
     } else {
-        println!("{:<24} {:<8} {:>10}  标题", "目录", "词数", "时长");
+        println!(
+            "{:<24} {:<6} {:<8} {:>10}  标题",
+            "目录", "科目", "词数", "时长"
+        );
         for lesson in &lessons {
             println!(
-                "{:<24} {:<8} {:>10}  {}",
+                "{:<24} {:<6} {:<8} {:>10}  {}",
                 truncate(&lesson.dir, 24),
+                subject_label(&lesson.subject),
                 lesson.item_count,
                 format_clock(lesson.total_ms),
                 lesson.title
@@ -1274,7 +1348,7 @@ mod tests {
         let app = app_config(temp.path());
         let payload = write_payload(
             temp.path(),
-            r#"{"title":"第5课","text":"摇晃\n粗壮\n","toml":"rate = 0.9\ngap = \"2s\"\n"}"#,
+            r#"{"title":"第5课","subject":"chinese","text":"摇晃\n粗壮\n","toml":"rate = 0.9\ngap = \"2s\"\n"}"#,
         );
 
         let outcome = import(&app, &payload, false).unwrap();
@@ -1303,7 +1377,10 @@ mod tests {
     fn duplicate_import_requires_force() {
         let temp = tempfile::tempdir().unwrap();
         let app = app_config(temp.path());
-        let payload = write_payload(temp.path(), r#"{"title":"第5课","text":"摇晃\n"}"#);
+        let payload = write_payload(
+            temp.path(),
+            r#"{"title":"第5课","subject":"chinese","text":"摇晃\n"}"#,
+        );
         import(&app, &payload, false).unwrap();
 
         let err = import(&app, &payload, false).unwrap_err();
@@ -1319,7 +1396,7 @@ mod tests {
         let app = app_config(temp.path());
         let payload = write_payload(
             temp.path(),
-            r#"{"title":"第5课","dir":"../evil","text":"摇晃\n"}"#,
+            r#"{"title":"第5课","subject":"chinese","dir":"../evil","text":"摇晃\n"}"#,
         );
         let err = import(&app, &payload, false).unwrap_err();
         assert!(format!("{err:#}").contains(".."));
@@ -1327,7 +1404,7 @@ mod tests {
 
         let payload = write_payload(
             temp.path(),
-            r#"{"title":"第5课","dir":"/tmp/evil","text":"摇晃\n"}"#,
+            r#"{"title":"第5课","subject":"chinese","dir":"/tmp/evil","text":"摇晃\n"}"#,
         );
         assert!(import(&app, &payload, false).is_err());
     }
@@ -1338,7 +1415,7 @@ mod tests {
         let app = app_config(temp.path());
         let payload = write_payload(
             temp.path(),
-            r#"{"title":"第5课","text":"摇晃\n","toml":"rate = 9.9\n"}"#,
+            r#"{"title":"第5课","subject":"chinese","text":"摇晃\n","toml":"rate = 9.9\n"}"#,
         );
         assert!(import(&app, &payload, false).is_err());
         assert!(
@@ -1353,7 +1430,10 @@ mod tests {
     fn title_generates_safe_dir_when_missing() {
         let temp = tempfile::tempdir().unwrap();
         let app = app_config(temp.path());
-        let payload = write_payload(temp.path(), r#"{"title":"第6课/上","text":"窗户\n操场\n"}"#);
+        let payload = write_payload(
+            temp.path(),
+            r#"{"title":"第6课/上","subject":"chinese","text":"窗户\n操场\n"}"#,
+        );
         let outcome = import(&app, &payload, false).unwrap();
         assert!(outcome.dir_path.ends_with("第6课_上"));
         assert!(outcome.dir_path.starts_with(&app.lessons_dir));
@@ -1368,7 +1448,7 @@ mod tests {
 
         let text_path = temp.path().join("words.txt");
         fs::write(&text_path, "旅行\n准备\n").unwrap();
-        let outcome = import_lesson(
+        let err = import_lesson(
             &app,
             ImportOptions {
                 title: Some("第7课".to_string()),
@@ -1376,15 +1456,34 @@ mod tests {
                 ..Default::default()
             },
         )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("--subject"),
+            "flags 模式必须要求 --subject: {err:#}"
+        );
+
+        let outcome = import_lesson(
+            &app,
+            ImportOptions {
+                title: Some("第7课".to_string()),
+                text: Some(text_path.to_string_lossy().to_string()),
+                subject: Some("chinese".to_string()),
+                ..Default::default()
+            },
+        )
         .unwrap();
         assert_eq!(outcome.item_count, 2);
+        assert_eq!(outcome.subject, "chinese");
     }
 
     #[test]
     fn payload_conflicts_with_flags() {
         let temp = tempfile::tempdir().unwrap();
         let app = app_config(temp.path());
-        let payload = write_payload(temp.path(), r#"{"title":"第5课","text":"摇晃\n"}"#);
+        let payload = write_payload(
+            temp.path(),
+            r#"{"title":"第5课","subject":"chinese","text":"摇晃\n"}"#,
+        );
         let err = import_lesson(
             &app,
             ImportOptions {

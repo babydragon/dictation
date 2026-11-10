@@ -62,13 +62,28 @@ dictation serve \
 
 ## 数据库 schema
 
-时间统一用 Unix 秒（INTEGER）。
+时间统一用 Unix 秒（INTEGER）。**schema 版本 = 3**，存在 `PRAGMA user_version`。
+
+### 版本与迁移
+
+- 启动时自动迁移；迁移前用 `VACUUM INTO` 备份，只保留最近 3 份
+  （`dictation.db.bak-v1-<时间戳>`）。
+- `user_version` 高于程序支持版本 → 拒绝启动，提示升级二进制。
+- 迁移只追加、不修改；新增列必须有默认值或可空。
+- v1 → v2：`lessons`/`sessions` 增加 `subject`/`grade`/`term`；
+  `words` 唯一键从 `text` 改为 `(subject, text)`（重建表，保留原 `id`）。
+  旧数据按「含拉丁字母 → `english`，其余 → `chinese`」回填。
+- v2 → v3：`session_items` 增加 `repeat_gap_ms`（默认 1200），
+  让 `GET /api/sessions/{id}` 能精确重放已保存的会话。
 
 ```sql
 CREATE TABLE IF NOT EXISTS lessons (
   id TEXT PRIMARY KEY,
   dir TEXT NOT NULL,
   title TEXT NOT NULL,
+  subject TEXT NOT NULL DEFAULT 'chinese',
+  grade INTEGER,
+  term INTEGER,
   item_count INTEGER NOT NULL,
   total_ms INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
@@ -78,6 +93,9 @@ CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY,
   kind TEXT NOT NULL,              -- lesson | review
   lesson_id TEXT,
+  subject TEXT NOT NULL DEFAULT 'chinese',
+  grade INTEGER,
+  term INTEGER,
   title TEXT NOT NULL,
   created_at INTEGER NOT NULL,
   finished_at INTEGER
@@ -93,20 +111,23 @@ CREATE TABLE IF NOT EXISTS session_items (
   duration_ms INTEGER NOT NULL,
   gap_ms INTEGER NOT NULL,
   repeat INTEGER NOT NULL,
+  repeat_gap_ms INTEGER NOT NULL DEFAULT 1200,
   is_review INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (session_id, position)
 );
 
 CREATE TABLE IF NOT EXISTS words (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  text TEXT NOT NULL UNIQUE,
+  subject TEXT NOT NULL,
+  text TEXT NOT NULL,
   lang TEXT NOT NULL,
   clip_lesson TEXT,
   clip_path TEXT,
   duration_ms INTEGER,
   gap_ms INTEGER,
   repeat INTEGER,
-  updated_at INTEGER NOT NULL
+  updated_at INTEGER NOT NULL,
+  UNIQUE (subject, text)
 );
 
 CREATE TABLE IF NOT EXISTS attempts (
@@ -128,7 +149,9 @@ CREATE TABLE IF NOT EXISTS review_state (
 );
 ```
 
-- `words.text` 是去重键；同一词在不同课共用状态，但 clip 信息更新为最近一次 lesson session 的。
+- `words` 的去重键是 `(subject, text)`；同一科目内跨课共用状态，但 clip 信息更新为最近一次
+  lesson session 的。语文和英语的同形词互不影响。
+- `subject` 取值 `chinese` / `english`；`grade` 1–6、`term` 1/2 仅用于筛选与展示，不进唯一键。
 - `review_state` 只在检查提交后写入/更新。
 - 复习 session 不写 `words`，只引用已有 clip。
 
@@ -145,6 +168,9 @@ CREATE TABLE IF NOT EXISTS review_state (
       "id": "a1b2c3d4e5f6",
       "dir": "第5课",
       "title": "第5课 词语听写",
+      "subject": "chinese",
+      "grade": 3,
+      "term": 1,
       "item_count": 20,
       "total_ms": 181160
     }
@@ -154,6 +180,7 @@ CREATE TABLE IF NOT EXISTS review_state (
 
 - `id` = `sha256(dir_name)` 前 12 位 hex。
 - `dir` 是**相对目录名**，不含主机绝对路径；与 `POST /api/lessons` 响应一致。
+- `subject` 为 `chinese` / `english`；`grade` / `term` 可能为 `null`（旧课时或未设置）。
 - 排序：`title` 升序，同名按 `dir` 升序（稳定、与 CLI 相同）。
 - 没有课时：`200 {"lessons":[]}`，不是 404。
 - 缺 `manifest.json` 的目录、manifest 解析失败的目录：跳过并 warn，不影响其他课时。
@@ -163,7 +190,15 @@ CREATE TABLE IF NOT EXISTS review_state (
 ### `GET /api/review/summary`
 
 ```json
-{ "due_count": 0, "wrong_count": 1, "review_count": 1 }
+{
+  "due_count": 1, "wrong_count": 1, "review_count": 2,
+  "subjects": [
+    { "subject": "chinese", "due_count": 1, "wrong_count": 1,
+      "review_count": 2, "oldest_overdue_days": 3 },
+    { "subject": "english", "due_count": 0, "wrong_count": 0,
+      "review_count": 0, "oldest_overdue_days": 0 }
+  ]
+}
 ```
 
 - `due_count`：`review_state.due_at <= now` 的词数。
@@ -171,6 +206,8 @@ CREATE TABLE IF NOT EXISTS review_state (
 - `review_count`：`last_grade='again' OR due_at <= now` 的词数（去重）。
 - 首页 `错词复习 (N)` 用 `review_count`；这样孩子当天刚标错的词也能立即复习。
   `review_count=0` 时隐藏或禁用。
+- `subjects` 是按科目拆分的同一组计数（顶层字段是合计），首页按科目各显示一个入口；
+  没有复习状态的科目可以省略。
 
 ### `POST /api/sessions`
 
@@ -180,21 +217,88 @@ CREATE TABLE IF NOT EXISTS review_state (
 
 - 读取对应 lesson 的 `manifest.json`。
 - 创建 `sessions` + `session_items`；upsert `words`（clip 信息取本课）。
-- **自动混入**：在本课 items 之后、outro 之前，追加最多 5 个
-  `last_grade='again' OR due_at <= now` 的错词/到期词；跳过与本课重复的词；
-  不额外加语音提示；这些 item 的 `review=true`，`base` 指向原课。
+- **自动混入**：在本课 items 之后、outro 之前，追加
+  `min(manifest.review_cap, max(3, ceil(新词数 × 25%)))` 个
+  `last_grade='again' OR due_at <= now` 的同科目错词/到期词；
+  跳过与本课重复的词；不额外加语音提示；这些 item 的 `review=true`，`base` 指向原课。
+- 选词优先级：错词优先 → 距上次复习最久 → `due_at`；复习段顺序按 session 种子洗牌。
+- `manifest.review_cap` 默认 8，`0` 关闭混入，最大 15；复习段音频不超过 150s。
 - 返回 `SessionManifest`（字段与示例见 [`player.md`](player.md#sessionmanifest)）。
 - 如果 lesson 不存在：404。
 
 ### `POST /api/sessions/review`
 
-无 body。取 `last_grade='again' OR due_at <= now` 的 `review_state JOIN words`，
-最多 20 个，按 `due_at` 升序（刚标错的词当天也能复习）：
+```json
+{ "subject": "chinese", "limit": 20, "grade": 3, "term": 1 }
+```
+
+- `subject` **必填**（`chinese` / `english`），缺失或非法 → 400；
+- `limit` 可选，默认 **20**，范围 **1–40**，越界 → 400；
+- `grade`（1–6）/`term`（1–2）可选，按词的来源课筛选，用于「只练三年级上」；
+- 只取该科目的 `last_grade='again' OR due_at <= now` 词；
+- 选词优先级：错词优先 → 距上次复习最久 → `due_at`（刚标错的词当天也能复习）：
 
 - 创建 `sessions.kind='review'`、`title='错词复习'`。
 - `session_items.is_review=1`，clip 用 `words` 里保存的。
-- 返回 `SessionManifest`，`intro`/`outro` 为 `null`，`defaults.lead_in_ms=3000`。
+- 返回 `SessionManifest`，`subject` 为请求的科目，`intro`/`outro` 为 `null`，
+  `defaults.lead_in_ms=3000`。
 - 没有到期词：`409 {"error":"没有到期错词"}`。
+
+### `GET /api/review/queue`
+
+agent 用来挑词/排序的待复习池（只读，只返回可播放的词）。
+
+```
+GET /api/review/queue?subject=chinese&limit=100&grade=3&term=1
+```
+
+- `subject` **必填**；`limit` 默认 100、范围 1–200；`grade`/`term` 可选。
+- 排序与组卷一致：错词 → 距上次复习最久 → `due_at`。
+- `total` 是范围内可播放到期词总数（不受 `limit` 截断）。
+
+```json
+{
+  "subject": "chinese",
+  "total": 42,
+  "words": [
+    { "text": "粗壮", "lang": "zh", "last_grade": "again", "lapses": 2,
+      "due_at": "2026-11-08T10:00:00+08:00", "interval_days": 1,
+      "last_review_at": "2026-11-07T10:00:00+08:00", "overdue_days": 3 }
+  ]
+}
+```
+
+### `POST /api/sessions/custom`
+
+按 agent 给定的词表和顺序创建一个**临时复习会话**（不建课时目录、不调用 TTS）。
+
+```json
+{
+  "subject": "chinese",
+  "title": "第一单元综合复习",
+  "grade": 3,
+  "term": 1,
+  "items": ["粗壮", "摇晃", "旅行"]
+}
+```
+
+- `subject` 必填；`title` 非空；`items` 1–**60** 个，去重后顺序即播放顺序。
+- 词必须已存在于同科目且有音频；否则 400：
+  - `{"error":"未知词","unknown":["xx"]}`
+  - `{"error":"缺少音频","unplayable":["xx"]}`
+  - `{"error":"重复的词","duplicated":["xx"]}`
+  - `{"error":"复习词过多（最多 60 个，本次 N 个）","limit":60,"got":N}`
+- 返回 `SessionManifest`（`kind="review"`、`review=true`、无 intro/outro、`lead_in=3000`）。
+- 之后走普通播放 → `POST /api/sessions/{id}/check`，`attempts` / `review_state` 更新与
+  应用内复习完全一致。
+
+### `GET /api/sessions/{id}`
+
+返回已创建 session 的 `SessionManifest`，供 PWA 深链 `?s=<id>` 打开。
+
+- 课时 session：从 `lesson_id` 重新读取 manifest；课时文件缺失 → 404。
+- 复习/自定义 session：使用复习默认值（无 intro/outro、`lead_in=3000`）。
+- 未知 id → `404 {"error":"session 不存在"}`。
 
 ### `POST /api/sessions/{id}/check`
 
@@ -261,6 +365,9 @@ body 与 CLI `lesson import --payload` 的 JSON 相同：
 ```json
 {
   "title": "第5课 词语听写",
+  "subject": "chinese",
+  "grade": 3,
+  "term": 1,
   "dir": "第5课",
   "text": "摇晃\n粗壮\n毕竟\n",
   "toml": "rate = 0.9\ngap = \"6s\"\n",
@@ -270,10 +377,15 @@ body 与 CLI `lesson import --payload` 的 JSON 相同：
 
 - 校验规则与 CLI 完全一致（共用 `lesson::import`）：`title` 必填、`text` 非空、
   单条 ≤200 字符、重复词保留首次并 warn、`dir` 生成安全目录名。
+- **`subject` 必填**：`chinese` / `english`，缺失或非法 → 400；
+  `grade` 可选 1–6，`term` 可选 1/2。
+- 科目/年级/学期会合并写入 `lesson.toml`（payload 覆盖 toml 同名键），
+  生成时写入 `manifest.json`。
 - 成功：`201`（新建）/ `200`（`force=true` 覆盖）
 
 ```json
-{ "created": true, "dir": "第5课", "title": "第5课 词语听写", "item_count": 20 }
+{ "created": true, "dir": "第5课", "title": "第5课 词语听写",
+  "subject": "chinese", "grade": 3, "term": 1, "item_count": 20 }
 ```
 
 - `dir` 是**相对目录名**，不返回主机绝对路径。
@@ -392,6 +504,7 @@ body 全部可选：
 {
   "sessions": [
     { "id": "5b0d...", "kind": "lesson", "title": "第5课",
+      "subject": "chinese", "grade": 3, "term": 1,
       "created_at": "2026-11-06T10:00:00+08:00",
       "finished_at": "2026-11-06T10:05:12+08:00",
       "item_count": 20, "correct": 19, "wrong": 1 }
@@ -431,6 +544,7 @@ body 全部可选：
 - `origin_lesson` 为 `null` 表示来源课已从 `lessons/` 消失；前端照常显示词。
 - `due_at` 为 `null` 表示该词没有 `review_state`。
 - 时间一律 RFC3339、`+08:00`，与 CLI `--json` 完全一致。
+- `subject`/`grade`/`term` 来自 session 创建时的课时设置；复习会话带科目、无年级。
 
 ### 错误
 
@@ -458,6 +572,16 @@ body 全部可选：
   验证 `review_state` 到期时间、创建 review session。
 - 路径穿越测试：`../` 404。
 - 重复 check 409。
+
+科目与迁移：
+- v1 库（含中文/英文词、attempts、review_state）打开后：`user_version=2`、
+  词 id 不变、科目回填正确、外键完整；重复打开幂等；库版本更高拒绝启动；
+  备份只保留最近 3 份。
+- 同一 `text` 在中英两科下可共存。
+- `POST /api/lessons` 缺 `subject` 或值非法 → 400；成功响应回显 subject/grade/term。
+- `GET /api/lessons` 带 `subject`/`grade`/`term`，缺省为 `chinese`/`null`。
+- `POST /api/sessions/review` 缺 `subject` → 400；只取该科目到期词。
+- `GET /api/review/summary` 的 `subjects` 分组与顶层合计一致。
 
 CLI/HTTP 一致性：
 - `GET /api/lessons` 与 `lesson::list::scan` 共用读取与序列化：响应同时含 `id`

@@ -46,9 +46,44 @@ pub const DEFAULT_INTRO_EN: &str =
 pub const DEFAULT_OUTRO_ZH: &str = "听写结束，请检查一遍。";
 pub const DEFAULT_OUTRO_EN: &str = "That's the end of the dictation. Please check your answers.";
 
+/// Curriculum subject. Distinct from [`Lang`]: an English lesson may still
+/// contain Chinese glosses, and a Chinese lesson may contain Latin acronyms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Subject {
+    #[default]
+    Chinese,
+    English,
+}
+
+impl Subject {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Chinese => "chinese",
+            Self::English => "english",
+        }
+    }
+
+    /// Only the canonical API values are accepted; `lang` already uses
+    /// `zh`/`en`, so accepting those here would be ambiguous.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "chinese" => Some(Self::Chinese),
+            "english" => Some(Self::English),
+            _ => None,
+        }
+    }
+}
+
 /// Lesson-level defaults. Every item may override `rate`, `gap_ms`, `repeat`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LessonConfig {
+    /// Curriculum subject; words are keyed by `(subject, text)`.
+    pub subject: Subject,
+    /// 1–6, optional metadata used for filtering.
+    pub grade: Option<u8>,
+    /// 1 (上) or 2 (下), optional metadata.
+    pub term: Option<u8>,
     /// Speech rate, 0.5..=2.0. 1.0 is normal.
     pub rate: f32,
     /// Silence after each item, in milliseconds.
@@ -81,6 +116,9 @@ pub struct LessonConfig {
 impl Default for LessonConfig {
     fn default() -> Self {
         Self {
+            subject: Subject::Chinese,
+            grade: None,
+            term: None,
             rate: 0.9,
             gap_ms: 6_000,
             repeat: 2,
@@ -94,7 +132,7 @@ impl Default for LessonConfig {
             voice_en: None,
             voice_mixed: None,
             cue: Cue::None,
-            review_cap: 5,
+            review_cap: 8,
         }
     }
 }

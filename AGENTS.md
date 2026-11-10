@@ -36,7 +36,7 @@
   有线或无线局域网；预编译二进制需要 glibc ≥2.30。
   本地 TTS 属于可选能力，建议 4GB+ RAM 和额外 2GB 磁盘。
   课件与缓存按每课约 3–8MB 估算，100 课建议预留 1–2GB。
-- **典型规模**：一次语文听写 20 个词；可能追加最多 5 个复习词。
+- **典型规模**：一次语文听写 20–40 个词；可能追加按比例（25%，上限 8）的复习词。
 - **网络**：家里 WiFi；允许云端 TTS 和云端多模态批改。
 
 ### 交互原则
@@ -119,7 +119,8 @@ SBC 同时跑服务 + SQLite 没问题；本地 TTS 只在生成时占用 CPU。
 ### D10. 错词复习 + 自动混入
 
 - 错词/到期词进入 `review_state`；首页有“错词复习”入口。
-- 下一课自动混入最多 5 个待复习词：追加在本课词之后、outro 之前。
+- 下一课自动混入待复习词（25% × 新词数，保底 3、上限 `review_cap`）：
+  追加在本课词之后、outro 之前。
 - **不加额外语音提示**；检查页用「复习」标签区分。
 - 复习标对后，首页入口和后续混入消失。
 
@@ -167,6 +168,18 @@ CLI（`lesson import` / `lesson gen`）保留为**运维与本地调试**路径�
 
 时间输出 RFC3339；`--json` 错误走 stderr + exit 1。CLI 只读，不修改 `data/`。
 
+### D15. 科目隔离与 schema 版本
+
+- 科目是一等维度：`subject ∈ {chinese, english}`，写请求**必填**；
+  `grade`（1–6）/`term`（1/2）是可选的筛选/展示元数据。
+- 词的身份是 `(subject, text)`，不是全局 `text`；语文和英语的同形词互不影响。
+- 复习、积压、组卷都按科目隔离，一个 session 不混科目。
+- SQLite 用 `PRAGMA user_version` 管理 schema（当前 v3）：
+  - 启动时自动迁移；迁移前 `VACUUM INTO` 备份，保留最近 3 份；
+  - 库版本高于程序 → 拒绝启动；
+  - 迁移只追加、不修改；新增列必须有默认值或可空。
+- 详见 [`docs/review-scheduling.md`](docs/review-scheduling.md)。
+
 ---
 
 ## 5. 输入格式
@@ -197,6 +210,9 @@ library
 
 ```toml
 title = "第5课"
+subject = "chinese"            # 必填：chinese / english
+grade = 3                      # 可选 1–6，仅用于筛选/展示
+term = 1                       # 可选 1=上 / 2=下
 rate = 0.9
 gap = "6s"
 repeat = 2
@@ -210,7 +226,7 @@ voice_zh = "Cherry"
 voice_en = "Aiden"
 voice_mixed = "Cherry"
 # cue = "beep"                  # 保留字段；当前未实现，默认 none
-review_cap = 5
+review_cap = 8
 ```
 
 时间字段接受 `6000`、`6000ms`、`6s`、`1.2s`。
@@ -444,13 +460,14 @@ lessons/第5课/
 
 概念模型：
 
-- 词以 `text` 去重，跨课时共享状态。
+- 词以 `(subject, text)` 去重，同科目内跨课时共享状态；科目之间严格隔离。
 - `attempts` 记录每次对错；`review_state` 记录到期时间、间隔、lapses。
 - 调度：错 → 1 天；对 → 1/2/4/7/15/30 天递增；30 天封顶。
 - 待复习 = `last_grade='again' OR due_at <= now`；错词当天即可复习。
-- 组卷：本课新词 + 最多 5 个待复习词，追加在本课之后、outro 之前；
+- 组卷：本课新词 + `min(review_cap, max(3, 25%×新词数))` 个**同科目**待复习词，
+  追加在本课之后、outro 之前；
   跳过本课已有词；不加语音提示。
-- 首页另有“错词复习”入口，可单独练。
+- 首页另有“错词复习”入口，可单独练；默认 20 个，可选 1–40，支持按年级/学期筛选。
 - 后续可换 FSRS；接口保持不变。
 
 **实际 SQLite schema 与 API 以 [`docs/http-api.md`](docs/http-api.md) 为准。**
@@ -466,6 +483,8 @@ axum 服务（SBC / 本机）
   ├─ POST /api/lessons            导入词表（校验后写 lessons/）
   ├─ POST /api/lessons/{id}/generate → 后台 job
   ├─ GET  /api/jobs/{id}          轮询
+  ├─ GET  /api/review/queue       待复习池（agent 挑词）
+  ├─ POST /api/sessions/custom    临时复习课时（agent 给词表和顺序）
   ├─ lessons / sessions / check / review
   └─ media / static PWA
         ↓（生成由服务进程执行，持有 TTS 密钥）
@@ -575,7 +594,8 @@ dictation/
 ├── TODO.md                # 进度/验收/日志
 ├── docs/
 │   ├── http-api.md        # 服务端 HTTP API / SQLite / 一致性契约
-│   └── player.md          # 儿童端播放器与自检交互
+│   ├── player.md          # 儿童端播放器与自检交互
+│   └── review-scheduling.md # 科目隔离、复习组卷、AI 临时复习
 ├── deploy/
 │   ├── dictation.service  # systemd unit
 │   ├── config.example     # /etc/dictation/config.toml

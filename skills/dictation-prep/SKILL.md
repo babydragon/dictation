@@ -47,6 +47,9 @@ curl -sS "$API/api/jobs/<job_id>"
 ```json
 {
   "title": "第5课 词语听写",
+  "subject": "chinese",
+  "grade": 3,
+  "term": 1,
   "dir": "第5课",
   "text": "摇晃\n粗壮\n毕竟\n",
   "toml": "rate = 0.9\ngap = \"6s\"\nrepeat = 2\n",
@@ -54,6 +57,9 @@ curl -sS "$API/api/jobs/<job_id>"
 }
 ```
 
+- `subject`：**必填**，`chinese`（语文）或 `english`（英语）。缺了会 400，**没有默认值**；
+  不确定就问家长，不要猜。
+- `grade`（1–6）、`term`（1=上 / 2=下）：可选，用于后续按年级筛选复习。
 - `text`：**一行一个词**，保持老师给的顺序；不要加标题行（服务端会写 `# title`）。
 - `toml`：可选；不写则用默认设置。字符串里的换行用 `\n`。
 - `dir`：可选；不给则从 `title` 生成安全目录名。
@@ -106,7 +112,7 @@ announce_index = false
 intro = "请准备好纸和笔，听写马上开始。"
 intro_gap = "1.5s"
 outro = "听写结束，请检查一遍。"
-review_cap = 5
+review_cap = 8
 ```
 
 - 默认不逐题播报“第 N 个”。
@@ -187,6 +193,58 @@ curl -sS -X POST "$API/api/lessons/第5课/generate" "${AUTH[@]}" -d '{}'
   不要猜路径、不要用文件工具绕过。
 - CLI（`dictation lesson import` / `lesson gen`）是主机侧运维入口，
   只在家长明确要求本机操作时使用。
+
+## 复习组卷 / 加练（agent 挑词）
+
+家长说“今天没有新词，帮我挑一些复习”“错词太多，帮我排个顺序”时，走 HTTP，
+**不要自己猜词，也不要把词写回课时**。
+
+### 1. 拉取待复习池
+
+```bash
+curl -sS "$API/api/review/queue?subject=chinese&limit=200"
+```
+
+- `subject` **必填**；`limit` 默认 100、最大 200；可选 `grade`/`term`。
+- `total` 是范围内总量，`words` 已按「错词优先 → 最久未复习」排序；
+  可以直接取前 N 个，也可以按你的教学判断重排。
+- 只返回有音频、可播放的词。
+
+### 2. 创建临时复习课时
+
+```bash
+curl -sS -X POST "$API/api/sessions/custom" "${AUTH[@]}" \
+  -H 'content-type: application/json' -d '{
+    "subject": "chinese",
+    "title": "第一单元综合复习",
+    "grade": 3,
+    "term": 1,
+    "items": ["粗壮", "摇晃", "旅行"]
+  }'
+```
+
+- `items` 的顺序就是播放顺序；
+- **最多 60 个词**。超过会返回
+  `{"error":"复习词过多（最多 60 个，本次 N 个）","limit":60,"got":N}`，
+  必须裁剪到 60 以内，或请家长分成两次复习；**不要原样重试**。
+- 未知词 / 缺音频会分别返回 `unknown` / `unplayable` 列表，按列表修正后再试。
+- 你只决定「选哪些词、什么顺序」，**不参与判分和排期**；对错与下次复习时间由
+  应用批改后统一计算。
+
+### 3. 把链接给家长
+
+返回的 `session_id` 拼成 `$API/?s=<session_id>`，家长在手机上打开后点卡片开始。
+
+### 直接加练
+
+不需要挑词时，直接按科目开一个复习会话：
+
+```bash
+curl -sS -X POST "$API/api/sessions/review" "${AUTH[@]}" \
+  -H 'content-type: application/json' -d '{"subject":"chinese","limit":20}'
+```
+
+`limit` 默认 20、最大 40。
 
 ## 查询听写结果 / 分析错词
 

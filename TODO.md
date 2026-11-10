@@ -24,10 +24,14 @@
 | 结果查询 / 错词导出 | ✅ `result list/show/wrong`，JSON 供大模型分析 |
 | 结果查询 HTTP 化 | ✅ `GET /api/results[/{id}|/latest][/wrong]`，与 CLI 同一序列化 |
 | CLI/HTTP 一致性 | ✅ 导入、列表、结果共用实现；约定见 `docs/http-api.md` |
+| 科目隔离 / schema v2 | ✅ 迁移 + subject/grade/term 贯通 |
+| 复习组卷算法 | ✅ review_cap 生效、优先级、比例、洗牌、150s 护栏 |
+| 复习加练 | ✅ `limit`(1–40)、`grade`/`term` 筛选、科目卡片显示逾期 |
+| AI 组卷 | ✅ `/api/review/queue`、`/api/sessions/custom`、`GET /api/sessions/{id}`、`?s=` 深链 |
 | 缓存清理 | ✅ `clean --unused/--older-than`，默认 dry-run |
 | 断点续听 | ✅ localStorage 保存 session + item，7 天有效 |
 
-当前测试：`cargo test` **156 passed**（147 lib + 9 bin）；clippy / fmt 干净；
+当前测试：`cargo test` **188 passed**（179 lib + 9 bin）；clippy / fmt 干净；
 release 构建通过。
 演示课时：`lessons/第5课`（20 词，3:24，运行时数据，不提交）。
 
@@ -41,6 +45,14 @@ release 构建通过。
 3. **记忆曲线细化**：`review_cap` 接到服务端、FSRS、按教材/单元限定范围。
 4. **本地 TTS（可选）**：断网兜底，SBC 上选型与实测。
 5. **F8 外网分享**：Cloudflare Pages + R2，独立会话实施；要点见 §5 F8。
+
+### 发布 v0.2.0-rc.1（科目 + 复习组卷）
+
+- [ ] `Cargo.toml` / `Cargo.lock` 升到 `0.2.0-rc.1`
+- [ ] 全量验证：fmt / clippy / tests / JS / bash -n / x86 + riscv64
+- [ ] commit + push + tag `v0.2.0-rc.1`（CI 自动 `--prerelease`）
+- [ ] 校验 release 资产、`SHA256SUMS`、RISC-V ELF
+- [ ] 从 release 安装一次（`--version v0.2.0-rc.1`）并跑迁移 + HTTP 生成
 
 ### 发布 v0.1.0（正式版）
 
@@ -254,7 +266,7 @@ dictation result import <file|-> [--json]
 
 ### 6.1 自动化
 
-- `cargo test`：156 passed（147 lib + 9 bin，截至 2026-11-09）。
+- `cargo test`：188 passed（179 lib + 9 bin，截至 2026-11-09）。
 - `cargo clippy --all-targets -- -D warnings`：0 warning。
 - `cargo fmt --check`：通过。
 - `cargo build --release`：通过。
@@ -476,6 +488,62 @@ dictation result import <file|-> [--json]
   两侧同步、语义一致。§13 目录补 `lesson/list.rs`、`result_view.rs`。
 - skill 的课时列表说明补齐 `dir` 字段与用途。
 - 验证：fmt / clippy / 156 tests / `node --check` 通过。
+
+### 2026-11-09（AI 组卷）
+
+- `GET /api/review/queue`：返回可播放的待复习词（错词→最久未复习排序），
+  支持 `limit`(1–200)、`grade`/`term`；`total` 不受 limit 截断。
+- `POST /api/sessions/custom`：按 agent 给定的词表与顺序创建临时复习会话；
+  1–60 个词，重复/未知/缺音频分别 400；不建课时目录、不调 TTS。
+- `GET /api/sessions/{id}`：重放已创建 session；课时 session 重新读 manifest，
+  复习/自定义 session 用复习默认值。
+- schema v3：`session_items` 增加 `repeat_gap_ms`，`GET /api/sessions/{id}` 可精确重放
+  （否则非默认 repeat_gap 的课时会按 1200ms 播放）。
+- PWA 支持 `?s=<session_id>` 深链：首页出现「点击开始」卡片（规避 iOS 自动播放限制）。
+- skill 新增「复习组卷 / 加练」流程，写明 60 词上限、错误处理、agent 只选词不排期。
+- 验证：188 tests；fmt / clippy / JS 通过。
+
+### 2026-11-09（复习加练）
+
+- `POST /api/sessions/review` 支持 `limit`（默认 20，范围 1–40）、`grade`（1–6）、
+  `term`（1–2）；非法值 400。
+- `create_review_session_filtered`：按 `words.clip_lesson → lessons.grade/term`
+  过滤来源课；选词排序沿用「错词 → 最久未复习 → due_at」；session 记录
+  subject/grade/term。
+- 首页科目复习卡显示「最久 N 天未复习」，便于判断是否需要加练。
+- 测试：db 的 limit/grade/term 过滤；HTTP 的 limit 生效、默认值与越界校验。
+- 验证：182 tests；fmt / clippy / JS 通过。
+
+### 2026-11-09（复习组卷算法）
+
+- `review_cap` 写入 `manifest.json`（顶层，默认 8，0=关闭），服务端从 manifest 读取；
+  修复此前「lesson.toml 配置不生效」的问题。
+- 数量：`min(review_cap, max(3, ceil(新词数 × 25%)))`；20→5、30→8、40→8。
+- 选词优先级：`last_grade='again'` 优先 → 距上次复习最久
+  （`due_at - interval_days*86400`）→ `due_at` → id。
+- 播放顺序：选词后按 session 随机种子 `sha256(seed + text)` 洗牌，
+  同一 session 稳定、不同 session 不同，避免固定搭配形成位置记忆。
+- 时长护栏：复习段累计音频 ≤ 150s；至少保留 1 个，避免静默空复习。
+- 验证：180 tests（含优先级、比例、预算、洗牌稳定性、cap=0 集成）；
+  fmt / clippy / JS 通过。
+
+### 2026-11-09（科目隔离 + schema v2）
+
+- 迁移框架：`PRAGMA user_version`（当前 v2）；迁移前 `VACUUM INTO` 备份、只留最近 3 份；
+  库版本高于程序 → 拒绝启动；`words` 重建保留原 id，按「含拉丁字母 → `english`，
+  其余 → `chinese`」回填。
+- 数据模型：`subject`（`chinese`/`english`）必填；`grade`（1–6）/`term`（1/2）可选；
+  词身份改为 `(subject, text)`；manifest、session、结果查询全链路带科目。
+- 导入：HTTP 与 CLI 都要求 `subject`，`grade`/`term` 可选；与传入 toml 合并后写入
+  `lesson.toml`（payload 覆盖同名键）。
+- 复习：`POST /api/sessions/review` 必须带 `subject`；自动混入与
+  `GET /api/review/summary` 的 `subjects` 分组都按科目隔离；首页按科目出卡。
+- 兼容：旧 manifest 缺 `subject` 读作 `chinese`；旧库自动迁移；旧 PWA 需同版本更新
+  （复习请求现在带 `subject`）。
+- 验证：173 tests；真实 `data/dictation.db` 副本迁移成功（user_version=2、生成备份、
+  词 id 保留）；HTTP 实测导入缺 subject 400、带 subject 201、复习缺 subject 400、
+  科目分组正确。
+- 下一步：组卷算法（`review_cap` 生效、优先级、数量、洗牌、150s 护栏）。
 
 ### 2026-11-09（文档按功能拆分）
 

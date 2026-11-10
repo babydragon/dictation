@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
-use crate::model::{Cue, Item, Lang, Lesson, LessonConfig};
+use crate::model::{Cue, Item, Lang, Lesson, LessonConfig, Subject};
 
 pub mod import;
 pub mod list;
@@ -15,6 +15,9 @@ pub mod list;
 #[derive(Debug, Default, Deserialize)]
 struct LessonToml {
     title: Option<String>,
+    subject: Option<String>,
+    grade: Option<u8>,
+    term: Option<u8>,
     rate: Option<f32>,
     gap: Option<DurationField>,
     repeat: Option<u8>,
@@ -98,6 +101,23 @@ impl LessonToml {
         }
         if let Some(review_cap) = self.review_cap {
             config.review_cap = review_cap;
+        }
+        if let Some(raw) = self.subject {
+            config.subject = Subject::parse(&raw).with_context(|| {
+                format!("lesson.toml: subject 必须是 chinese 或 english，当前 {raw}")
+            })?;
+        }
+        if let Some(grade) = self.grade {
+            if !(1..=6).contains(&grade) {
+                bail!("lesson.toml: grade 必须在 1–6 之间，当前 {grade}");
+            }
+            config.grade = Some(grade);
+        }
+        if let Some(term) = self.term {
+            if !(1..=2).contains(&term) {
+                bail!("lesson.toml: term 必须是 1（上）或 2（下），当前 {term}");
+            }
+            config.term = Some(term);
         }
         Ok(self.title)
     }
@@ -738,6 +758,48 @@ mod tests {
         assert_eq!(lesson.outro_lang(), Lang::Zh);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_subject_grade_and_term() {
+        use crate::model::Subject;
+
+        let toml = "subject = \"english\"\ngrade = 3\nterm = 1\n";
+        let lesson = parse_with_toml(
+            "apple\nlibrary\n",
+            &tmp_path("subject.txt"),
+            None,
+            Some(toml),
+        )
+        .unwrap();
+        assert_eq!(lesson.config.subject, Subject::English);
+        assert_eq!(lesson.config.grade, Some(3));
+        assert_eq!(lesson.config.term, Some(1));
+
+        let default = parse_str("摇晃\n", &tmp_path("default-subject.txt"), None).unwrap();
+        assert_eq!(default.config.subject, Subject::Chinese);
+        assert_eq!(default.config.grade, None);
+        assert_eq!(default.config.term, None);
+    }
+
+    #[test]
+    fn rejects_invalid_subject_grade_and_term() {
+        for toml in [
+            "subject = \"math\"\n",
+            "grade = 0\n",
+            "grade = 7\n",
+            "term = 3\n",
+        ] {
+            let err =
+                parse_with_toml("摇晃\n", &tmp_path("bad-meta.txt"), None, Some(toml)).unwrap_err();
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("subject")
+                    || message.contains("grade")
+                    || message.contains("term"),
+                "{toml} 必须报出具体字段: {message}"
+            );
+        }
     }
 
     #[test]

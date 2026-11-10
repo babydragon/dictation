@@ -245,6 +245,10 @@ pub async fn render(
     let manifest = Manifest {
         version: manifest::MANIFEST_VERSION,
         title: lesson.title.clone(),
+        subject: Some(lesson.config.subject),
+        grade: lesson.config.grade,
+        term: lesson.config.term,
+        review_cap: lesson.config.review_cap,
         generated_at: now_rfc3339(),
         defaults: ManifestDefaults {
             gap_ms: lesson.config.gap_ms,
@@ -1038,6 +1042,70 @@ mod tests {
             .filter(|path| path.extension().is_some_and(|ext| ext == "wav"))
             .collect();
         assert_eq!(wavs.len(), 1, "相同缓存键只应写一个片段文件");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn manifest_carries_review_cap() {
+        let dir = temp_dir("review-cap");
+        let out_dir = dir.join("out");
+        let cache = Cache::new(dir.join("cache"));
+        let provider = TestProvider::new(24_000);
+        let mut lesson = test_lesson(1_000);
+        lesson.config.review_cap = 2;
+
+        let result = render(
+            &lesson,
+            &provider,
+            &cache,
+            &config(),
+            &RenderOptions {
+                out_dir: out_dir.clone(),
+                full_track: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let manifest: Manifest =
+            serde_json::from_str(&fs::read_to_string(&result.manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest.review_cap, 2);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn manifest_carries_subject_grade_and_term() {
+        use crate::model::Subject;
+
+        let dir = temp_dir("meta");
+        let out_dir = dir.join("out");
+        let cache = Cache::new(dir.join("cache"));
+        let provider = TestProvider::new(24_000);
+        let mut lesson = test_lesson(1_000);
+        lesson.config.subject = Subject::English;
+        lesson.config.grade = Some(3);
+        lesson.config.term = Some(2);
+
+        let result = render(
+            &lesson,
+            &provider,
+            &cache,
+            &config(),
+            &RenderOptions {
+                out_dir: out_dir.clone(),
+                full_track: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let manifest: Manifest =
+            serde_json::from_str(&fs::read_to_string(&result.manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest.subject(), Subject::English);
+        assert_eq!(manifest.grade, Some(3));
+        assert_eq!(manifest.term, Some(2));
 
         let _ = fs::remove_dir_all(&dir);
     }

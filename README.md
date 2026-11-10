@@ -8,7 +8,8 @@
 
 ## 安装（发布包）
 
-当前正式版 `v0.1.0`；预发布使用 `-rc.x`（例如 `v0.1.0-rc.2`）。
+当前正式版 `v0.1.0`；预发布 `v0.2.0-rc.1`（科目隔离、复习组卷、AI 组卷）。
+预发布使用 `-rc.x` 后缀，例如 `v0.2.0-rc.1`。
 
 ```bash
 # 指定版本（推荐，可复现）
@@ -173,6 +174,7 @@ curl -sS "$API/api/health"
 # 导入（201 新建 / 200 覆盖 / 409 已存在）
 curl -sS -X POST "$API/api/lessons" -H 'content-type: application/json' -d '{
   "title": "第5课",
+  "subject": "chinese",
   "text": "摇晃\n粗壮\n毕竟\n",
   "toml": "rate = 0.9\ngap = \"6s\"\n"
 }'

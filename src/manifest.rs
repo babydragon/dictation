@@ -4,7 +4,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::model::Lang;
+use crate::model::{Lang, Subject};
 
 pub const MANIFEST_VERSION: u32 = 1;
 
@@ -12,6 +12,16 @@ pub const MANIFEST_VERSION: u32 = 1;
 pub struct Manifest {
     pub version: u32,
     pub title: String,
+    /// Optional for backwards compatibility; missing means `chinese`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<Subject>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grade: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub term: Option<u8>,
+    /// Maximum review words mixed into a lesson session; 0 disables mixing.
+    #[serde(default = "default_review_cap")]
+    pub review_cap: u8,
     pub generated_at: String,
     pub defaults: ManifestDefaults,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -26,6 +36,17 @@ pub struct Manifest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub full_track: Option<String>,
     pub total_ms: u32,
+}
+
+fn default_review_cap() -> u8 {
+    8
+}
+
+impl Manifest {
+    /// Subject of the lesson; old manifests without the field are Chinese.
+    pub fn subject(&self) -> Subject {
+        self.subject.unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +100,10 @@ mod tests {
         Manifest {
             version: MANIFEST_VERSION,
             title: "第5课".to_string(),
+            subject: None,
+            grade: None,
+            term: None,
+            review_cap: 8,
             generated_at: "2026-10-20T12:00:00+08:00".to_string(),
             defaults: ManifestDefaults {
                 gap_ms: 6_000,
@@ -164,5 +189,28 @@ mod tests {
         assert!(!json.contains("\"outro\":"));
         assert!(!json.contains("\"outro_text\":"));
         assert!(json.contains("\"intro_gap_ms\":1500"));
+    }
+
+    #[test]
+    fn review_cap_defaults_to_eight_for_old_manifests() {
+        let mut value = serde_json::to_value(sample_manifest()).unwrap();
+        value.as_object_mut().unwrap().remove("review_cap");
+        let parsed: Manifest = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.review_cap, 8);
+    }
+
+    #[test]
+    fn old_manifest_without_subject_reads_as_chinese() {
+        use crate::model::Subject;
+
+        let mut value = serde_json::to_value(sample_manifest()).unwrap();
+        value.as_object_mut().unwrap().remove("subject");
+        value.as_object_mut().unwrap().remove("grade");
+        value.as_object_mut().unwrap().remove("term");
+
+        let parsed: Manifest = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.subject(), Subject::Chinese);
+        assert_eq!(parsed.grade, None);
+        assert_eq!(parsed.term, None);
     }
 }
