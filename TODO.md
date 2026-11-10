@@ -48,11 +48,11 @@ release 构建通过。
 
 ### 发布 v0.2.0-rc.1（科目 + 复习组卷）
 
-- [ ] `Cargo.toml` / `Cargo.lock` 升到 `0.2.0-rc.1`
-- [ ] 全量验证：fmt / clippy / tests / JS / bash -n / x86 + riscv64
-- [ ] commit + push + tag `v0.2.0-rc.1`（CI 自动 `--prerelease`）
-- [ ] 校验 release 资产、`SHA256SUMS`、RISC-V ELF
-- [ ] 从 release 安装一次（`--version v0.2.0-rc.1`）并跑迁移 + HTTP 生成
+- [x] `Cargo.toml` / `Cargo.lock` 升到 `0.2.0-rc.1`
+- [x] 全量验证：fmt / clippy / 188 tests / JS / bash -n / x86 + riscv64
+- [x] commit + push + tag `v0.2.0-rc.1`（CI 自动 `--prerelease`）
+- [x] 校验 release 资产、`SHA256SUMS`、RISC-V ELF
+- [x] 从 release 安装一次（`--version v0.2.0-rc.1`）并跑迁移 + HTTP 生成
 
 ### 发布 v0.1.0（正式版）
 
@@ -489,7 +489,20 @@ dictation result import <file|-> [--json]
 - skill 的课时列表说明补齐 `dir` 字段与用途。
 - 验证：fmt / clippy / 156 tests / `node --check` 通过。
 
-### 2026-11-09（AI 组卷）
+### 2026-11-10（v0.2.0-rc.1 已发布）
+
+- 提交 `f948c49`，tag `v0.2.0-rc.1`；Action `42734981595` 全流程通过。
+- pre-release：`https://github.com/babydragon/dictation/releases/tag/v0.2.0-rc.1`
+- 资产：x86_64（4.7MB）、riscv64gc（4.1MB）、`install.sh`、`SHA256SUMS`；
+  `sha256sum -c` 通过，RISC-V 为 ELF64 RISC-V。
+- 从 release 实测：`install.sh --root ... --no-systemd --version v0.2.0-rc.1`
+  安装成功，二进制 `0.2.0-rc.1`。
+- release 二进制搭真实 v1 数据库副本启动：自动迁移到 `user_version=3`、
+  生成 `dictation.db.bak-v1-*`、科目回填正确；HTTP 导入（english/grade 3）→
+  mock 生成 → `POST /api/sessions` 返回带 subject/grade 的 manifest。
+- 下一步：设备上验证（科目/复习组卷/加练/AI 组卷），再决定 `v0.2.0` 正式版。
+
+
 
 - `GET /api/review/queue`：返回可播放的待复习词（错词→最久未复习排序），
   支持 `limit`(1–200)、`grade`/`term`；`total` 不受 limit 截断。
