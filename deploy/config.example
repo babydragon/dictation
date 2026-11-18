@@ -3,7 +3,7 @@
 
 [paths]
 # 可写数据根目录；相对路径会基于它解析。
-base = "/srv/dictation"
+base = "/var/lib/dictation"
 
 # 以下相对 base；也可以写绝对路径。
 lessons = "lessons"

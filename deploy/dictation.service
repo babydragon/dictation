@@ -20,7 +20,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/srv/dictation
+ReadWritePaths=/var/lib/dictation
 UMask=0027
 
 [Install]

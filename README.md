@@ -25,14 +25,14 @@ curl -fsSL https://github.com/babydragon/dictation/releases/latest/download/inst
 
 - 下载对应架构的 tgz（x86_64 / riscv64）；
 - 校验 `SHA256SUMS`；
-- 安装到 `/opt/dictation`、`/srv/dictation`、`/etc/dictation`；
+- 安装到 `/opt/dictation`、`/var/lib/dictation`、`/etc/dictation`；
 - 保留已有 `config.toml`、env、课时和数据库；
 - 安装/更新 systemd unit 并重启服务。
 
-数据目录默认 `/srv/dictation`；如果更喜欢 FHS 的服务状态目录，可以：
+数据目录默认 `/var/lib/dictation`（FHS 服务状态目录）；如果更想放在 `/srv/dictation`，可以：
 
 ```bash
-... | sudo bash -s -- --version v0.2.0 --data-root /var/lib/dictation
+... | sudo bash -s -- --version v0.2.0 --data-root /srv/dictation
 ```
 
 `--dry-run` 只下载/校验并打印计划，不写系统；`--no-systemd` 跳过服务安装。

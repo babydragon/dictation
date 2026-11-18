@@ -540,7 +540,7 @@ CLI 仍保留 `dictation gen` 作为运维/本地调试入口。
 
 ```toml
 [paths]
-base = "/srv/dictation"
+base = "/var/lib/dictation"
 lessons = "lessons"      # 相对 base；也可绝对
 data = "data"            # DB = <data>/dictation.db
 cache = "cache"
@@ -554,15 +554,15 @@ port = 8080
 - `lessons`/`data`/`cache` 相对 `base`；`web` 默认相对 base，示例用绝对。
 - `--config` 是 clap global arg，所有子命令可用。
 - `dictation config show [--json]` 输出解析后的路径与来源。
-- 安装脚本的 `--data-root` 可把 `base` 改为 `/var/lib/dictation` 等其他目录；
-  默认 `/srv/dictation`。改目录时同步更新 managed unit 的 `ReadWritePaths`。
+- 安装脚本的 `--data-root` 可把 `base` 改为 `/srv/dictation` 等其他目录；
+  默认 `/var/lib/dictation`。改目录时同步更新 managed unit 的 `ReadWritePaths`。
 
 ### 部署 / 交叉编译
 
 - SBC：`riscv64gc-unknown-linux-gnu`，Linux（glibc ≥2.30）；systemd 常驻。
 - 优先本地 `cargo zigbuild` 交叉编译。
 - 目录分离：`/opt/dictation` 只放只读程序（二进制、`web/`、INSTALL）；
-  `/srv/dictation/{lessons,data,cache}` 放可写数据。
+  `/var/lib/dictation/{lessons,data,cache}` 放可写数据。
   agent 以普通用户运行，加入 `dictation` 组，只写 `lessons/`/`cache`；
   `data/`（SQLite）由服务独占写入。
 - **依赖约束：新增依赖优先纯 Rust；尽可能避免 `*-sys` crate**

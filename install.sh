@@ -4,7 +4,7 @@
 #
 # 从 GitHub release（或镜像目录）下载预编译包，按 INSTALL.md 的约定安装：
 #   程序  /opt/dictation            (root:root, 只读)
-#   数据  /srv/dictation/{lessons,data,cache} (dictation:dictation)
+#   数据  /var/lib/dictation/{lessons,data,cache} (dictation:dictation)
 #   配置  /etc/dictation/config.toml, /etc/dictation/env
 #   unit  /etc/systemd/system/dictation.service
 #
@@ -29,7 +29,7 @@ BASE_URL="${DICTATION_BASE_URL:-}"
 NO_SYSTEMD=0
 DRY_RUN=0
 ROOT_PREFIX=""
-DATA_ROOT="/srv/dictation"
+DATA_ROOT="/var/lib/dictation"
 # 服务实际使用的数据根：优先取已存在 config.toml 的 [paths].base；
 # 只有新装配置时才由 --data-root 决定。install_config 之后解析。
 EFFECTIVE_BASE=""
@@ -55,10 +55,10 @@ dictation installer
   --dry-run             只打印将要执行的操作，不写安装目标（不要求 root）
   --root <dir>          安装到自定义前缀：<dir>/opt、<dir><data-root>、<dir>/etc；
                         同时跳过用户/组和 systemd（用于测试）
-  --data-root <dir>     可写数据根目录，默认 /srv/dictation；只对“新装配置”生效。
+  --data-root <dir>     可写数据根目录，默认 /var/lib/dictation；只对“新装配置”生效。
                         若 /etc/dictation/config.toml 已存在，其 [paths].base 优先，
                         unit 的 ReadWritePaths 会跟随配置（不会改写已有配置）
-                        也可以设为 /var/lib/dictation
+                        也可以设为 /srv/dictation
   -h, --help            显示本帮助
 
 环境变量:
@@ -461,14 +461,11 @@ install_config() {
   if [ -e "$ETC_DIR/config.toml" ]; then
     log "保留现有配置: $ETC_DIR/config.toml"
   else
-    if [ "$DATA_ROOT" = "/srv/dictation" ]; then
-      run install -m 0644 "$SRC/deploy/config.example" "$ETC_DIR/config.toml"
-    else
-      # 替换整行 base（容忍引号/空白变化），而不是只匹配默认值。
-      sed -E "s|^[[:space:]]*base[[:space:]]*=.*\$|base = \"$DATA_ROOT\"|" \
-        "$SRC/deploy/config.example" > "$TMP_DIR/config.toml"
-      run install -m 0644 "$TMP_DIR/config.toml" "$ETC_DIR/config.toml"
-    fi
+    # 始终把 base 替换成本次的数据根（容忍引号/空白变化），
+    # 这样脚本与 release 资产里的模板新旧不一致时也不会写错目录。
+    sed -E "s|^[[:space:]]*base[[:space:]]*=.*\$|base = \"$DATA_ROOT\"|" \
+      "$SRC/deploy/config.example" > "$TMP_DIR/config.toml"
+    run install -m 0644 "$TMP_DIR/config.toml" "$ETC_DIR/config.toml"
     log "已安装 $ETC_DIR/config.toml（请按需编辑）"
   fi
 
@@ -527,7 +524,10 @@ install_unit() {
   log "安装 systemd unit"
   [ -n "$EFFECTIVE_BASE" ] || die "内部错误：EFFECTIVE_BASE 未初始化"
   local unit_src="$TMP_DIR/dictation.service"
-  sed "s|/srv/dictation|$EFFECTIVE_BASE|g" "$SRC/deploy/dictation.service" > "$unit_src"
+  # 兼容新旧模板：默认数据根历史上有 /srv 与 /var/lib 两种。
+  sed -e "s|/srv/dictation|$EFFECTIVE_BASE|g" \
+      -e "s|/var/lib/dictation|$EFFECTIVE_BASE|g" \
+      "$SRC/deploy/dictation.service" > "$unit_src"
 
   if [ ! -e "$UNIT_FILE" ]; then
     run install -d -m 0755 "$UNIT_DIR"
