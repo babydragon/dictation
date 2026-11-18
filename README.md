@@ -8,13 +8,13 @@
 
 ## 安装（发布包）
 
-当前正式版 `v0.1.0`；预发布 `v0.2.0-rc.1`（科目隔离、复习组卷、AI 组卷）。
-预发布使用 `-rc.x` 后缀，例如 `v0.2.0-rc.1`。
+当前正式版 `v0.2.0`（科目隔离、复习组卷、范围复习）。
+预发布使用 `-rc.x` 后缀，例如 `v0.3.0-rc.1`。
 
 ```bash
 # 指定版本（推荐，可复现）
-curl -fsSL https://github.com/babydragon/dictation/releases/download/v0.1.0/install.sh \
-  | sudo bash -s -- --version v0.1.0
+curl -fsSL https://github.com/babydragon/dictation/releases/download/v0.2.0/install.sh \
+  | sudo bash -s -- --version v0.2.0
 
 # 最新正式版（自动解析 latest，不含 pre-release）
 curl -fsSL https://github.com/babydragon/dictation/releases/latest/download/install.sh \
@@ -32,7 +32,7 @@ curl -fsSL https://github.com/babydragon/dictation/releases/latest/download/inst
 数据目录默认 `/srv/dictation`；如果更喜欢 FHS 的服务状态目录，可以：
 
 ```bash
-... | sudo bash -s -- --version v0.1.0 --data-root /var/lib/dictation
+... | sudo bash -s -- --version v0.2.0 --data-root /var/lib/dictation
 ```
 
 `--dry-run` 只下载/校验并打印计划，不写系统；`--no-systemd` 跳过服务安装。

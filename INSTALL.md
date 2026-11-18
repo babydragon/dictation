@@ -10,15 +10,15 @@
 正式版：
 
 ```bash
-curl -fsSL https://github.com/babydragon/dictation/releases/download/v0.1.0/install.sh \
-  | sudo bash -s -- --version v0.1.0
+curl -fsSL https://github.com/babydragon/dictation/releases/download/v0.2.0/install.sh \
+  | sudo bash -s -- --version v0.2.0
 
 # 或让脚本解析 latest（不含 pre-release）
 curl -fsSL https://github.com/babydragon/dictation/releases/latest/download/install.sh \
   | sudo bash
 ```
 
-预发布使用 `-rc.x`（例如 `v0.1.0-rc.2`），把上面的版本号整体替换即可。
+预发布使用 `-rc.x`（例如 `v0.3.0-rc.1`），把上面的版本号整体替换即可。
 
 `install.sh` 会：
 
@@ -33,7 +33,7 @@ curl -fsSL https://github.com/babydragon/dictation/releases/latest/download/inst
 常用参数：
 
 ```bash
-install.sh --version v0.1.0       # 指定版本
+install.sh --version v0.2.0       # 指定版本
 install.sh --dry-run               # 只下载/校验/打印计划
 install.sh --no-systemd            # 只安装文件，不装服务
 install.sh --repo owner/repo       # 覆盖默认仓库
