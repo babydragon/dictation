@@ -4,7 +4,8 @@
 > `AGENTS.md` 只保留稳定设计与约定；每次工作完成后更新本文件，不要为了进度去改
 > `AGENTS.md`（除非设计本身变了）。
 >
-> 最后更新：2026-11-09
+> 术语与命名见 [`docs/glossary.md`](docs/glossary.md)，本文件用词以词表为准。
+> 最后更新：2026-11-18
 
 ---
 
@@ -26,13 +27,14 @@
 | CLI/HTTP 一致性 | ✅ 导入、列表、结果共用实现；约定见 `docs/http-api.md` |
 | 科目隔离 / schema v2 | ✅ 迁移 + subject/grade/term 贯通 |
 | 复习组卷算法 | ✅ review_cap 生效、优先级、比例、洗牌、150s 护栏 |
-| 复习加练 | ✅ `limit`(1–40)、`grade`/`term` 筛选、科目卡片显示逾期 |
-| AI 组卷 | ✅ `/api/review/queue`、`/api/sessions/custom`、`GET /api/sessions/{id}`、`?s=` 深链 |
+| 错词复习 | ✅ `limit`(1–40)、`grade`/`term` 筛选、科目卡片显示逾期 |
+| 范围复习 | ✅ `/api/review/queue`、`/api/sessions/custom`、`GET /api/sessions/{id}`、`?s=` 深链 |
+| 复习第二轮（课内复习 + 范围复习） | ✅ schema v4 / 排序 / 提前复习调度 / `lesson_id` / `/api/review/lessons` / `/api/words` / `custom.shuffle` / PWA「复习 N」 |
 | 缓存清理 | ✅ `clean --unused/--older-than`，默认 dry-run |
-| 断点续听 | ✅ localStorage 保存 session + item，7 天有效 |
+| 断点续听 | ✅ localStorage 保存会话 + 条目，7 天有效 |
 
-当前测试：`cargo test` **188 passed**（179 lib + 9 bin）；clippy / fmt 干净；
-release 构建通过。
+当前测试：`cargo test` **198 passed**（189 lib + 9 bin）；clippy / fmt 干净；
+`node --check web/app.js` 通过。
 演示课时：`lessons/第5课`（20 词，3:24，运行时数据，不提交）。
 
 ## 2. 下一步（按优先级）
@@ -42,7 +44,7 @@ release 构建通过。
 
 1. **家长模式 / 答案纸**：运行中调 gap/rate/repeat；A4 一列 20 题、带题号。
 2. **拍照批改**：`Grader` trait + 多模态模型 + 置信度 + 人工确认。
-3. **记忆曲线细化**：`review_cap` 接到服务端、FSRS、按教材/单元限定范围。
+3. **记忆曲线细化**：FSRS、按教材/单元限定范围（当前用课时范围表达）。
 4. **本地 TTS（可选）**：断网兜底，SBC 上选型与实测。
 5. **F8 外网分享**：Cloudflare Pages + R2，独立会话实施；要点见 §5 F8。
 
@@ -500,7 +502,7 @@ dictation result import <file|-> [--json]
 - release 二进制搭真实 v1 数据库副本启动：自动迁移到 `user_version=3`、
   生成 `dictation.db.bak-v1-*`、科目回填正确；HTTP 导入（english/grade 3）→
   mock 生成 → `POST /api/sessions` 返回带 subject/grade 的 manifest。
-- 下一步：设备上验证（科目/复习组卷/加练/AI 组卷），再决定 `v0.2.0` 正式版。
+- 下一步：设备上验证（科目/复习组卷/错词复习/范围复习），再决定 `v0.2.0` 正式版。
 
 
 
@@ -508,22 +510,89 @@ dictation result import <file|-> [--json]
   支持 `limit`(1–200)、`grade`/`term`；`total` 不受 limit 截断。
 - `POST /api/sessions/custom`：按 agent 给定的词表与顺序创建临时复习会话；
   1–60 个词，重复/未知/缺音频分别 400；不建课时目录、不调 TTS。
-- `GET /api/sessions/{id}`：重放已创建 session；课时 session 重新读 manifest，
+- `GET /api/sessions/{id}`：重放已创建会话；课时会话重新读 manifest，
   复习/自定义 session 用复习默认值。
 - schema v3：`session_items` 增加 `repeat_gap_ms`，`GET /api/sessions/{id}` 可精确重放
   （否则非默认 repeat_gap 的课时会按 1200ms 播放）。
 - PWA 支持 `?s=<session_id>` 深链：首页出现「点击开始」卡片（规避 iOS 自动播放限制）。
-- skill 新增「复习组卷 / 加练」流程，写明 60 词上限、错误处理、agent 只选词不排期。
+- skill 新增「错词复习 / 范围复习」流程，写明 60 词上限、错误处理、agent 只选词不排期。
 - 验证：188 tests；fmt / clippy / JS 通过。
 
-### 2026-11-09（复习加练）
+### 2026-11-18（复习第二轮设计：课内复习 + 范围复习，仅文档）
+
+- 讨论结论：英语入门单元只有 ~10 词，自动混入只有 3 个，需要能主动复习；
+  但**不做**「复习计划」这类实体——范围只是请求参数，进度由 agent 每次重算。
+- 孩子端只保留一个复习入口：**课内复习**，只取本课 `again`/到期词；
+  词集合以 `manifest.json` 为准（不用 `words.clip_lesson`，它会被后来的课覆盖）。
+- 「整课重排」「跨课范围复习」只给 agent / 家长端：`GET /api/words` 取词与统计
+  （`lapses` / `correct_streak` / `wrong_recent`），`custom` + `shuffle` 组卷。
+- 新增调度规则：未到期词答对**完全不写 `review_state`**；答错照常回退。
+- 排序改用真实 `attempts.created_at`（schema v4 只加索引），否则提前练习不更新
+  派生值，会反复抽到同一个词。
+- 明确混入边界：只有 `POST /api/sessions` 混入，`kind='review'` 永不混入。
+- 文档：`docs/review-scheduling.md` 增 §4.5 / §4.6 / §6.5 / §6.6、测试与决策；
+  `docs/http-api.md` 增 `GET /api/words`、`GET /api/review/lessons`、
+  `review.lesson_id`、`custom.shuffle`、提前复习调度、v4 索引。
+- `AGENTS.md` §10 已同步：提前复习不动调度、孩子端课内复习、范围复习归 agent/家长端。
+- 新增 `docs/glossary.md`：统一全部术语、代码标识、枚举值，并列出旧称/禁用词
+  （加练 → 错词复习、AI 组卷 → 范围复习、课程 → 课时）。
+- `AGENTS.md` 增加「术语先登记，再使用」约定（§16）与接手清单项（§19）；
+  `http-api.md` / `player.md` / `review-scheduling.md` / `README.md` / skill 顶部
+  都指向词表。
+- 代码未动，因此没有跑 fmt/clippy/test。
+
+### 2026-11-18（复习第二轮实现：课内复习 + 范围复习）
+
+后端：
+
+- schema **v4**：只加 `idx_attempts_word(word_id, created_at)`；`migrate_v3_to_v4` 幂等，
+  旧库自动升级（v1 起可一路迁到 4）。
+- 三处复习选词 SQL（混入、`/api/review/queue`、复习会话）统一用 `REVIEW_ORDER_BY`，
+  排序键改为相关子查询 `MAX(attempts.created_at)`（走 `idx_attempts_word`），
+  没有练习记录时回退到派生值。
+- `check_session` 增加提前复习分支：`last_grade='again'` 或 `due_at<=now` 走原规则；
+  否则答对**不写** `review_state`，答错照常重置 1 天 + `lapses+1`。
+- `create_review_session_filtered` 抽出 `review_session_core(ReviewScope)`，
+  新增 `create_lesson_review_session`：词集合来自 manifest，`grade/term` 只存不过滤。
+- `POST /api/sessions/review` 新增 `lesson_id`：与 `grade`/`term` 互斥（400）、
+  未知课时 404、科目不符 400、无可复习词 409；`title="<课时> · 复习"`。
+- 新增 `GET /api/review/lessons`（`subject` 可选）：按 manifest 词集合 × `review_state`
+  聚合 `review_count/due_count/wrong_count/learned_count`，只返回 `review_count>0`。
+- 新增 `GET /api/words`：课时 manifest 并集、去重保序、`sources` 记录来源课；
+  返回 `attempts/wrong/correct/correct_streak/wrong_recent/lapses/interval_days/due_at`；
+  `limit` 1–500、`offset`、`total`；未知课时 400 + `unknown`。
+- `create_custom_session` 增加 `shuffle`（session 种子洗牌，顺序落 `session_items`）。
+
+前端：
+
+- 课时卡从整块 `<button>` 改为 `div.card-lesson` + `.card-open`（`role=button`、
+  Enter/Space 可进）+ 底部独立 `.card-review-btn`「复习 N」，不嵌套按钮。
+- `loadHome` 并行拉 `/api/review/lessons`，按 `lesson_id` 挂 `review_count`；
+  接口失败等价于没有复习词。
+- 点击「复习 N」→ `POST /api/sessions/review{subject, lesson_id}` → 同一播放器；
+  409 toast「这一课没有需要复习的词」并刷新首页。
+- `?mock` 补 `/api/review/lessons`、`lesson_id` 复习、`<课时> · 复习` 标题。
+- 320/360px 断点收紧内边距，复习条整行满宽、`min-height:56px`。
+
+验证：
+
+- `cargo test` **198 passed**（189 lib + 9 bin）；`fmt --check` / `clippy -D warnings` /
+  `node --check web/app.js` 通过。
+- 真实 `serve` + mock provider 端到端：导入生成 → 标错 → `/api/review/lessons`
+  → 课内复习只返本课错词 → `/api/words` 统计与 `sources` → `shuffle`
+  → 提前复习答对 `interval/due/lapses` 三字段不变，答错重置。
+- 真实 DB + headless Chrome：Unit 1 卡片显示「复习 2」、Unit 2 无入口；
+  点击后播放器标题「Unit 1 · 复习」、进度 1/2；320/390px 无横向溢出、
+  DOM 中无嵌套 `<button>`。
+
+### 2026-11-09（错词复习）
 
 - `POST /api/sessions/review` 支持 `limit`（默认 20，范围 1–40）、`grade`（1–6）、
   `term`（1–2）；非法值 400。
 - `create_review_session_filtered`：按 `words.clip_lesson → lessons.grade/term`
   过滤来源课；选词排序沿用「错词 → 最久未复习 → due_at」；session 记录
   subject/grade/term。
-- 首页科目复习卡显示「最久 N 天未复习」，便于判断是否需要加练。
+- 首页科目复习卡显示「最久 N 天未复习」，便于判断是否需要错词复习。
 - 测试：db 的 limit/grade/term 过滤；HTTP 的 limit 生效、默认值与越界校验。
 - 验证：182 tests；fmt / clippy / JS 通过。
 

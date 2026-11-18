@@ -388,6 +388,79 @@ body {
 }
 .chev .icon { width: 18px; height: 18px; }
 
+/* 课时卡：主区域可点，课内复习是独立的次级动作
+   （整卡不能再是 <button>，否则会嵌套按钮） */
+
+.card-lesson {
+  display: block;
+  padding: 0;
+  overflow: hidden;
+  cursor: default;
+}
+
+.card-lesson:active { transform: none; }
+
+.card-lesson.is-busy {
+  opacity: 0.6;
+  pointer-events: none;
+}
+
+.card-open {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 18px 16px;
+  border-radius: calc(var(--radius) - 2px);
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.card-lesson.has-review .card-open { padding-bottom: 14px; }
+
+.card-open:active { background: rgba(31, 47, 74, 0.035); }
+
+.card-open:focus-visible {
+  outline: 3px solid rgba(217, 99, 52, 0.5);
+  outline-offset: -3px;
+}
+
+/* 课内复习：卡片底部的一条暖色次级动作，点击高度 ≥ 56px */
+.card-review-btn {
+  appearance: none;
+  -webkit-appearance: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 56px;
+  padding: 8px 16px;
+  border: 0;
+  border-top: 1.5px dashed var(--line-strong);
+  background: var(--accent-soft);
+  /* 比 --accent-deep 再压深一档：浅暖底上 ≥4.5:1，按压态也够 */
+  color: #a8401a;
+  font: inherit;
+  font-size: 17px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  transition: background-color 0.15s var(--ease);
+}
+
+.card-review-btn .icon { width: 19px; height: 19px; }
+.card-review-btn:active { background: #f6dcc8; }
+
+.card-review-btn:focus-visible {
+  outline: 3px solid rgba(217, 99, 52, 0.5);
+  outline-offset: -3px;
+}
+
+.card-review-label { white-space: nowrap; }
+
 /* 继续上次听写：暖色卡片，和深蓝的错词复习卡区分开 */
 
 .card-resume {
@@ -1044,6 +1117,11 @@ body {
   .check-word { font-size: 23px; }
   .mark-btn { min-width: 70px; font-size: 15px; }
   .counter-now { font-size: 84px; }
+  /* 320px：课时卡收窄内边距，标题保持单行空间，复习条不挤压主区域 */
+  .card-open { gap: 12px; padding: 16px 14px; }
+  .card-lesson.has-review .card-open { padding-bottom: 13px; }
+  .card-title { font-size: 20px; }
+  .card-review-btn { padding: 8px 14px; font-size: 16px; }
 }
 
 /* 减少动效 */

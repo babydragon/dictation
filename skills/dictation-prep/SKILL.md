@@ -5,6 +5,10 @@ description: 把老师消息、课本照片、杂乱词表整理成 dictation �
 
 # 听写词表准备（HTTP API 版）
 
+术语与命名以仓库内 `docs/glossary.md` 为准（安装包里可能没有 docs，按下面的
+固定说法即可）：说「课时」不说「课程」，说「错词复习」不说「加练」，
+说「范围复习」不说「AI 组卷」。
+
 你的任务不是教孩子，而是把家长手里的**原始材料**变成 `dictation` 能吃的
 **纯文本词表 + 课时设置**，然后通过 `serve` 的 HTTP API 导入并生成。
 
@@ -194,7 +198,7 @@ curl -sS -X POST "$API/api/lessons/第5课/generate" "${AUTH[@]}" -d '{}'
 - CLI（`dictation lesson import` / `lesson gen`）是主机侧运维入口，
   只在家长明确要求本机操作时使用。
 
-## 复习组卷 / 加练（agent 挑词）
+## 错词复习 / 范围复习（agent 挑词）
 
 家长说“今天没有新词，帮我挑一些复习”“错词太多，帮我排个顺序”时，走 HTTP，
 **不要自己猜词，也不要把词写回课时**。
@@ -206,11 +210,11 @@ curl -sS "$API/api/review/queue?subject=chinese&limit=200"
 ```
 
 - `subject` **必填**；`limit` 默认 100、最大 200；可选 `grade`/`term`。
-- `total` 是范围内总量，`words` 已按「错词优先 → 最久未复习」排序；
+- `total` 是范围内总量，`words` 已按「错词优先 → 距上次练习最久」排序；
   可以直接取前 N 个，也可以按你的教学判断重排。
 - 只返回有音频、可播放的词。
 
-### 2. 创建临时复习课时
+### 2. 创建临时复习会话
 
 ```bash
 curl -sS -X POST "$API/api/sessions/custom" "${AUTH[@]}" \
@@ -235,7 +239,13 @@ curl -sS -X POST "$API/api/sessions/custom" "${AUTH[@]}" \
 
 返回的 `session_id` 拼成 `$API/?s=<session_id>`，家长在手机上打开后点卡片开始。
 
-### 直接加练
+### 暂时不用范围复习的场合
+
+孩子端已经有「课内复习」入口（课时卡片上的 `复习 N`），由 PWA 自己调
+`POST /api/sessions/review` + `lesson_id`，**不需要你介入**。只有在家长要
+「跨课/整单元/考前过一遍」时才走上面的范围复习流程。
+
+### 错词复习
 
 不需要挑词时，直接按科目开一个复习会话：
 
@@ -245,6 +255,65 @@ curl -sS -X POST "$API/api/sessions/review" "${AUTH[@]}" \
 ```
 
 `limit` 默认 20、最大 40。
+
+## 范围复习（按课时挑词）
+
+家长说“复习英语第 1–4 课”“考前把前几个单元过一遍”时用这条链路。
+**范围是请求参数，没有「复习计划」这种实体**；进度每次由你重新计算。
+
+### 1. 找到课时 id
+
+```bash
+curl -sS "$API/api/lessons"
+```
+
+取 `id`（12 位 hex）与 `dir`；按 `dir`/`title` 判断家长说的是哪几课。
+
+### 2. 取词与统计
+
+```bash
+curl -sS "$API/api/words?subject=english&lessons=<id1>,<id2>&limit=200"
+```
+
+每个词返回 `attempts`、`wrong`、`correct`、`correct_streak`、`wrong_recent`、
+`lapses`、`interval_days`、`due_at`、`has_clip`、`sources`。
+
+- **只用 `has_clip=true` 的词**，否则组卷会报 `unplayable`。
+- 省略 `lessons` 时只返回已学词（没有可靠课时归属）。
+- `limit` 最大 500，用 `offset` 翻页；`total` 不受分页影响。
+
+### 3. 怎么挑词（启发式，不是硬规则）
+
+| 组合 | 建议 |
+|---|---|
+| `wrong = 0` | 不必纳入 |
+| `wrong >= 1` 且 `correct_streak >= 3` 且 `interval_days >= 15` | 错过但已稳定，不纳入 |
+| `lapses >= 2` | 学了又忘，优先纳入 |
+| `wrong_recent >= 1` | 当前不稳定，纳入 |
+| `attempts <= 2` | 样本不足，先问家长 |
+
+**不要凭一次错误判定「不会写」**：`attempts` 只有对/错两态，没有错字信息，
+笔误和真不会在数据上分不开。要下结论就说清依据（错几次、回退几次）。
+
+### 4. 组卷
+
+```bash
+curl -sS -X POST "$API/api/sessions/custom" "${AUTH[@]}" \
+  -H 'content-type: application/json' -d '{
+    "subject": "english",
+    "title": "Unit 1–4 复习",
+    "items": ["apple", "library", "season"],
+    "shuffle": true
+  }'
+```
+
+- `shuffle=true` 让服务端洗牌（同一会话内稳定、可重放）；想按课文顺序就省略。
+- 仍然受 **60 词上限**约束；超了要裁剪或分两次。
+- 「整课重排」= 用该课 manifest 的全部词 + `shuffle: true`，不要按 `wrong` 严格降序。
+
+### 5. 把链接给家长
+
+`$API/?s=<session_id>`；告诉家长这次包含哪些课、为什么挑这些词。
 
 ## 查询听写结果 / 分析错词
 

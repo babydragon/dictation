@@ -1,6 +1,8 @@
 # Dictation — 儿童听写生成与练习系统
 
 > **本文件是稳定设计与约定的唯一来源。**
+> 术语与命名以 [`docs/glossary.md`](docs/glossary.md) 为唯一规范；本文件与所有
+> 设计文档都必须使用词表里的词，不要另造近义词。
 > 进度、验收、工作日志在 [`TODO.md`](TODO.md)；新 session 先读本文件，再读
 > `TODO.md` 的「当前状态 / 下一步」。
 >
@@ -14,7 +16,7 @@
 
 - 每个词单独 TTS，词与词之间插入**毫秒级精确**的等待静音。
 - 支持中文、英文、中英混合。
-- 支持课时级、单词级语速；支持重复遍数；开场白/结束语按语言自动选择。
+- 支持课时级、词条级语速；支持重复遍数；开场白/结束语按语言自动选择。
 - 孩子用纸笔听写；结束后自检；错词进入复习并自动混入后续课时。
 - 可扩展拍照批改、家长模式、家庭服务器部署。
 
@@ -55,8 +57,8 @@
 | R1 | 输入纯文本，一行一词 | 编号、项目符号、空行、中文标点均可容错 |
 | R2 | 逐条 TTS，不依赖 SSML 停顿 | 词间静音由本地拼接，误差 < 20ms |
 | R3 | 中/英/混合 | 按脚本检测选 voice；混合可用双语 voice |
-| R4 | 语速可调 | 课时级、单词级、播放时全局；0.5–2.0 |
-| R5 | 等待间隔可调 | 课时级、单词级 |
+| R4 | 语速可调 | 课时级、词条级、播放时全局；0.5–2.0 |
+| R5 | 等待间隔可调 | 课时级、词条级 |
 | R6 | 重复遍数可调 | 默认 2 遍，遍间 1.2s |
 | R7 | 纸笔听写 | A4 一列 20 题，带题号（后续实现） |
 | R8 | 听后自检 | 显示所有词；只标错，未标默认正确 |
@@ -174,7 +176,7 @@ CLI（`lesson import` / `lesson gen`）保留为**运维与本地调试**路径�
   `grade`（1–6）/`term`（1/2）是可选的筛选/展示元数据。
 - 词的身份是 `(subject, text)`，不是全局 `text`；语文和英语的同形词互不影响。
 - 复习、积压、组卷都按科目隔离，一个 session 不混科目。
-- SQLite 用 `PRAGMA user_version` 管理 schema（当前 v3）：
+- SQLite 用 `PRAGMA user_version` 管理 schema（当前 v4）：
   - 启动时自动迁移；迁移前 `VACUUM INTO` 备份，保留最近 3 份；
   - 库版本高于程序 → 拒绝启动；
   - 迁移只追加、不修改；新增列必须有默认值或可空。
@@ -236,7 +238,7 @@ review_cap = 8
 
 | 属性 | 示例 | 说明 |
 |---|---|---|
-| `rate` | `rate=0.8` | 单词语速 |
+| `rate` | `rate=0.8` | 词条语速 |
 | `gap` | `gap=8s` | 该词后的等待 |
 | `repeat` | `repeat=1` | 该词读几遍 |
 | `speak` | `speak=长大的长` | 送给 TTS 的文本，display 仍是原词 |
@@ -463,11 +465,19 @@ lessons/第5课/
 - 词以 `(subject, text)` 去重，同科目内跨课时共享状态；科目之间严格隔离。
 - `attempts` 记录每次对错；`review_state` 记录到期时间、间隔、lapses。
 - 调度：错 → 1 天；对 → 1/2/4/7/15/30 天递增；30 天封顶。
+- **提前复习**（未到期、也非错词的词，出现在范围复习里）：答对**不改调度**
+  （不升级、不动 `due_at`/`lapses`）；答错照常重置 1 天、`lapses+1`。
+  判断依据是词当前记录，与 session 类型无关。
 - 待复习 = `last_grade='again' OR due_at <= now`；错词当天即可复习。
 - 组卷：本课新词 + `min(review_cap, max(3, 25%×新词数))` 个**同科目**待复习词，
   追加在本课之后、outro 之前；
   跳过本课已有词；不加语音提示。
 - 首页另有“错词复习”入口，可单独练；默认 20 个，可选 1–40，支持按年级/学期筛选。
+- 孩子端只有两个复习动作：首页“错词复习”，以及课时卡上的**课内复习**
+  （只取该课待复习词，词集合以该课 manifest 为准）。不给孩子范围/数量设置。
+- 跨课范围复习（“第 1–4 课”“考前过一遍”）只由 agent / 家长端发起：
+  `GET /api/words` 取词与统计，`POST /api/sessions/custom` 组卷；
+  服务端只给统计事实，是否“掌握”由调用方判断。
 - 后续可换 FSRS；接口保持不变。
 
 **实际 SQLite schema 与 API 以 [`docs/http-api.md`](docs/http-api.md) 为准。**
@@ -484,7 +494,7 @@ axum 服务（SBC / 本机）
   ├─ POST /api/lessons/{id}/generate → 后台 job
   ├─ GET  /api/jobs/{id}          轮询
   ├─ GET  /api/review/queue       待复习池（agent 挑词）
-  ├─ POST /api/sessions/custom    临时复习课时（agent 给词表和顺序）
+  ├─ POST /api/sessions/custom    临时复习会话（agent 给词表和顺序）
   ├─ lessons / sessions / check / review
   └─ media / static PWA
         ↓（生成由服务进程执行，持有 TTS 密钥）
@@ -593,9 +603,10 @@ dictation/
 ├── AGENTS.md              # 本文件：稳定设计
 ├── TODO.md                # 进度/验收/日志
 ├── docs/
+│   ├── glossary.md        # 术语表：唯一规范用词
 │   ├── http-api.md        # 服务端 HTTP API / SQLite / 一致性契约
 │   ├── player.md          # 儿童端播放器与自检交互
-│   └── review-scheduling.md # 科目隔离、复习组卷、AI 临时复习
+│   └── review-scheduling.md # 科目隔离、复习组卷、范围复习
 ├── deploy/
 │   ├── dictation.service  # systemd unit
 │   ├── config.example     # /etc/dictation/config.toml
@@ -754,6 +765,15 @@ DOUBAO_VOICE_EN=en_female_stokie_uranus_bigtts
   破坏性操作默认 dry-run，必须显式 `--apply`/`--force`；错误用
   `{"error": ...}` + 非零退出；路径/配置走 `AppConfig`。
 - **完成工作后更新 `TODO.md`**（状态/勾选/日志）；只有设计变化才改本文件。
+- **术语先登记，再使用**：新增概念、字段、端点、状态值、UI 文案时，先在
+  [`docs/glossary.md`](docs/glossary.md) 加一行（含代码标识与「不要用」的旧称），
+  再改 `AGENTS.md` / `docs/*.md` / 代码 / skill。
+  - 同一个概念只允许一个规范表述；禁止同义词并存
+    （如「加练 / 错词复习」「课程 / 课时」「AI 组卷 / 范围复习」）。
+  - 发现文档之间、代码与文档之间用词不一致时，以词表为准，并顺手修正冲突一方。
+  - 字段名、枚举值、错误文案也属于术语，必须与契约一致。
+  - 词表只定义「是什么」；规则细节写在 `AGENTS.md` 或 `docs/*.md`，不要在两处
+    各写一份解释。
 
 ---
 
@@ -780,7 +800,7 @@ DOUBAO_VOICE_EN=en_female_stokie_uranus_bigtts
 - 是否朗读 `note` 的组词/例句。
 - 是否按字数自动计算 gap。
 - 多音字词典（pinyin crate）自动生成 `speak`。
-- 按教材/单元限定复习范围。
+- 按教材范围限定复习（当前用课时范围表达）。
 - 家长端 Web 编辑器（替代 agent skill）。
 - 答案纸版式与拍照批改的对齐方式。
 - SBC 本地 TTS 选型与验收。
@@ -790,10 +810,11 @@ DOUBAO_VOICE_EN=en_female_stokie_uranus_bigtts
 ## 19. Session 接手清单
 
 1. 读本文件（稳定设计）。
-2. 读 `TODO.md` 的「当前状态 / 下一步」，只做当前功能块。
-3. `cargo test`；`cargo run -- plan fixtures/lesson-20.txt`。
-4. 不要提前实现后续功能块，除非用户明确要求。
-5. 完成后：
+2. 读 [`docs/glossary.md`](docs/glossary.md)；文档或代码里遇到不确定的用词，以它为准。
+3. 读 `TODO.md` 的「当前状态 / 下一步」，只做当前功能块。
+4. `cargo test`；`cargo run -- plan fixtures/lesson-20.txt`。
+5. 不要提前实现后续功能块，除非用户明确要求。
+6. 完成后：
    - 更新 `TODO.md` 的状态、勾选、工作日志；
    - 只有设计/约定变化时才改 `AGENTS.md`；
    - 跑完整验证；

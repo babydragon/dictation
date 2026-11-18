@@ -1,9 +1,10 @@
 # 服务端 HTTP API 契约
 
 > 本文件定义 `serve` 的 HTTP 接口、SQLite schema、鉴权，以及「CLI 与 HTTP 一致性」
-> 约定。`AGENTS.md` 是设计总纲；儿童端播放器与自检的交互见 [`player.md`](player.md)。
+> 约定。术语与命名以 [`glossary.md`](glossary.md) 为准；`AGENTS.md` 是设计总纲；
+> 儿童端播放器与自检的交互见 [`player.md`](player.md)。
 > 外网分享发布见本地工作稿 `docs/share-publish.md`（未入库，不随仓库发布）。
-> 最后更新：2026-11-09
+> 最后更新：2026-11-18
 
 ## 文件归属
 
@@ -62,7 +63,7 @@ dictation serve \
 
 ## 数据库 schema
 
-时间统一用 Unix 秒（INTEGER）。**schema 版本 = 3**，存在 `PRAGMA user_version`。
+时间统一用 Unix 秒（INTEGER）。**schema 版本 = 4**，存在 `PRAGMA user_version`。
 
 ### 版本与迁移
 
@@ -75,6 +76,9 @@ dictation serve \
   旧数据按「含拉丁字母 → `english`，其余 → `chinese`」回填。
 - v2 → v3：`session_items` 增加 `repeat_gap_ms`（默认 1200），
   让 `GET /api/sessions/{id}` 能精确重放已保存的会话。
+- v3 → v4：只加索引，不改表结构：
+  `CREATE INDEX IF NOT EXISTS idx_attempts_word ON attempts(word_id, created_at)`，
+  供「距上次练习最久」排序使用（见 `review-scheduling.md` §4.2）。
 
 ```sql
 CREATE TABLE IF NOT EXISTS lessons (
@@ -147,6 +151,9 @@ CREATE TABLE IF NOT EXISTS review_state (
   lapses INTEGER NOT NULL DEFAULT 0,
   last_grade TEXT NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_review_due ON review_state(due_at);
+CREATE INDEX IF NOT EXISTS idx_attempts_word ON attempts(word_id, created_at);
 ```
 
 - `words` 的去重键是 `(subject, text)`；同一科目内跨课共用状态，但 clip 信息更新为最近一次
@@ -209,6 +216,38 @@ CREATE TABLE IF NOT EXISTS review_state (
 - `subjects` 是按科目拆分的同一组计数（顶层字段是合计），首页按科目各显示一个入口；
   没有复习状态的科目可以省略。
 
+### `GET /api/review/lessons`
+
+课时卡片上的「复习 N」用。只读，HTTP-only（`GET /api/lessons` 与 CLI 共用
+`lesson::list`，**不能**在这里加 DB 字段）。
+
+```
+GET /api/review/lessons?subject=english
+```
+
+```json
+{
+  "subject": "english",
+  "lessons": [
+    { "lesson_id": "a1b2c3d4e5f6", "dir": "Unit 1", "title": "Unit 1 单词听写",
+      "review_count": 3, "due_count": 2, "wrong_count": 1, "learned_count": 10 }
+  ]
+}
+```
+
+- `subject` **可选**；省略 = 所有科目（响应里的 `subject` 为 `null`）。
+  非法值 → 400。首页一次请求拿全部，不必按科目拆。
+- 计数范围 = 该课 `manifest.json` 的词集合 ∩ 该科目 `review_state`；
+  **不使用 `words.clip_lesson`**（那是「最近一次被课时会话引用」）。
+- 三个计数互相不排斥，可重叠：
+  - `due_count`：`due_at <= now`；
+  - `wrong_count`：`last_grade='again'`；
+  - `review_count`：`last_grade='again' OR due_at <= now`（首页「复习 N」用这个）；
+  - `learned_count`：本课有 `review_state` 的词数。
+- 只返回 `review_count > 0` 的课时；没有 → `200 {"subject":"english","lessons":[]}`。
+- 排序同 `GET /api/lessons`（`title` 升序，同名按 `dir`）。
+- 每次调用会读所有课时 manifest；课时数量在几十个量级，可接受。
+
 ### `POST /api/sessions`
 
 ```json
@@ -221,10 +260,23 @@ CREATE TABLE IF NOT EXISTS review_state (
   `min(manifest.review_cap, max(3, ceil(新词数 × 25%)))` 个
   `last_grade='again' OR due_at <= now` 的同科目错词/到期词；
   跳过与本课重复的词；不额外加语音提示；这些 item 的 `review=true`，`base` 指向原课。
-- 选词优先级：错词优先 → 距上次复习最久 → `due_at`；复习段顺序按 session 种子洗牌。
+- 选词优先级：错词优先 → 距上次练习最久（`COALESCE(MAX(attempts.created_at), due_at - interval_days*86400)`）→ `due_at`；复习段顺序按 session 种子洗牌。
 - `manifest.review_cap` 默认 8，`0` 关闭混入，最大 15；复习段音频不超过 150s。
 - 返回 `SessionManifest`（字段与示例见 [`player.md`](player.md#sessionmanifest)）。
 - 如果 lesson 不存在：404。
+
+#### 自动混入只发生在这里
+
+| 入口 | `kind` | 会不会追加额外复习词 |
+|---|---|---|
+| `POST /api/sessions` | `lesson` | **会**（本课词之后追加） |
+| `POST /api/sessions/review` | `review` | 不会 |
+| `POST /api/sessions/custom` | `review` | 不会 |
+
+- `kind='review'` 的会话**永不混入**；`GET /api/sessions/{id}` 重放也不会补词。
+- 回归要求：`review` / `custom` 返回的 `items` 数量必须**等于**选中的词数。
+- 反方向成立：复习会话里答错的词会写 `review_state`，因此会在**下一次课时会话**
+  里被混入——这是期望行为。
 
 ### `POST /api/sessions/review`
 
@@ -236,13 +288,27 @@ CREATE TABLE IF NOT EXISTS review_state (
 - `limit` 可选，默认 **20**，范围 **1–40**，越界 → 400；
 - `grade`（1–6）/`term`（1–2）可选，按词的来源课筛选，用于「只练三年级上」；
 - 只取该科目的 `last_grade='again' OR due_at <= now` 词；
-- 选词优先级：错词优先 → 距上次复习最久 → `due_at`（刚标错的词当天也能复习）：
+- 选词优先级：错词优先 → 距上次练习最久 → `due_at`（刚标错的词当天也能复习）：
 
 - 创建 `sessions.kind='review'`、`title='错词复习'`。
 - `session_items.is_review=1`，clip 用 `words` 里保存的。
 - 返回 `SessionManifest`，`subject` 为请求的科目，`intro`/`outro` 为 `null`，
   `defaults.lead_in_ms=3000`。
 - 没有到期词：`409 {"error":"没有到期错词"}`。
+
+#### 课内复习：`lesson_id`
+
+```json
+{ "subject": "english", "lesson_id": "a1b2c3d4e5f6", "limit": 20 }
+```
+
+- 给了 `lesson_id` 时，词集合**以该课 `manifest.json` 为准**，再从里面取
+  `again` / 到期词；仍然只取待复习词，不会整课重放。
+- `lesson_id` 与 `grade`/`term` 同时给 → 400（`{"error":"lesson_id 与 grade/term 不能同时使用"}`）。
+- 课时不存在 → 404；课时 `subject` 与请求不符 → 400（`{"error":"课时科目不匹配"}`）。
+- `title` = `<课时 title> · 复习`；其余字段同上。
+- 没有待复习词 → `409 {"error":"这一课没有需要复习的词"}`。
+- 孩子端只用这个入口；跨课范围复习见 `GET /api/words` + `POST /api/sessions/custom`。
 
 ### `GET /api/review/queue`
 
@@ -253,7 +319,9 @@ GET /api/review/queue?subject=chinese&limit=100&grade=3&term=1
 ```
 
 - `subject` **必填**；`limit` 默认 100、范围 1–200；`grade`/`term` 可选。
-- 排序与组卷一致：错词 → 距上次复习最久 → `due_at`。
+- 排序与组卷一致：错词 → 距上次练习最久 → `due_at`。
+- `last_review_at` 是 `due_at - interval_days*86400` 的派生近似值，仅供展示；
+  **排序不使用它**（提前复习不更新 `review_state`，会失真）。
 - `total` 是范围内可播放到期词总数（不受 `limit` 截断）。
 
 ```json
@@ -268,6 +336,55 @@ GET /api/review/queue?subject=chinese&limit=100&grade=3&term=1
 }
 ```
 
+### `GET /api/words`
+
+按课时范围读词表 + 掌握度统计。**只读**，给 agent 做范围复习选词用；
+孩子端不调用。
+
+```
+GET /api/words?subject=english&lessons=<id1>,<id2>&limit=200&offset=0
+```
+
+```json
+{
+  "subject": "english",
+  "total": 38,
+  "offset": 0,
+  "limit": 200,
+  "words": [
+    {
+      "text": "library", "lang": "en", "has_clip": true,
+      "sources": [{ "id": "a1b2c3d4e5f6", "dir": "Unit 1" }],
+      "attempts": 6, "wrong": 2, "correct": 4,
+      "correct_streak": 3, "wrong_recent": 0,
+      "last_grade": "good", "last_attempt_at": "2026-11-16T19:20:00+08:00",
+      "lapses": 1, "interval_days": 7, "due_at": "2026-11-23T19:20:00+08:00"
+    }
+  ]
+}
+```
+
+- `subject` **必填**；`lessons` 逗号分隔的课时 id。
+  - 给了 `lessons`：词集合 = 这些课时 `manifest.json` 的**并集**，
+    按请求顺序的课时顺序、manifest 内顺序排列；同一个词只出现一次
+    （`sources` 可能多项）。**包含从未听写过的词**（统计全零）。
+  - 省略 `lessons`：只返回该科目**已学词**（有 `review_state` 的词），
+    因为它们没有「属于哪一课」的可靠来源。
+- `has_clip`：`words` 里有可用 clip（否则不能进 `custom`，仍会返回该词）。
+- 从未进过会话的词在 `words` 里还没有记录：`lang` 为空字符串、`has_clip=false`、
+  统计全零。
+- 统计按 `(subject, text)` 关联 `attempts` / `review_state`：
+  - `attempts` = 总次数；`wrong` = `grade='again'` 次数；`correct` = `grade='good'` 次数；
+  - `correct_streak` = 从最后一次往前连续答对的次数；
+  - `wrong_recent` = 最近 5 次里的错次数；
+  - 没有 `review_state` / `attempts` 时：计数为 `0`，`lapses=0`、`interval_days=0`，
+    `last_grade`、`last_attempt_at`、`due_at` 为 `null`。
+- `limit` 默认 **200**、范围 1–500；`offset` 默认 0。`total` 不受分页截断。
+- 未知课时 id → `400 {"error":"未知的课时","unknown":["xx"]}`。
+- 空结果 → `200`，`words: []`。
+- 服务端**不判断「是否掌握」**，只给数字；启发式见
+  [`review-scheduling.md`](review-scheduling.md#65-词表读取与掌握度统计)。
+
 ### `POST /api/sessions/custom`
 
 按 agent 给定的词表和顺序创建一个**临时复习会话**（不建课时目录、不调用 TTS）。
@@ -278,11 +395,14 @@ GET /api/review/queue?subject=chinese&limit=100&grade=3&term=1
   "title": "第一单元综合复习",
   "grade": 3,
   "term": 1,
-  "items": ["粗壮", "摇晃", "旅行"]
+  "items": ["粗壮", "摇晃", "旅行"],
+  "shuffle": false
 }
 ```
 
 - `subject` 必填；`title` 非空；`items` 1–**60** 个，去重后顺序即播放顺序。
+- `shuffle` 可选，默认 `false`：为 `true` 时服务端按 session 种子洗牌
+  （`sha256(seed + text)`），顺序写进 `session_items`，重放不变。
 - 词必须已存在于同科目且有音频；否则 400：
   - `{"error":"未知词","unknown":["xx"]}`
   - `{"error":"缺少音频","unplayable":["xx"]}`
@@ -296,7 +416,7 @@ GET /api/review/queue?subject=chinese&limit=100&grade=3&term=1
 
 返回已创建 session 的 `SessionManifest`，供 PWA 深链 `?s=<id>` 打开。
 
-- 课时 session：从 `lesson_id` 重新读取 manifest；课时文件缺失 → 404。
+- 课时会话：从 `lesson_id` 重新读取 manifest；课时文件缺失 → 404。
 - 复习/自定义 session：使用复习默认值（无 intro/outro、`lead_in=3000`）。
 - 未知 id → `404 {"error":"session 不存在"}`。
 
@@ -316,10 +436,15 @@ GET /api/review/queue?subject=chinese&limit=100&grade=3&term=1
 - 对每项：
   - upsert `words`（若新词，clip 信息从 session_items 取）。
   - 写 `attempts`，`grade = correct ? "good" : "again"`，`source="self"`。
-  - 更新 `review_state`：
-    - 错：`interval_days=1`、`due_at=now+86400`、`lapses+=1`、`last_grade="again"`。
-    - 对：`interval_days` 按 `1→2→4→7→15→30` 递增（无记录从 2 开始；已 30 保持 30）；
-      `due_at=now+interval*86400`、`last_grade="good"`。
+  - 更新 `review_state`，先看这条记录当前是否「到期」：
+    - 正常复习（`last_grade='again'` 或 `due_at <= now`）：
+      - 错：`interval_days=1`、`due_at=now+86400`、`lapses+=1`、`last_grade="again"`。
+      - 对：`interval_days` 按 `1→2→4→7→15→30` 递增（无记录从 2 开始；已 30 保持 30）；
+        `due_at=now+interval*86400`、`last_grade="good"`。
+    - 提前复习（未到期且不是错词，出现在范围复习里）：
+      - **答对：完全不写 `review_state`**（不升级、不改 `due_at`、不改 `lapses`）。
+      - 答错：同「错」分支（重置 1 天、`lapses+=1`）。
+  - 判定依据是**当前记录**，与 session 的 `kind` 无关；`due` 复习与范围复习共用本端点。
   - 同一 session 重复提交被 409 拦住。
 - 更新 `sessions.finished_at`。
 - 返回：

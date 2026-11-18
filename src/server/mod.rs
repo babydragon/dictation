@@ -178,6 +178,8 @@ fn router(state: AppState) -> Router {
         .route("/api/lessons/{id}/generate/cancel", post(cancel_generation))
         .route("/api/jobs/{id}", get(get_job))
         .route("/api/review/summary", get(review_summary))
+        .route("/api/review/lessons", get(review_lessons))
+        .route("/api/words", get(words))
         .route("/api/results", get(list_results))
         .route("/api/results/latest", get(latest_result))
         .route("/api/results/latest/wrong", get(latest_result_wrong))
@@ -1018,6 +1020,232 @@ async fn review_summary(State(state): State<AppState>) -> Result<Json<Value>, Ap
     })))
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct ReviewLessonsQuery {
+    #[serde(default)]
+    subject: String,
+}
+
+/// Per-lesson review counters for the lesson card's "复习 N" action.
+///
+/// HTTP-only: `GET /api/lessons` is shared with the CLI via `lesson::list`, so
+/// DB-backed counters must not be added there.
+async fn review_lessons(
+    State(state): State<AppState>,
+    Query(query): Query<ReviewLessonsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let subject_filter = if query.subject.trim().is_empty() {
+        None
+    } else {
+        Some(
+            Subject::parse(&query.subject)
+                .ok_or_else(|| ApiError::bad_request("subject 必须是 chinese 或 english"))?
+                .as_str()
+                .to_string(),
+        )
+    };
+
+    let db = state.db.clone();
+    let lessons_dir = state.lessons_dir.clone();
+    let entries = run_db(db.clone(), move |db| {
+        db.scan_lessons(&lessons_dir).map_err(ApiError::internal)
+    })
+    .await?;
+
+    // Word sets come from each manifest; `words.clip_lesson` would point at
+    // whichever lesson last referenced the word.
+    let mut plans = Vec::new();
+    for entry in entries {
+        if let Some(filter) = &subject_filter {
+            if &entry.subject != filter {
+                continue;
+            }
+        }
+        let Ok(manifest) = read_manifest(Path::new(&entry.dir)) else {
+            continue;
+        };
+        let texts: Vec<String> = manifest
+            .items
+            .iter()
+            .map(|item| item.text.clone())
+            .collect();
+        plans.push((entry, texts));
+    }
+
+    let counts = run_db(db, move |db| {
+        plans
+            .into_iter()
+            .map(|(entry, texts)| {
+                db.review_counts_for_texts(&entry.subject, &texts)
+                    .map(|counts| (entry, counts))
+                    .map_err(ApiError::internal)
+            })
+            .collect::<Result<Vec<_>, _>>()
+    })
+    .await?;
+
+    let mut lessons: Vec<Value> = counts
+        .into_iter()
+        .filter(|(_, counts)| counts.review > 0)
+        .map(|(entry, counts)| {
+            json!({
+                "lesson_id": entry.id,
+                "dir": entry.dir_name,
+                "title": entry.title,
+                "review_count": counts.review,
+                "due_count": counts.due,
+                "wrong_count": counts.wrong,
+                "learned_count": counts.learned,
+            })
+        })
+        .collect();
+    lessons.sort_by(|a, b| {
+        let key = |value: &Value| {
+            (
+                value["title"].as_str().unwrap_or("").to_string(),
+                value["dir"].as_str().unwrap_or("").to_string(),
+            )
+        };
+        key(a).cmp(&key(b))
+    });
+
+    Ok(Json(json!({
+        "subject": subject_filter,
+        "lessons": lessons,
+    })))
+}
+
+const WORDS_DEFAULT_LIMIT: u32 = 200;
+const WORDS_MAX_LIMIT: u32 = 500;
+
+#[derive(Debug, Default, Deserialize)]
+struct WordsQuery {
+    #[serde(default)]
+    subject: String,
+    /// Comma-separated lesson ids; omitted means "words practised before".
+    #[serde(default)]
+    lessons: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+    #[serde(default)]
+    offset: Option<u32>,
+}
+
+/// Word list + practice statistics for a lesson range. Read-only; used by the
+/// agent to compose range reviews. The child UI never calls this.
+async fn words(
+    State(state): State<AppState>,
+    query: Result<Query<WordsQuery>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Query(query) = query.map_err(query_rejection)?;
+    let subject = Subject::parse(&query.subject)
+        .ok_or_else(|| ApiError::bad_request("subject 必填（chinese|english）"))?
+        .as_str()
+        .to_string();
+    let limit = query.limit.unwrap_or(WORDS_DEFAULT_LIMIT);
+    if !(1..=WORDS_MAX_LIMIT).contains(&limit) {
+        return Err(ApiError::bad_request("limit 必须是 1–500 的整数"));
+    }
+    let offset = query.offset.unwrap_or(0);
+
+    let mut requested: Vec<String> = Vec::new();
+    if let Some(raw) = &query.lessons {
+        for part in raw.split(',') {
+            let id = part.trim();
+            if id.is_empty() || requested.iter().any(|existing| existing == id) {
+                continue;
+            }
+            requested.push(id.to_string());
+        }
+    }
+
+    let mut texts: Vec<String> = Vec::new();
+    let mut sources: HashMap<String, Vec<Value>> = HashMap::new();
+
+    if requested.is_empty() {
+        let lookup = subject.clone();
+        texts = run_db(state.db.clone(), move |db| {
+            db.learned_texts(&lookup).map_err(ApiError::internal)
+        })
+        .await?;
+    } else {
+        let db = state.db.clone();
+        let lessons_dir = state.lessons_dir.clone();
+        let entries = run_db(db, move |db| {
+            db.scan_lessons(&lessons_dir).map_err(ApiError::internal)
+        })
+        .await?;
+
+        let mut unknown = Vec::new();
+        for id in &requested {
+            let Some(entry) = entries.iter().find(|entry| &entry.id == id) else {
+                unknown.push(id.clone());
+                continue;
+            };
+            let Ok(manifest) = read_manifest(Path::new(&entry.dir)) else {
+                continue;
+            };
+            for item in &manifest.items {
+                if !texts.iter().any(|text| text == &item.text) {
+                    texts.push(item.text.clone());
+                }
+                sources
+                    .entry(item.text.clone())
+                    .or_default()
+                    .push(json!({ "id": entry.id, "dir": entry.dir_name }));
+            }
+        }
+        if !unknown.is_empty() {
+            return Err(
+                ApiError::bad_request("未知的课时").with_extra(json!({ "unknown": unknown }))
+            );
+        }
+    }
+
+    let total = texts.len();
+    let page: Vec<String> = texts
+        .into_iter()
+        .skip(offset as usize)
+        .take(limit as usize)
+        .collect();
+    let lookup_subject = subject.clone();
+    let profiles = run_db(state.db.clone(), move |db| {
+        db.word_profiles(&lookup_subject, &page)
+            .map_err(ApiError::internal)
+    })
+    .await?;
+
+    let words: Vec<Value> = profiles
+        .iter()
+        .map(|profile| {
+            json!({
+                "text": profile.text,
+                "lang": profile.lang,
+                "has_clip": profile.has_clip,
+                "sources": sources.get(&profile.text).cloned().unwrap_or_default(),
+                "attempts": profile.attempts,
+                "wrong": profile.wrong,
+                "correct": profile.correct,
+                "correct_streak": profile.correct_streak,
+                "wrong_recent": profile.wrong_recent,
+                "last_grade": profile.last_grade,
+                "last_attempt_at": profile.last_attempt_at.map(result_view::format_unix),
+                "lapses": profile.lapses,
+                "interval_days": profile.interval_days,
+                "due_at": profile.due_at.map(result_view::format_unix),
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "subject": subject,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "words": words,
+    })))
+}
+
 // ---------------------------------------------------------------------------
 // Result query (read-only, same JSON as `dictation result ... --json`)
 // ---------------------------------------------------------------------------
@@ -1196,6 +1424,18 @@ fn shuffle_review_items(items: &mut [NewItem], seed: &str) {
     });
 }
 
+/// Same deterministic order as [`shuffle_review_items`], for a plain word list
+/// (`POST /api/sessions/custom` with `shuffle`).
+fn shuffle_texts(texts: &mut [String], seed: &str) {
+    texts.sort_by_cached_key(|text| {
+        let mut hasher = Sha256::new();
+        hasher.update(seed.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(text.as_bytes());
+        hasher.finalize().to_vec()
+    });
+}
+
 #[derive(Debug, Deserialize)]
 struct CreateSessionRequest {
     lesson_id: String,
@@ -1354,6 +1594,10 @@ struct ReviewSessionRequest {
     grade: Option<u8>,
     #[serde(default)]
     term: Option<u8>,
+    /// Lesson-scoped review (孩子端「复习 N」): restrict to this lesson's
+    /// manifest words, still only the due/wrong ones.
+    #[serde(default)]
+    lesson_id: Option<String>,
 }
 
 async fn create_review_session(
@@ -1379,6 +1623,49 @@ async fn create_review_session(
             return Err(ApiError::bad_request("term 必须是 1（上）或 2（下）"));
         }
     }
+
+    let lesson_id = body
+        .lesson_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .map(str::to_string);
+
+    if let Some(lesson_id) = lesson_id {
+        if body.grade.is_some() || body.term.is_some() {
+            return Err(ApiError::bad_request(
+                "lesson_id 与 grade/term 不能同时使用",
+            ));
+        }
+        let (_, lesson_dir) = resolve_lesson(&state, &lesson_id).await?;
+        let manifest = read_manifest(&lesson_dir)
+            .map_err(|err| ApiError::internal(err.context("读取 manifest 失败")))?;
+        if manifest.subject().as_str() != subject {
+            return Err(ApiError::bad_request("课时科目不匹配"));
+        }
+        // The word set must come from the manifest: `words.clip_lesson` points
+        // at whichever lesson last referenced the word.
+        let texts: Vec<String> = manifest
+            .items
+            .iter()
+            .map(|item| item.text.clone())
+            .collect();
+        let title = format!("{} · 复习", manifest.title);
+        let grade = manifest.grade;
+        let term = manifest.term;
+        let db = state.db.clone();
+        let lookup_subject = subject.clone();
+        let record = run_db(db, move |db| {
+            db.create_lesson_review_session(&lookup_subject, &title, &texts, limit, grade, term)
+                .map_err(ApiError::internal)
+        })
+        .await?;
+        let Some(record) = record else {
+            return Err(ApiError::conflict("这一课没有需要复习的词"));
+        };
+        return Ok(Json(review_manifest(&record, subject, grade, term)));
+    }
+
     let db = state.db.clone();
     let lookup = subject.clone();
     let record = run_db(db, move |db| {
@@ -1518,6 +1805,10 @@ struct CustomSessionRequest {
     term: Option<u8>,
     #[serde(default)]
     items: Vec<String>,
+    /// Optional server-side shuffle; keeps the order stable across replays
+    /// because the result is written into `session_items`.
+    #[serde(default)]
+    shuffle: bool,
 }
 
 async fn custom_session(
@@ -1563,6 +1854,11 @@ async fn custom_session(
         return Err(
             ApiError::bad_request("重复的词").with_extra(json!({ "duplicated": duplicated }))
         );
+    }
+
+    if body.shuffle {
+        let seed = uuid::Uuid::new_v4().simple().to_string();
+        shuffle_texts(&mut texts, &seed);
     }
 
     let db = state.db.clone();
@@ -3325,6 +3621,17 @@ mod tests {
         }
     }
 
+    fn set_manifest_texts(dir: &Path, texts: &[&str]) {
+        let path = dir.join("manifest.json");
+        let mut value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let items = value["items"].as_array_mut().unwrap();
+        assert_eq!(items.len(), texts.len(), "item 数必须与文本数一致");
+        for (item, text) in items.iter_mut().zip(texts) {
+            item["text"] = json!(text);
+        }
+        fs::write(path, value.to_string()).unwrap();
+    }
+
     #[tokio::test]
     async fn review_summary_groups_by_subject_and_review_requires_subject() {
         let temp = tempfile::tempdir().unwrap();
@@ -3375,5 +3682,395 @@ mod tests {
         assert_eq!(body["subject"], "english");
         assert_eq!(body["kind"], "review");
         assert_eq!(body["items"].as_array().unwrap().len(), 1, "只取英语错词");
+    }
+
+    #[tokio::test]
+    async fn lesson_review_takes_only_that_lessons_due_words() {
+        let temp = tempfile::tempdir().unwrap();
+        let opts = test_opts(&temp);
+        fs::create_dir_all(&opts.lessons_dir).unwrap();
+        write_lesson_manifest(&opts.lessons_dir, "第五课", "第五课", 2, 20_000);
+        set_manifest_texts(&opts.lessons_dir.join("第五课"), &["共同", "甲"]);
+        write_lesson_manifest(&opts.lessons_dir, "第六课", "第六课", 2, 20_000);
+        set_manifest_texts(&opts.lessons_dir.join("第六课"), &["共同", "乙"]);
+        let state = test_state(&opts, None, None);
+        let app = router(state.clone());
+
+        // Every word is wrong, so both lessons have due words.
+        seed_subject_session(
+            &state,
+            "chinese",
+            &[
+                test_item("共同", false, "lesson000001"),
+                test_item("甲", false, "lesson000001"),
+            ],
+            Some(&[(1, false), (2, false)]),
+        );
+        seed_subject_session(
+            &state,
+            "chinese",
+            &[
+                test_item("共同", false, "lesson000001"),
+                test_item("乙", false, "lesson000001"),
+            ],
+            Some(&[(1, false), (2, false)]),
+        );
+
+        let response = post(
+            &app,
+            "/api/sessions/review",
+            json!({"subject": "chinese", "lesson_id": db::lesson_id("第五课")}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["kind"], "review");
+        assert_eq!(body["title"], "第五课 · 复习");
+        let texts: Vec<&str> = body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(texts.len(), 2, "只取本课待复习词: {texts:?}");
+        assert!(
+            texts.contains(&"共同") && texts.contains(&"甲"),
+            "{texts:?}"
+        );
+        assert!(!texts.contains(&"乙"), "别的课的词不能混进来");
+    }
+
+    #[tokio::test]
+    async fn lesson_review_validates_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let opts = test_opts(&temp);
+        fs::create_dir_all(&opts.lessons_dir).unwrap();
+        write_lesson_manifest(&opts.lessons_dir, "第五课", "第五课", 1, 10_000);
+        set_manifest_texts(&opts.lessons_dir.join("第五课"), &["甲"]);
+        let state = test_state(&opts, None, None);
+        let app = router(state.clone());
+        let lesson_id = db::lesson_id("第五课");
+
+        let response = post(
+            &app,
+            "/api/sessions/review",
+            json!({"subject": "chinese", "lesson_id": lesson_id, "grade": 3}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(body_json(response).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("不能同时使用"));
+
+        let response = post(
+            &app,
+            "/api/sessions/review",
+            json!({"subject": "chinese", "lesson_id": "deadbeefcafe"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = post(
+            &app,
+            "/api/sessions/review",
+            json!({"subject": "english", "lesson_id": lesson_id}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(body_json(response).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("科目"));
+
+        // Never practised → nothing due in this lesson.
+        let response = post(
+            &app,
+            "/api/sessions/review",
+            json!({"subject": "chinese", "lesson_id": lesson_id}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(body_json(response).await["error"], "这一课没有需要复习的词");
+    }
+
+    #[tokio::test]
+    async fn review_lessons_counts_by_manifest_words() {
+        let temp = tempfile::tempdir().unwrap();
+        let opts = test_opts(&temp);
+        fs::create_dir_all(&opts.lessons_dir).unwrap();
+        write_lesson_manifest(&opts.lessons_dir, "第五课", "第五课", 2, 20_000);
+        set_manifest_texts(&opts.lessons_dir.join("第五课"), &["甲", "乙"]);
+        write_lesson_manifest_meta(
+            &opts.lessons_dir,
+            "Unit 1",
+            "Unit 1",
+            "english",
+            None,
+            None,
+            2,
+            20_000,
+        );
+        set_manifest_texts(&opts.lessons_dir.join("Unit 1"), &["apple", "book"]);
+        let state = test_state(&opts, None, None);
+        let app = router(state.clone());
+
+        // 甲 wrong, 乙 correct → one due/wrong word in 第五课.
+        seed_subject_session(
+            &state,
+            "chinese",
+            &[
+                test_item("甲", false, "lesson000001"),
+                test_item("乙", false, "lesson000001"),
+            ],
+            Some(&[(1, false), (2, true)]),
+        );
+
+        let body = body_json(
+            app.clone()
+                .oneshot(get_req("/api/review/lessons"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(body["subject"], Value::Null);
+        let lessons = body["lessons"].as_array().unwrap();
+        assert_eq!(lessons.len(), 1, "没有练习记录的课时不出现: {lessons:?}");
+        assert_eq!(lessons[0]["title"], "第五课");
+        assert_eq!(lessons[0]["lesson_id"], db::lesson_id("第五课"));
+        assert_eq!(lessons[0]["dir"], "第五课");
+        assert_eq!(lessons[0]["review_count"], 1);
+        assert_eq!(lessons[0]["wrong_count"], 1);
+        assert_eq!(lessons[0]["due_count"], 0);
+        assert_eq!(lessons[0]["learned_count"], 2);
+
+        let body = body_json(
+            app.clone()
+                .oneshot(get_req("/api/review/lessons?subject=english"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(body["subject"], "english");
+        assert_eq!(body["lessons"].as_array().unwrap().len(), 0);
+
+        let response = app
+            .clone()
+            .oneshot(get_req("/api/review/lessons?subject=french"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Every word of 第五课 is now correct and not due → it disappears.
+        let id = db::lesson_id("第五课");
+        let response = post(
+            &app,
+            "/api/sessions/review",
+            json!({"subject": "chinese", "lesson_id": id}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        let session_id = body["session_id"].as_str().unwrap().to_string();
+        let response = post(
+            &app,
+            &format!("/api/sessions/{session_id}/check"),
+            json!({"results": [{"position": 1, "correct": true}]}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(
+            app.clone()
+                .oneshot(get_req("/api/review/lessons"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(body["lessons"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn words_endpoint_reads_manifests_and_reports_stats() {
+        let temp = tempfile::tempdir().unwrap();
+        let opts = test_opts(&temp);
+        fs::create_dir_all(&opts.lessons_dir).unwrap();
+        write_lesson_manifest(&opts.lessons_dir, "第五课", "第五课", 3, 30_000);
+        set_manifest_texts(&opts.lessons_dir.join("第五课"), &["甲", "乙", "丙"]);
+        write_lesson_manifest(&opts.lessons_dir, "第六课", "第六课", 3, 30_000);
+        set_manifest_texts(&opts.lessons_dir.join("第六课"), &["丙", "丁", "戊"]);
+        let state = test_state(&opts, None, None);
+        let app = router(state.clone());
+
+        // 甲: wrong then correct → 2 attempts, 1 wrong, streak 1.
+        seed_subject_session(
+            &state,
+            "chinese",
+            &[
+                test_item("甲", false, "lesson000001"),
+                test_item("乙", false, "lesson000001"),
+                test_item("丙", false, "lesson000001"),
+            ],
+            Some(&[(1, false), (2, true), (3, true)]),
+        );
+        seed_subject_session(
+            &state,
+            "chinese",
+            &[test_item("甲", false, "lesson000001")],
+            Some(&[(1, true)]),
+        );
+
+        let path = format!(
+            "/api/words?subject=chinese&lessons={},{}",
+            db::lesson_id("第五课"),
+            db::lesson_id("第六课")
+        );
+        let body = body_json(app.clone().oneshot(get_req(&path)).await.unwrap()).await;
+        assert_eq!(body["total"], 5, "并集去重：甲 乙 丙 丁 戊");
+        let words = body["words"].as_array().unwrap();
+        assert_eq!(words.len(), 5);
+
+        let by_text = |text: &str| -> &Value {
+            words
+                .iter()
+                .find(|word| word["text"] == text)
+                .expect("词必须存在")
+        };
+        let jia = by_text("甲");
+        assert_eq!(jia["attempts"], 2);
+        assert_eq!(jia["wrong"], 1);
+        assert_eq!(jia["correct"], 1);
+        assert_eq!(jia["correct_streak"], 1);
+        assert_eq!(jia["wrong_recent"], 1);
+        assert_eq!(jia["has_clip"], true);
+        assert_eq!(jia["last_grade"], "good");
+
+        let bing = by_text("丙");
+        assert_eq!(bing["sources"].as_array().unwrap().len(), 2, "两课都含 丙");
+
+        let ding = by_text("丁");
+        assert_eq!(ding["attempts"], 0);
+        assert_eq!(ding["has_clip"], false);
+        assert!(ding["last_grade"].is_null());
+        assert!(ding["due_at"].is_null());
+        assert_eq!(
+            ding["sources"],
+            json!([{ "id": db::lesson_id("第六课"), "dir": "第六课" }])
+        );
+
+        let body = body_json(
+            app.clone()
+                .oneshot(get_req("/api/words?subject=chinese"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let texts: Vec<&str> = body["words"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|word| word["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(texts, ["甲", "乙", "丙"], "无范围时只返回已学词");
+        assert_eq!(body["words"][0]["sources"], json!([]));
+
+        let response = post(&app, "/api/sessions/review", json!({})).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .clone()
+            .oneshot(get_req("/api/words?subject=chinese&lessons=deadbeefcafe"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body_json(response).await["unknown"],
+            json!(["deadbeefcafe"])
+        );
+    }
+
+    #[tokio::test]
+    async fn words_endpoint_paginates() {
+        let temp = tempfile::tempdir().unwrap();
+        let opts = test_opts(&temp);
+        fs::create_dir_all(&opts.lessons_dir).unwrap();
+        write_lesson_manifest(&opts.lessons_dir, "第五课", "第五课", 3, 30_000);
+        set_manifest_texts(&opts.lessons_dir.join("第五课"), &["甲", "乙", "丙"]);
+        let state = test_state(&opts, None, None);
+        let app = router(state.clone());
+
+        let path = format!(
+            "/api/words?subject=chinese&lessons={}&limit=2&offset=1",
+            db::lesson_id("第五课")
+        );
+        let body = body_json(app.clone().oneshot(get_req(&path)).await.unwrap()).await;
+        assert_eq!(body["total"], 3);
+        let texts: Vec<&str> = body["words"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|word| word["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(texts, ["乙", "丙"]);
+
+        let response = app
+            .clone()
+            .oneshot(get_req(&format!(
+                "/api/words?subject=chinese&lessons={}&limit=501",
+                db::lesson_id("第五课")
+            )))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn custom_session_can_shuffle_and_stays_replayable() {
+        let temp = tempfile::tempdir().unwrap();
+        let opts = test_opts(&temp);
+        let state = test_state(&opts, None, None);
+        let app = router(state.clone());
+        seed_subject_session(
+            &state,
+            "chinese",
+            &[
+                test_item("甲", false, "lesson000001"),
+                test_item("乙", false, "lesson000001"),
+                test_item("丙", false, "lesson000001"),
+            ],
+            Some(&[(1, true), (2, true), (3, true)]),
+        );
+
+        let response = post(
+            &app,
+            "/api/sessions/custom",
+            json!({
+                "subject": "chinese",
+                "title": "巩固",
+                "items": ["甲", "乙", "丙"],
+                "shuffle": true,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        let session_id = body["session_id"].as_str().unwrap().to_string();
+        let mut texts: Vec<String> = body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["text"].as_str().unwrap().to_string())
+            .collect();
+        texts.sort();
+        assert_eq!(texts, ["丙", "乙", "甲"], "洗牌不能丢词或改词");
+
+        // Replay reads session_items, so the order is stable.
+        let replayed = body_json(
+            app.clone()
+                .oneshot(get_req(&format!("/api/sessions/{session_id}")))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(replayed["items"], body["items"]);
     }
 }

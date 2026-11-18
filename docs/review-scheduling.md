@@ -1,17 +1,18 @@
 # 复习组卷与科目隔离设计
 
-> 状态：实施中。第 1–4 步已完成（迁移/科目、组卷、加练、AI 组卷）；
-> 第 5 步（文档/skill 收尾 + 发布）待做。
-> 关联：[`http-api.md`](http-api.md)（接口契约）、[`player.md`](player.md)（播放与检查页）、
-> [`AGENTS.md`](../AGENTS.md)（D10 错词复习、§10 记忆曲线）。
-> 最后更新：2026-11-09
+> 状态：第 1–4 步已实现（迁移/科目、组卷、错词复习、范围复习）。
+> 2026-11-18 追加设计并已实现：课内复习（孩子端唯一入口）、范围复习
+> （agent / 家长端）、提前复习的调度与排序修正。实现记录见 `TODO.md` 工作日志。
+> 关联：[`glossary.md`](glossary.md)（术语）、[`http-api.md`](http-api.md)（接口契约）、
+> [`player.md`](player.md)（播放与检查页）、[`AGENTS.md`](../AGENTS.md)（D10 错词复习、§10 记忆曲线）。
+> 最后更新：2026-11-18
 
 ## 1. 目标
 
 - 复习必须**按科目严格隔离**：语文和英语各有独立的词库、积压和复习会话。
 - 组卷有明确规则：到期、优先级、上限、顺序，不再使用写死的「最多 5 个」。
-- 支持**加练**：没有新词的日子可以单独做复习，积压可主动消化。
-- 支持 **AI 组卷**：agent 读取待复习池，挑词/排序，生成一个临时复习课时
+- 支持**错词复习**：没有新词的日子可以单独练本科目的待复习词。
+- 支持 **范围复习**：agent 按课时范围读取词表与统计，挑词/排序，生成一个临时会话
   （如「第一单元综合复习」），其后续批改与调度与应用内复习完全一致。
 - 本轮**不引入 FSRS**；保留 `attempts`、`due_at`、`lapses` 等数据，后续可迁移。
 
@@ -19,7 +20,7 @@
 
 - 不做多孩子 / 多账号。
 - 不做跨设备同步。
-- 不做按教材单元的自动范围识别（单元由家长/AI 在标题或筛选条件里表达）。
+- 不做按教材单元的自动范围识别（单元由家长 / agent 在课时范围里表达）。
 
 ## 2. 数据模型
 
@@ -132,7 +133,7 @@ v2 → v3：`session_items` 增加 `repeat_gap_ms`（默认 1200），
 - 迁移只增不删；新列必须有默认值或可空。
 - 读取端对可选字段一律给默认值（`serde(default)`），旧 manifest 仍可播放。
 - API 只做**字段追加**；删除/改名字段必须同步契约、skill、README、PWA。
-- **写请求的 `subject` 必填**（导入、复习、AI 组卷）；旧 PWA 与旧 skill
+- **写请求的 `subject` 必填**（导入、复习、范围复习）；旧 PWA 与旧 skill
   必须在同一版本一起更新，不保留「缺省语文」的兼容分支。
 - 数据库迁移仍然把旧数据回填为 `chinese`，保证升级后已有课时/词可用。
 
@@ -150,10 +151,17 @@ v2 → v3：`session_items` 增加 `repeat_gap_ms`（默认 1200），
 同科目内，排除本课已有的词、没有 clip 的词：
 
 1. `last_grade='again'` 优先；
-2. 其余按**距上次复习时间**从长到短（`last_review_at = due_at - interval_days*86400`）；
+2. 其余按**距上次练习时间**从长到短：
+   `last_seen_at = COALESCE(MAX(attempts.created_at), due_at - interval_days*86400)`；
 3. 平手按 `due_at`、`word_id`。
 
 理由：记忆衰减取决于「多久没见过」，而不是「逾期了几天」。
+
+**必须用 `attempts` 的真实时间**，不能用 `due_at - interval_days*86400` 代替：
+提前复习（§4.5）不写 `review_state`，派生值不会更新，昨天刚练过的词第二天会被
+再次当成「最久没练」优先抽中。
+
+需要索引 `attempts(word_id, created_at)`；属于 schema **v4**（只加索引、不加列）。
 
 ### 4.3 数量
 
@@ -185,7 +193,39 @@ count = min(review_cap, max(3, ceil(new_count * 0.25)))
   - 不同次顺序不同，避免「粗壮→摇晃」固定搭配形成位置记忆；
   - 新词顺序不动，只打乱复习段。
 
-## 5. 积压与加练
+### 4.5 提前复习（未到期）的调度
+
+范围复习（§6.6）会取到未到期的词。批改时**逐词**判断，不依赖 session 的创建方式：
+
+| 批改时的记录状态 | 答对 | 答错 |
+|---|---|---|
+| `last_grade='again'` 或 `due_at <= now` | 正常升级 `1→2→4→7→15→30` | 重置 1 天、`lapses+1` |
+| 其他（提前复习） | **完全不写 `review_state`** | 重置 1 天、`lapses+1` |
+
+理由：
+
+- 额外重复不是「间隔到了」的证据，不能用来膨胀间隔；
+- 但「又写错了」是遗忘的强证据，无论是否到期都要回退。
+
+这条规则让 `due` 复习与范围复习共用同一个检查端点，不需要给 session 记 mode，
+也不需要新增列（v4 只加索引，见 §4.2）。
+
+### 4.6 课内复习（孩子端唯一入口）
+
+课时卡片在本课有待复习词时出现次级动作「复习 N」，语义与首页「错词复习」完全一致：
+只取 `last_grade='again' OR due_at <= now` 的**本课词**。
+
+- **词集合以该课 `manifest.json` 为准**，不用 `words.clip_lesson`：后者是「最近一次
+  被课时会话引用」，同一个词在多课出现时会被改写成后来的课。
+- 顺序洗牌（沿用 `sha256(session_seed + text)`）：集合通常只有 1–3 个词，但固定顺序
+  仍会形成位置记忆。
+- 复用原课 clips，不调 TTS；`kind='review'`、无 intro/outro、`lead_in=3000`。
+- N = 0 时入口隐藏。
+- 孩子端**不提供**「整课重排」，也不提供任何范围/数量设置。
+
+「整课重排」（本课全部词、错词分桶后桶内洗牌）只给 agent 与家长端，见 §6.6。
+
+## 5. 积压与错词复习
 
 ### 5.1 汇总
 
@@ -203,7 +243,7 @@ count = min(review_cap, max(3, ceil(new_count * 0.25)))
 }
 ```
 
-### 5.2 复习会话（加练）
+### 5.2 复习会话（错词复习）
 
 `POST /api/sessions/review`：
 
@@ -217,7 +257,7 @@ count = min(review_cap, max(3, ceil(new_count * 0.25)))
 - 选词规则同 §4.2；`kind='review'`、`title='错词复习'`、无 intro/outro。
 - 首页按科目显示入口；家长模式可选「练 10 / 20 / 全部（≤40）」。
 
-## 6. AI 组卷
+## 6. 范围复习
 
 ### 6.1 读取待复习池
 
@@ -237,7 +277,7 @@ count = min(review_cap, max(3, ceil(new_count * 0.25)))
 
 按 §4.2 排序，agent 可以直接取前 N 个，也可以按自己的教学判断重排。
 
-### 6.2 创建临时复习课时
+### 6.2 创建临时复习会话
 
 `POST /api/sessions/custom`：
 
@@ -272,10 +312,70 @@ count = min(review_cap, max(3, ceil(new_count * 0.25)))
 
 | 场景 | 入口 | 词匹配 | 调度 |
 |---|---|---|---|
-| AI 挑词组卷（本设计） | `POST /api/sessions/custom` | 必须已存在 | 批改时正常更新 |
+| 范围复习（本设计） | `POST /api/sessions/custom` | 必须已存在 | 批改时正常更新 |
 | 离线结果回传（分享功能） | `POST /api/results/import` | 按 `(subject, text)` 匹配，缺失可建词或标记 `unmatched` | 用 `finished_at` 为时间基准写入 |
 
 两者都**不允许 agent 直接写 `due_at`**，调度权始终在服务端。
+
+### 6.5 词表读取与掌握度统计
+
+范围复习的前置条件：agent 要能读到「某几课的所有词 + 历史表现」。现在没有这个能力
+（`GET /api/lessons` 不含词；`GET /api/review/queue` 只有到期子集；读 manifest 需要
+先建一个 session）。
+
+```
+GET /api/words?subject=english&lessons=<id1>,<id2>&limit=200&offset=0
+```
+
+- 词集合 = 这些课时 `manifest.json` 的**并集**，按请求顺序的课时内顺序排列；
+  同一个词只出现一次（含从未听写过的词，统计全零）。
+- 统计按 `(subject, text)` 关联 `attempts` / `review_state`。
+- 返回字段：`attempts`、`wrong`、`correct`、`correct_streak`、`wrong_recent`
+  （最近 5 次里的错次数）、`last_grade`、`last_attempt_at`、`lapses`、
+  `interval_days`、`due_at`、`has_clip`、`sources`。
+- 省略 `lessons` = 该科目**已学词**（有 `review_state` 的词）：没有课时范围时，
+  词无法可靠归属到某一课（`words.clip_lesson` 会被后来的课覆盖）。
+
+服务端**只给事实，不下结论**；「哪些词该纳入」由 agent 判断，skill 里写启发式：
+
+| 组合 | 建议 |
+|---|---|
+| `wrong = 0` | 不必纳入 |
+| `wrong >= 1` 且 `correct_streak >= 3` 且 `interval >= 15` | 错过但已稳定，不纳入 |
+| `lapses >= 2` | 学了又忘，优先纳入 |
+| `wrong_recent >= 1` | 当前不稳定，纳入 |
+| `attempts <= 2` | 样本不足，交家长确认 |
+
+为什么需要频率而不是单次对错：`attempts` 只有 `correct` / `again` 两态，**没有错字
+信息**（F6 拍照批改才有），所以「笔误」与「不会写」在数据上无法区分，只能靠
+「反复错」「学了又忘」近似。`lapses` 比 `wrong` 更接近「真不会」，因为它跨越了多次
+复习。
+
+### 6.6 范围复习（agent / 家长端）
+
+适用于「英语第 1–4 课、语文前四个单元、考前过一遍」这类跨课复习。孩子端不提供。
+
+流程：
+
+1. `GET /api/lessons` 找到课时 id；
+2. `GET /api/words?subject=...&lessons=...` 取词与统计；
+3. 按 §6.5 启发式挑词（或整取该范围）；
+4. `POST /api/sessions/custom { subject, title, items, shuffle: true }`，
+   `items` 的顺序由 agent 决定；
+5. 把 `?s=<session_id>` 深链交给家长。
+
+**不做 `review_plan` / `coverage` / 范围进度实体。** 范围是请求参数，进度由 agent
+每次重新计算；跨天覆盖同一范围靠 §4.2 的「最久未练优先」自然滚动。只有出现
+「多个并行范围」「跨设备看进度」「按考试日期倒排」三者之一时，才考虑引入快照式
+计划实体。
+
+「整课重排」（本课全部词）也走这条链路，排序建议**分桶 + 桶内洗牌**：
+
+1. 桶 A：`last_grade='again'`；桶 B：`due_at <= now`；桶 C：其余（按 `attempts` 少 → 最久未练）；
+2. 桶内用 session 种子洗牌。
+
+不要按 `wrong` 严格降序：错得最多的词永远排第一，孩子会记住位置；而且错 1–2 次
+在小学样本里可能只是笔误。
 
 ## 7. 兼容性清单
 
@@ -288,6 +388,17 @@ count = min(review_cap, max(3, ceil(new_count * 0.25)))
 - `GET /api/lessons` 追加 `subject`/`grade`/`term`，不删旧字段。
 - 结果 JSON 追加 `subject`；旧字段不变。
 - CLI 与 HTTP 语义同步（见 `http-api.md` 的一致性约定）。
+
+2026-11-18 追加：
+
+- schema **v4**：只加索引 `attempts(word_id, created_at)`，不改表结构、不加列；
+  旧库自动创建，幂等。
+- `POST /api/sessions/review` 新增**可选** `lesson_id`；不传时行为与现在完全一致。
+- `POST /api/sessions/custom` 新增**可选** `shuffle`，默认 `false`。
+- 新增 `GET /api/words`、`GET /api/review/lessons`（都是只读、HTTP-only 运行时能力，
+  不涉及 CLI 一致性；不修改 `GET /api/lessons`）。
+- `check` 的提前复习分支只改变「未到期且答对」这一种组合，其余路径不变。
+- 排序改用 `attempts.created_at` 后，旧数据（无 attempts）回退到派生值，行为等价。
 
 ## 8. 测试计划
 
@@ -306,19 +417,51 @@ count = min(review_cap, max(3, ceil(new_count * 0.25)))
 - 洗牌：同 session 稳定、不同 session 不同；
 - 科目隔离：语文到期词不出现在英语会话。
 
-AI 组卷 / 加练：
+范围复习 / 错词复习：
 - 自定义会话顺序保持、超 60 个 / 重复 / 未知 / 缺音频分别 400 且错误可读；
 - 批改后 `review_state` 与应用内复习结果一致；
 - `limit` 默认/上限、科目筛选、年级/学期筛选；
 - 结果查询按科目过滤。
 
+课内复习（2026-11-18 追加）：
+- 词集合来自 manifest：同一词在两课出现时，分别出现在两课的「课内复习」里；
+- `lesson_id` 与 `grade`/`term` 同时给 → 400；课时不属于该科目 → 400；未知 → 404；
+- 无可复习词 → 409；
+- 生成的会话 `kind='review'`、`title` 带「· 复习」、无 intro/outro；
+- 会话词数 == 本课待复习词数（**不含**任何额外混入）。
+
+提前复习调度：
+- 未到期词答对 → `interval_days` / `due_at` / `lapses` 三字段**完全不变**；
+- 未到期词答错 → `interval_days=1`、`due_at=now+86400`、`lapses+1`；
+- `last_grade='again'` 且 `due_at` 在未来（错词 1 天后）答对 → **正常升级**，不当作提前；
+- 到期词出现在范围复习里答对 → 正常升级。
+
+排序修正：
+- 昨天刚练过、未到期的词，第二次同范围取词时排在其他更久未练的词之后；
+- 无 `attempts` 记录时仍按派生值排序（旧数据兼容）。
+
+范围复习：
+- `GET /api/words` 并集去重、按请求的课时顺序 + manifest 内顺序；
+- 统计字段在无 `review_state` / 无 `attempts` 时为零值而不是 500；
+- `lessons` 含未知 id → 400 且列出 `unknown`；
+- `limit` 默认 200、上限 500；`offset` 生效。
+
 ## 9. 实施顺序
 
 1. **迁移框架 + v2 + 科目字段贯通**（manifest、导入、列表、结果）。
 2. **组卷算法**：manifest `review_cap`、优先级、数量、洗牌、150s 护栏。
-3. **积压汇总 + 加练会话**（API + 首页分组；家长模式可后置）。
-4. **AI 组卷**：`/api/review/queue`、`/api/sessions/custom`、`GET /api/sessions/{id}`、PWA 深链。
+3. **积压汇总 + 错词复习会话**（API + 首页分组；家长模式可后置）。
+4. **范围复习**：`/api/review/queue`、`/api/sessions/custom`、`GET /api/sessions/{id}`、PWA 深链。
 5. 文档/skill 同步，全量验证，`v0.2.0-rc.1`。
+6. **课内复习**（2026-11-18）：
+   1. schema v4（只加 `attempts(word_id, created_at)` 索引）+ 选词排序改用真实
+      `attempts.created_at`；
+   2. `check` 的提前复习分支；
+   3. `POST /api/sessions/review` 增加 `lesson_id`；
+   4. `GET /api/review/lessons`（每课待复习数）；
+   5. `GET /api/words` + `custom.shuffle`（agent 范围复习）；
+   6. PWA 课时卡「复习 N」（需 designer 把整卡 `<button>` 改成主/次两个动作）；
+   7. skill 增加范围复习流程与启发式。
 
 ## 10. 已确认的决策
 
@@ -326,10 +469,15 @@ AI 组卷 / 加练：
 - 科目：`chinese` / `english`，写请求必填。
 - 迁移回填：含拉丁字母 → `english`，其余 → `chinese`。
 - 组卷：`min(review_cap=8, max(3, 25%×新词数))` + 150s 护栏。
-- 加练：`limit` 默认 20、最大 40。
-- AI 组卷：上限 60 个词，超出直接报错。
+- 错词复习：`limit` 默认 20、最大 40。
+- 范围复习：单次上限 60 个词，超出直接报错。
 - 备份：保留最近 3 份。
 - FSRS：本轮不做。
+- 孩子端只有「课内复习」一个复习入口，只取本课待复习词；不给孩子任何范围/数量设置。
+- 「整课重排」与「跨课范围复习」只给 agent / 家长端。
+- 不做 `review_plan` / `coverage` / 范围进度实体；范围是请求参数。
+- 提前复习答对**完全不动调度**；答错照常回退。
+- 课内复习的词集合以 manifest 为准，不用 `words.clip_lesson`。
 
 ## 11. skill / 文档同步（实施时必须完成）
 
@@ -339,13 +487,17 @@ AI 组卷 / 加练：
   写明「旧请求不带 subject 会 400，不是默认语文」。
 - 新增「复习组卷」流程：
   1. `GET /api/review/queue?subject=...` 取待复习池（已按优先级排序）；
-  2. agent 挑选/排序，`POST /api/sessions/custom` 创建临时复习课时；
+  2. agent 挑选/排序，`POST /api/sessions/custom` 创建临时复习会话；
   3. 把 `?s=<session_id>` 链接给家长。
+- 新增「范围复习」流程：`GET /api/words?subject=&lessons=` 取词与统计 →
+  按 §6.5 启发式挑词 → `custom`（`shuffle: true`）→ 深链。
+  写明「`lapses` / `correct_streak` 优先于单次对错；样本 ≤2 次时请家长确认」。
 - 明确 `POST /api/sessions/custom` 的 **60 词上限**：
   超过时返回 `{"error":"复习词过多（最多 60 个，本次 N 个）"}`，
   agent 必须裁剪到 60 以内，或请家长决定分几次复习；**不要原样重试**。
-- 说明 AI 只决定「选哪些词、什么顺序」，**不写调度**；对错与下次复习时间
+- 说明 agent 只决定「选哪些词、什么顺序」，**不写调度**；对错与下次复习时间
   由应用批改后统一计算。
+- 说明孩子端不需要设置范围：课内复习入口自动出现，范围复习由 agent / 家长发起。
 
 `docs/http-api.md`：实施第一步先把新端点、字段、错误码写进契约，再写代码。
 `AGENTS.md`：只在设计/约定变化时同步（科目身份、迁移版本、组卷规则）。

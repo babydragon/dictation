@@ -92,6 +92,8 @@
   let mockDue = 2;      // 到期词
   let mockWrong = 0;    // 上次标错、还没纠正的词
   const mockReviewCount = () => mockDue + mockWrong;
+  // 预览里把待复习词都算到第 5 课头上，用来演示「课内复习」入口
+  const MOCK_REVIEW_LESSON_ID = 'a1b2c3d4e5f6';
 
   const MOCK_LESSONS = [
     {
@@ -181,7 +183,7 @@
     let reviewFrom = kind === 'review' ? 0 : words.length;
     if (kind !== 'review') words.push(MOCK_TAIL_REVIEW[0]);
 
-    const base = '/media/' + (kind === 'review' ? 'review-src' : lessonId);
+    const base = '/media/' + (lessonId || 'review-src');
     const tailBase = kind === 'review' ? base : '/media/prev-lesson';
     const baseFor = (i) => (i >= reviewFrom ? tailBase : base);
     const gap = 2400;
@@ -220,7 +222,9 @@
     return {
       session_id: 'mock-' + Date.now().toString(36),
       kind: kind,
-      title: kind === 'review' ? '错词复习' : lesson.title,
+      title: kind === 'review'
+        ? (lesson ? lesson.title + ' · 复习' : '错词复习')
+        : lesson.title,
       base: base,
       defaults: {
         gap_ms: gap,
@@ -269,9 +273,32 @@
             resolve(buildMockManifest('lesson', body && body.lesson_id));
             return;
           }
+          if (path === '/api/review/lessons' && method === 'GET') {
+            const count = mockReviewCount();
+            const lesson = MOCK_LESSONS.filter((l) => l.id === MOCK_REVIEW_LESSON_ID)[0];
+            resolve({
+              subject: null,
+              lessons: count > 0 && lesson
+                ? [{
+                    lesson_id: lesson.id,
+                    dir: lesson.title,
+                    title: lesson.title,
+                    review_count: count,
+                    due_count: mockDue,
+                    wrong_count: mockWrong,
+                    learned_count: lesson.words.length,
+                  }]
+                : [],
+            });
+            return;
+          }
           if (path === '/api/sessions/review' && method === 'POST') {
-            if (mockReviewCount() <= 0) throw httpError(409, '没有到期错词');
-            resolve(buildMockManifest('review', null));
+            const lessonId = (body && body.lesson_id) || null;
+            if (mockReviewCount() <= 0) throw httpError(409, '这一课没有需要复习的词');
+            if (lessonId && lessonId !== MOCK_REVIEW_LESSON_ID) {
+              throw httpError(409, '这一课没有需要复习的词');
+            }
+            resolve(buildMockManifest('review', lessonId));
             return;
           }
           const m = /^\/api\/sessions\/([^/]+)\/check$/.exec(path);
@@ -333,8 +360,14 @@
   const API = {
     lessons: () => request('/api/lessons'),
     reviewSummary: () => request('/api/review/summary'),
+    reviewLessons: () => request('/api/review/lessons'),
     createSession: (lessonId) => request('/api/sessions', { method: 'POST', body: { lesson_id: lessonId } }),
     createReview: (subject) => request('/api/sessions/review', { method: 'POST', body: { subject: subject } }),
+    lessonReview: (subject, lessonId) =>
+      request('/api/sessions/review', {
+        method: 'POST',
+        body: { subject: subject, lesson_id: lessonId },
+      }),
     getSession: (sessionId) => request('/api/sessions/' + encodeURIComponent(sessionId)),
     check: (sessionId, results) =>
       request('/api/sessions/' + encodeURIComponent(sessionId) + '/check', {
@@ -1042,6 +1075,8 @@
 
   function lessonCard(lesson, isLast) {
     const count = Number(lesson.item_count || 0);
+    const reviewCount = Math.max(0, Number(lesson.review_count) || 0);
+    const title = lesson.title || '未命名课时';
     const meta = [];
     const subject = subjectLabel(lesson.subject);
     if (subject) meta.push(subject);
@@ -1049,14 +1084,44 @@
     meta.push(count + ' 个词');
     if (lesson.total_ms) meta.push('约 ' + approxText(lesson.total_ms));
 
-    const card = el('button', { class: 'card', type: 'button' }, [
+    const card = el('div', { class: 'card card-lesson' + (reviewCount > 0 ? ' has-review' : '') });
+
+    // 主区域：不能嵌在 <button> 里（旁边还有复习按钮），用 role=button 保留键盘可达性
+    const open = el('div', {
+      class: 'card-open',
+      role: 'button',
+      tabindex: '0',
+      'aria-label': '开始听写：' + title,
+    }, [
       el('div', { class: 'card-main' }, [
-        el('p', { class: 'card-title', text: lesson.title || '未命名课时' }),
+        el('p', { class: 'card-title', text: title }),
         el('p', { class: 'card-meta', text: meta.join(' · ') }),
       ]),
       el('span', { class: 'chev' }, [iconEl('chev')]),
     ]);
-    card.addEventListener('click', () => startLesson(lesson, card));
+
+    open.addEventListener('click', () => startLesson(lesson, card));
+    open.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') {
+        e.preventDefault();
+        startLesson(lesson, card);
+      }
+    });
+    card.appendChild(open);
+
+    if (reviewCount > 0) {
+      const reviewBtn = el('button', {
+        class: 'card-review-btn',
+        type: 'button',
+        'aria-label': '复习 ' + reviewCount + '：' + title,
+      }, [
+        iconEl('retry'),
+        el('span', { class: 'card-review-label', text: '复习 ' + reviewCount }),
+      ]);
+      reviewBtn.addEventListener('click', () => startLessonReview(lesson, card));
+      card.appendChild(reviewBtn);
+    }
+
     return card;
   }
 
@@ -1132,7 +1197,11 @@
     showScreen('home');
     setChildren(els.homeBody, el('div', { class: 'loading-block', html: '<span class="spinner"></span>正在读取…' }));
 
-    const [lessonsRes, summaryRes] = await Promise.allSettled([API.lessons(), API.reviewSummary()]);
+    const [lessonsRes, summaryRes, lessonReviewRes] = await Promise.allSettled([
+      API.lessons(),
+      API.reviewSummary(),
+      API.reviewLessons(),
+    ]);
 
     if (lessonsRes.status === 'rejected') {
       const frag = document.createDocumentFragment();
@@ -1143,6 +1212,20 @@
       return;
     }
     state.lessons = (lessonsRes.value && lessonsRes.value.lessons) || [];
+
+    // 课内复习：按 lesson_id 把 review_count 挂到课时卡片上；接口失败就当没有复习词
+    const reviewByLesson = new Map();
+    if (lessonReviewRes.status === 'fulfilled' && lessonReviewRes.value) {
+      const rows = Array.isArray(lessonReviewRes.value.lessons) ? lessonReviewRes.value.lessons : [];
+      rows.forEach((row) => {
+        if (!row || !row.lesson_id) return;
+        const n = Math.max(0, Number(row.review_count) || 0);
+        if (n > 0) reviewByLesson.set(String(row.lesson_id), n);
+      });
+    }
+    state.lessons.forEach((lesson) => {
+      lesson.review_count = reviewByLesson.get(String(lesson.id)) || 0;
+    });
     const summary = summaryRes.status === 'fulfilled' && summaryRes.value ? summaryRes.value : null;
     // review_count = 未纠正错词 + 到期词（当天标错的词也能立刻复习）；老服务端只有 due_count
     const hasReviewCount = summary && summary.review_count !== null && summary.review_count !== undefined;
@@ -1168,20 +1251,50 @@
 
   /* --------------------------------------------------------------- 进入播放 */
 
+  /** 课时卡片现在是 div，禁用态用 class 表达（保护重复点击） */
+  function setCardBusy(card, busy) {
+    if (!card) return;
+    card.classList.toggle('is-busy', !!busy);
+    card.setAttribute('aria-busy', busy ? 'true' : 'false');
+  }
+
   async function startLesson(lesson, card) {
     if (state.busy) return;
     state.busy = true;
-    card.disabled = true;
+    setCardBusy(card, true);
     unlockAudio();
     try {
       const manifest = await API.createSession(lesson.id);
       state.busy = false;
-      card.disabled = false;
+      setCardBusy(card, false);
       rememberLesson(lesson.id);
       startPlayback(manifest);
     } catch (err) {
       state.busy = false;
-      card.disabled = false;
+      setCardBusy(card, false);
+      toast((err && err.message) || '没法开始，再试一次');
+    }
+  }
+
+  /** 课内复习：只练这一课的待复习词，走和「听写」同一套播放器 */
+  async function startLessonReview(lesson, card) {
+    if (state.busy) return;
+    state.busy = true;
+    setCardBusy(card, true);
+    unlockAudio();
+    try {
+      const manifest = await API.lessonReview(lesson.subject, lesson.id);
+      state.busy = false;
+      setCardBusy(card, false);
+      startPlayback(manifest);
+    } catch (err) {
+      state.busy = false;
+      setCardBusy(card, false);
+      if (err && err.status === 409) {
+        toast('这一课没有需要复习的词');
+        loadHome();
+        return;
+      }
       toast((err && err.message) || '没法开始，再试一次');
     }
   }

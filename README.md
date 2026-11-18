@@ -192,7 +192,8 @@ curl -sS "$API/api/results/latest/wrong"    # 只取错词
 ```
 
 设置 `DICTATION_API_TOKEN` 后，写操作需带 `X-Dictation-Token`。
-完整契约见 [`docs/http-api.md`](docs/http-api.md)。
+完整契约见 [`docs/http-api.md`](docs/http-api.md)；术语与命名见
+[`docs/glossary.md`](docs/glossary.md)。
 
 ## 命令
 
