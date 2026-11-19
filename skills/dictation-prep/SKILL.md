@@ -523,8 +523,9 @@ curl -sS -X POST "$API/api/lessons/第5课-旧/delete" \
 - 不要生成 Markdown 表格或 YAML 作为 `text`。
 - 不要在 import 后、家长确认前执行 `gen`。
 - 不要删除家长给的词，即使你觉得重复或简单。
-- **不要假设接口返回结构**：`docs/http-api.md` 和本 skill 里的示例就是唯一依据；
-  字段名看不懂类型时先真实调用一次取原始 JSON，不要自己编 mock 结构当成真实返回。
+- **不要假设接口返回结构**：`docs/http-api.md` 和本 skill 的示例就是唯一契约。
+  运行脚本的环境可能没有网络、无法“先调一次看结构”，所以示例里的字段与类型必须照抄；
+  示例没覆盖的字段视为未定义，脚本应报“规范未定义”并停止，不要编造结构或猜类型。
 - 不要在没有 `apply:true` 前声称课时已删除；`lesson delete` 默认只返回计划。
 - 不要未经家长逐课确认就批量删课时；每删一课先把 `words_repointed` /
   `words_cleared` 报给家长。

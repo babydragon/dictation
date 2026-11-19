@@ -4330,4 +4330,159 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
+
+    // ---- 响应形状锁定：文档示例即契约，字段/类型漂移必须在这里失败 ----
+
+    fn assert_keys(value: &Value, expected: &[&str]) {
+        let mut got: Vec<String> = value
+            .as_object()
+            .unwrap_or_else(|| panic!("期望对象: {value}"))
+            .keys()
+            .cloned()
+            .collect();
+        got.sort();
+        let mut want: Vec<String> = expected.iter().map(|key| (*key).to_string()).collect();
+        want.sort();
+        assert_eq!(got, want, "字段集合变化，必须同步 docs/skill 示例");
+    }
+
+    fn json_type(value: &Value) -> &'static str {
+        match value {
+            Value::Null => "null",
+            Value::Bool(_) => "bool",
+            Value::Number(_) => "number",
+            Value::String(_) => "string",
+            Value::Array(_) => "array",
+            Value::Object(_) => "object",
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicates_response_shape_matches_docs() {
+        let temp = tempfile::tempdir().unwrap();
+        let opts = test_opts(&temp);
+        fs::create_dir_all(&opts.lessons_dir).unwrap();
+        write_lesson_manifest(&opts.lessons_dir, "第5课-新", "第5课", 2, 20_000);
+        write_lesson_manifest(&opts.lessons_dir, "第5课-旧", "第5课", 2, 20_000);
+        let app = router(test_state(&opts, None, None));
+
+        let body = body_json(
+            app.clone()
+                .oneshot(get_req("/api/lessons/duplicates"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_keys(&body, &["duplicates"]);
+        let groups = body["duplicates"].as_array().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_keys(&groups[0], &["subject", "title", "lessons"]);
+        assert_eq!(json_type(&groups[0]["subject"]), "string");
+        let lessons = groups[0]["lessons"].as_array().unwrap();
+        assert_eq!(lessons.len(), 2);
+        assert_keys(&lessons[0], &["dir", "id", "item_count", "total_ms"]);
+        assert_eq!(json_type(&lessons[0]["item_count"]), "number");
+    }
+
+    #[tokio::test]
+    async fn delete_plan_response_shape_matches_docs() {
+        let temp = tempfile::tempdir().unwrap();
+        let opts = test_opts(&temp);
+        fs::create_dir_all(&opts.lessons_dir).unwrap();
+        write_lesson_manifest(&opts.lessons_dir, "第5课", "第5课", 2, 20_000);
+        write_lesson_manifest(&opts.lessons_dir, "第5课-新", "第5课", 2, 20_000);
+        let state = test_state(&opts, None, None);
+        let app = router(state.clone());
+
+        // 造一个"旧课时独有的词"和"两课共有的词"，让 repoint / cleared 都非空
+        let entries = state.db.scan_lessons(&opts.lessons_dir).unwrap();
+        let old = entries
+            .iter()
+            .find(|entry| entry.dir_name == "第5课")
+            .unwrap()
+            .clone();
+        state
+            .db
+            .create_lesson_session(
+                &old,
+                &[
+                    test_item("词1", false, &old.id),
+                    test_item("只有旧课", false, &old.id),
+                ],
+            )
+            .unwrap();
+
+        let response = post(
+            &app,
+            &format!("/api/lessons/{}/delete", db::lesson_id("第5课")),
+            json!({}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_keys(
+            &body,
+            &[
+                "applied",
+                "bytes",
+                "files",
+                "lesson",
+                "lesson_id",
+                "sessions",
+                "title",
+                "words_cleared",
+                "words_repointed",
+            ],
+        );
+        assert_eq!(json_type(&body["applied"]), "bool");
+        assert_eq!(json_type(&body["files"]), "number", "files 是文件个数");
+        assert_eq!(json_type(&body["bytes"]), "number");
+        assert_eq!(json_type(&body["words_cleared"]), "array");
+        assert_eq!(json_type(&body["words_cleared"][0]), "string");
+        let repointed = body["words_repointed"].as_array().unwrap();
+        assert_eq!(repointed.len(), 1);
+        assert_keys(&repointed[0], &["text", "to_lesson", "to_lesson_id"]);
+        assert_eq!(repointed[0]["text"], "词1");
+    }
+
+    #[tokio::test]
+    async fn words_response_shape_matches_docs() {
+        let temp = tempfile::tempdir().unwrap();
+        let opts = test_opts(&temp);
+        fs::create_dir_all(&opts.lessons_dir).unwrap();
+        write_lesson_manifest(&opts.lessons_dir, "第5课", "第5课", 2, 20_000);
+        let state = test_state(&opts, None, None);
+        let app = router(state.clone());
+
+        let path = format!(
+            "/api/words?subject=chinese&lessons={}",
+            db::lesson_id("第5课")
+        );
+        let body = body_json(app.clone().oneshot(get_req(&path)).await.unwrap()).await;
+        assert_keys(&body, &["subject", "total", "offset", "limit", "words"]);
+        let word = &body["words"][0];
+        assert_keys(
+            word,
+            &[
+                "text",
+                "lang",
+                "has_clip",
+                "sources",
+                "attempts",
+                "wrong",
+                "correct",
+                "correct_streak",
+                "wrong_recent",
+                "last_grade",
+                "last_attempt_at",
+                "lapses",
+                "interval_days",
+                "due_at",
+            ],
+        );
+        assert_eq!(json_type(&word["has_clip"]), "bool");
+        assert_eq!(json_type(&word["attempts"]), "number");
+        assert_eq!(json_type(&word["due_at"]), "null", "未学过的词是 null");
+        assert_keys(&word["sources"][0], &["id", "dir"]);
+    }
 }
