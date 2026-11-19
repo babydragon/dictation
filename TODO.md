@@ -30,10 +30,13 @@
 | 错词复习 | ✅ `limit`(1–40)、`grade`/`term` 筛选、科目卡片显示逾期 |
 | 范围复习 | ✅ `/api/review/queue`、`/api/sessions/custom`、`GET /api/sessions/{id}`、`?s=` 深链 |
 | 复习第二轮（课内复习 + 范围复习） | ✅ schema v4 / 排序 / 提前复习调度 / `lesson_id` / `/api/review/lessons` / `/api/words` / `custom.shuffle` / PWA「复习 N」 |
+| 播放页导航 | ✅ 上一个 / 下一个；暂停态跳转保持暂停，首尾置灰 |
+| 单词重新生成 | ✅ `POST /api/lessons/{id}/regenerate-word` + 检查页长按（删缓存样本、只花 1 次 TTS） |
+| 听写节奏（隐藏） | ✅ 长按首页标题设置词后等待（本地设置，静态发布同样可用） |
 | 缓存清理 | ✅ `clean --unused/--older-than`，默认 dry-run |
 | 断点续听 | ✅ localStorage 保存会话 + 条目，7 天有效 |
 
-当前测试：`cargo test` **198 passed**（189 lib + 9 bin）；clippy / fmt 干净；
+当前测试：`cargo test` **200 passed**（191 lib + 9 bin）；clippy / fmt 干净；
 `node --check web/app.js` 通过。
 演示课时：`lessons/第5课`（20 词，3:24，运行时数据，不提交）。
 
@@ -42,11 +45,13 @@
 > SBC 部署已验收（安装 + systemd 自启 + 手机访问 + 服务端生成），
 > 不再是待办。离线本地 TTS 仍为可选增强。
 
-1. **家长模式 / 答案纸**：运行中调 gap/rate/repeat；A4 一列 20 题、带题号。
-2. **拍照批改**：`Grader` trait + 多模态模型 + 置信度 + 人工确认。
-3. **记忆曲线细化**：FSRS、按教材/单元限定范围（当前用课时范围表达）。
-4. **本地 TTS（可选）**：断网兜底，SBC 上选型与实测。
-5. **F8 外网分享**：Cloudflare Pages + R2，独立会话实施；要点见 §5 F8。
+1. **overrides + sample**：把挑中的采样固化到 `<cache>/overrides/<key>.wav`，配
+   `dictation sample <词> --takes N` 出候选；解决「坏采样被缓存锁死」的最终方案。
+2. **家长模式 / 答案纸**：A4 一列 20 题、带题号（gap 的运行时调节已由隐藏面板覆盖）。
+3. **拍照批改**：`Grader` trait + 多模态模型 + 置信度 + 人工确认。
+4. **记忆曲线细化**：FSRS、按教材/单元限定范围（当前用课时范围表达）。
+5. **本地 TTS（可选）**：断网兜底，SBC 上选型与实测。
+6. **F8 外网分享**：Cloudflare Pages + R2，独立会话实施；要点见 §5 F8。
 
 ### 发布 v0.2.0-rc.1（科目 + 复习组卷）
 
@@ -540,6 +545,24 @@ dictation result import <file|-> [--json]
   `http-api.md` / `player.md` / `review-scheduling.md` / `README.md` / skill 顶部
   都指向词表。
 - 代码未动，因此没有跑 fmt/clippy/test。
+
+### 2026-11-19（播放导航 / 隐藏节奏面板 / 单词重新生成）
+
+- 播放页新增「上一个 / 下一个」：独立一行、56px；`jumpTo` 重开时间轴，
+  暂停态跳转保持暂停，首项/末项置灰，断点续听 index 同步。
+- 隐藏「听写节奏」：长按首页标题 1.5s，输入**词后等待秒数**（0–120）；
+  换算 `gap_ms = round(秒×1000) − 80`（片段 20ms 前导 + 60ms 尾音），
+  只覆盖词后等待；存 `localStorage["dictation.timing.v1"]`，纯客户端，
+  静态发布同样可用。实测：默认 6s 与设 10s 的「点开始→第 2 项」差 3.92s
+  （9.92 − 6.00），换算正确。
+- 单词重新生成：`POST /api/lessons/{id}/regenerate-word` 按 `meta.text` 删缓存样本，
+  再 `force` 重渲染（其它词命中缓存，1 次 TTS，片段文件名不变）；
+  检查页长按词文本 1.5s 触发，仅课时会话。
+- 触摸兼容：CDP 触摸事件验证长按、滑动取消、保存、确认重生成全流程；
+  修掉「长按松手补发的 click 把确认框点掉」，改为吞掉紧邻的一次 click（400ms 失效）。
+- 验证：`cargo test` 200 passed、fmt/clippy、`node --check`；两处长按在
+  320/390px 下无溢出。
+- 尚未真机验证：iOS Safari 的系统长按菜单抑制与滚动惯性下的 `pointercancel`。
 
 ### 2026-11-18（复习第二轮实现：课内复习 + 范围复习）
 

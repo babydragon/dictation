@@ -481,6 +481,7 @@ agent 不持有 TTS 密钥、也不需要文件系统权限：导入与合成全
 - 受保护端点：
   - `POST /api/lessons`
   - `POST /api/lessons/{id}/generate`
+  - `POST /api/lessons/{id}/regenerate-word`
   - `POST /api/lessons/{id}/generate/cancel`
 
 ### `POST /api/lessons`
@@ -549,6 +550,27 @@ body 全部可选：
 - `503 {"error":"未配置 TTS 密钥（/etc/dictation/env）"}`：`serve` 启动时
   `Config::from_env()` 拿不到 key。
 - `429 {"error":"生成队列已满"}`：排队上限 4。
+
+### `POST /api/lessons/{id}/regenerate-word`
+
+重新采样**一个词**。TTS 输出是非确定性的（同输入每次韵律会变），而缓存键只由
+内容与参数决定，所以一次不理想的采样会被永久复用；这个接口删掉该词的缓存再强制
+重渲染，其它词仍命中缓存。
+
+```json
+{ "text": "一本正经", "provider": "doubao" }
+```
+
+- `text` 必填（trim 后非空，否则 400）；`provider` 可选，省略用默认。
+- `{id}` 解析同 `generate`；课时还没生成音频 → `404 {"error":"课时还没有生成音频，先听写一次"}`。
+- 词不在该课 `manifest.json` 里 → `404 {"error":"这一课没有这个词"}`。
+- 行为：把 `cache/*.json` 中 `text` 完全相等的样本（wav + json）全部删除，然后按
+  `force` 语义入队重渲染；只会为该词产生一次 TTS 调用（其它片段命中缓存）。
+- 片段文件名不变（缓存键不变），`manifest.json` 的 `duration_ms`/`total_ms` 会更新；
+  正在播放的会话不受影响，下次进入课时生效。
+- 返回同 `generate`：`202 {"job_id":"...","status":"queued","lesson":"..."}`；
+  已有进行中的任务时复用同一个 `job_id`。
+- `503`（无密钥）、`429`（队列已满）与 `generate` 相同。
 
 ### `GET /api/jobs/{job_id}`
 

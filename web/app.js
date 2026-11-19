@@ -301,6 +301,12 @@
             resolve(buildMockManifest('review', lessonId));
             return;
           }
+          const regenerate = /^\/api\/lessons\/([^/]+)\/regenerate-word$/.exec(path);
+          if (regenerate && method === 'POST') {
+            if (!body || !body.text) throw httpError(400, '缺少要重新生成的词');
+            resolve({ ok: true, text: body.text });
+            return;
+          }
           const m = /^\/api\/sessions\/([^/]+)\/check$/.exec(path);
           if (m && method === 'POST') {
             const results = (body && body.results) || [];
@@ -374,6 +380,11 @@
         method: 'POST',
         body: { results: results },
       }),
+    regenerateWord: (lessonId, text) =>
+      request('/api/lessons/' + encodeURIComponent(lessonId) + '/regenerate-word', {
+        method: 'POST',
+        body: { text: text },
+      }),
   };
 
   /* --------------------------------------------------------------- 界面状态 */
@@ -389,6 +400,7 @@
     marked: new Set(),
     busy: false,
     submitting: false,
+    regenerating: false,
     screen: 'home',
   };
 
@@ -437,6 +449,157 @@
     els.toast.classList.toggle('toast-raised', state.screen === 'check');
     if (toastTimer) clearTimeout(toastTimer);
     toastTimer = setTimeout(() => { els.toast.hidden = true; toastTimer = null; }, 3600);
+  }
+
+  /* ------------------------------------------------------------- 隐藏：长按 */
+
+  const HOLD_MS = 1500;
+  const HOLD_MOVE_PX = 10;
+
+  /**
+   * 长按触发。只用 pointer 事件；滑动、抬起、取消都会中止计时。
+   * 目标元素加 .hold-target（禁止系统长按菜单 / 选中文本）。
+   */
+  function attachLongPress(node, onHold) {
+    let timer = null;
+    let startX = 0;
+    let startY = 0;
+    let armed = false;
+
+    // 长按抬手时浏览器还会补发一次 click：在捕获阶段吞掉它，
+    // 否则刚弹出的面板/确认框会被这次 click 立刻点掉。
+    // 只吞一次、且 400ms 内失效，避免挡住家长随后的真实点击。
+    const swallowNextClick = () => {
+      let done = false;
+      const swallow = (event) => {
+        if (done) return;
+        done = true;
+        document.removeEventListener('click', swallow, true);
+        event.preventDefault();
+        event.stopPropagation();
+      };
+      document.addEventListener('click', swallow, true);
+      setTimeout(() => {
+        if (done) return;
+        done = true;
+        document.removeEventListener('click', swallow, true);
+      }, 400);
+    };
+
+    const cancel = () => {
+      armed = false;
+      if (timer) { clearTimeout(timer); timer = null; }
+    };
+
+    node.addEventListener('pointerdown', (event) => {
+      if (event.pointerType === 'mouse' && event.button !== 0) return;
+      cancel();
+      armed = true;
+      startX = event.clientX;
+      startY = event.clientY;
+      try { node.setPointerCapture(event.pointerId); } catch (e) { /* ignore */ }
+      timer = setTimeout(() => {
+        timer = null;
+        armed = false;
+        swallowNextClick();
+        onHold();
+      }, HOLD_MS);
+    });
+
+    node.addEventListener('pointermove', (event) => {
+      if (!armed) return;
+      const dx = event.clientX - startX;
+      const dy = event.clientY - startY;
+      if (dx * dx + dy * dy > HOLD_MOVE_PX * HOLD_MOVE_PX) cancel();
+    });
+
+    node.addEventListener('pointerup', cancel);
+    node.addEventListener('pointercancel', cancel);
+    node.addEventListener('lostpointercapture', cancel);
+    node.addEventListener('contextmenu', (event) => event.preventDefault());
+  }
+
+  /* ------------------------------------------- 隐藏：听写节奏（纯本地设置） */
+
+  const TIMING_KEY = 'dictation.timing.v1';
+  const TIMING_DEFAULT_SECONDS = 6;
+  const TIMING_MAX_SECONDS = 120;
+  // 片段自带 20ms 前导 + 60ms 尾音，可听静音 ≈ gap + 80ms
+  const CLIP_TAIL_MS = 80;
+  let timingOpenedAt = 0;
+
+  function clampTimingSeconds(value) {
+    if (value === null || value === undefined) return null;
+    if (typeof value === 'string' && value.trim() === '') return null;
+    const n = Number(value);
+    if (!isFinite(n)) return null;
+    if (n < 0 || n > TIMING_MAX_SECONDS) return null;
+    return Math.round(n * 10) / 10;
+  }
+
+  /** 返回设置里的秒数；没有设置（或读不到）返回 null */
+  function readTimingSeconds() {
+    let raw = null;
+    try { raw = localStorage.getItem(TIMING_KEY); } catch (e) { return null; }
+    if (!raw) return null;
+    let data = null;
+    try { data = JSON.parse(raw); } catch (e) { data = null; }
+    if (!data || typeof data !== 'object') return null;
+    const seconds = clampTimingSeconds(data.gapSeconds);
+    return seconds === null ? null : seconds;
+  }
+
+  /** 词后等待（毫秒）：设置了就用它，否则返回 null 让调用方走 manifest */
+  function timingGapMs() {
+    const seconds = readTimingSeconds();
+    if (seconds === null) return null;
+    return Math.max(0, Math.round(seconds * 1000) - CLIP_TAIL_MS);
+  }
+
+  function saveTimingSeconds(seconds) {
+    try {
+      localStorage.setItem(TIMING_KEY, JSON.stringify({ gapSeconds: seconds }));
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function clearTimingSeconds() {
+    try { localStorage.removeItem(TIMING_KEY); } catch (e) { /* ignore */ }
+  }
+
+  function openTimingPanel() {
+    const stored = readTimingSeconds();
+    els.timingGap.value = String(stored === null ? TIMING_DEFAULT_SECONDS : stored);
+    timingOpenedAt = Date.now();
+    els.timingModal.hidden = false;
+    setTimeout(() => {
+      try { els.timingGap.focus({ preventScroll: true }); } catch (e) { /* ignore */ }
+      try { els.timingGap.select(); } catch (e) { /* ignore */ }
+    }, 30);
+  }
+
+  function closeTimingPanel() {
+    els.timingModal.hidden = true;
+  }
+
+  function submitTimingPanel() {
+    const seconds = clampTimingSeconds(els.timingGap.value);
+    if (seconds === null) {
+      toast('填 0 到 120 之间的秒数');
+      try { els.timingGap.focus({ preventScroll: true }); } catch (e) { /* ignore */ }
+      return;
+    }
+    const saved = saveTimingSeconds(seconds);
+    closeTimingPanel();
+    toast(saved ? '已保存' : '这台设备存不了设置');
+  }
+
+  function resetTimingPanel() {
+    clearTimingSeconds();
+    closeTimingPanel();
+    toast('已恢复默认节奏');
   }
 
   /* ------------------------------------------------ 返回拦截（误触保护） */
@@ -676,6 +839,9 @@
     let start = Math.floor(Number(startIndex) || 0);
     if (!isFinite(start) || start < 0 || start >= total) start = 0;
 
+    // 隐藏的「听写节奏」：只覆盖词后等待，不影响 repeat_gap / lead_in / intro_gap
+    const customGap = timingGapMs();
+
     if (start === 0) {
       const leadIn = num(d.lead_in_ms, 3000);
       const introGap = num(d.intro_gap_ms, 1500);
@@ -710,13 +876,13 @@
       player.item = item;
       renderProgress(i, total);
       setReplayEnabled(true);
-      setStatus('正在听写');
+      setStatus(player.paused ? '已暂停' : '正在听写');
       saveResume(m, i);
       if (!(await waitWhilePaused(runId))) return;
 
       const repeat = Math.max(1, Math.round(num(item.repeat, d.repeat, 1)));
       const repeatGap = num(item.repeat_gap_ms, d.repeat_gap_ms, 1200);
-      const gap = num(item.gap_ms, d.gap_ms, 0);
+      const gap = customGap === null ? num(item.gap_ms, d.gap_ms, 0) : customGap;
       const src = clipSrc(item);
 
       for (let r = 0; r < repeat; r++) {
@@ -767,6 +933,7 @@
     els.btnToggleLabel.textContent = '暂停';
     setUse(els.btnToggleUse, 'pause');
     setReplayEnabled(false);
+    updateNavButtons(start, items.length);
   }
 
   function renderProgress(index, total) {
@@ -775,6 +942,14 @@
     for (let i = 0; i < segs.length; i++) {
       segs[i].className = 'seg' + (i < index ? ' done' : i === index ? ' now' : '');
     }
+    updateNavButtons(index, total);
+  }
+
+  function updateNavButtons(index, total) {
+    const i = Math.floor(Number(index) || 0);
+    const count = Math.max(0, Math.floor(Number(total) || 0));
+    els.btnPrev.disabled = i <= 0;
+    els.btnNext.disabled = count === 0 || i >= count - 1;
   }
 
   function setStatus(text) {
@@ -883,6 +1058,38 @@
     if (!player.running || !player.item) return;
     player.replayRequested = true;
     if (player.clipFinish) player.clipFinish('replay');
+  }
+
+  /**
+   * 跳到指定项的第一遍：结束当前项的剩余重复和等待。
+   * 暂停时跳过去仍保持暂停；同项则忽略（重听当前词请用「重听这个词」）。
+   */
+  function jumpTo(target) {
+    if (!player.running || !player.manifest) return;
+    const items = player.manifest.items || [];
+    if (!items.length) return;
+
+    let index = Math.floor(Number(target));
+    if (!isFinite(index)) return;
+    index = Math.max(0, Math.min(index, items.length - 1));
+    if (index === player.index) return;
+
+    const wasPaused = player.paused;
+    const elapsed = player.activeMs + (wasPaused ? 0 : performance.now() - player.segStart);
+
+    startPlayback(player.manifest, index);
+
+    // startPlayback 会清零计时；这里接着累计，避免「用时」缩水
+    player.activeMs = elapsed;
+    player.segStart = performance.now();
+
+    if (wasPaused) {
+      player.paused = true;
+      try { audio.pause(); } catch (e) { /* ignore */ }
+      updatePauseUI();
+    } else {
+      setStatus('正在听写');
+    }
   }
 
   function showAudioError() {
@@ -1368,9 +1575,17 @@
     soundBtn.addEventListener('click', () => playPreview(item, soundBtn));
     markBtn.addEventListener('click', () => toggleMark(index, row, markBtn));
 
+    // 隐藏：长按词文本用当前音色重新合成（仅课时会话；复习 / 自定义会话静默忽略）
+    const wordEl = el('p', { class: 'check-word', text: item.text });
+    const lessonId = lessonIdFromManifest(player.manifest);
+    if (lessonId) {
+      wordEl.classList.add('hold-target');
+      attachLongPress(wordEl, () => regenerateCheckWord(item, lessonId));
+    }
+
     // 课时 session 里自动追加的错词带 review=true，标一个小标签区分（不占序号、不影响按钮）
     const wordCell = el('div', { class: 'check-word-cell' }, [
-      el('p', { class: 'check-word', text: item.text }),
+      wordEl,
       item.review ? el('span', { class: 'tag-review', text: '复习' }) : null,
     ]);
 
@@ -1380,6 +1595,37 @@
       el('div', { class: 'check-tools' }, [soundBtn, markBtn])
     );
     return row;
+  }
+
+  /** 课时会话的 lesson_id 在 manifest.base 里（/media/<lesson_id>） */
+  function lessonIdFromManifest(manifest) {
+    if (!manifest || manifest.kind !== 'lesson') return null;
+    const base = String(manifest.base || '');
+    if (base.indexOf('/media/') !== 0) return null;
+    const id = base.slice('/media/'.length).replace(/\/+$/, '');
+    return id ? id : null;
+  }
+
+  async function regenerateCheckWord(item, lessonId) {
+    if (state.regenerating || state.submitting) return;
+    const ok = await confirmDialog({
+      title: '重新生成「' + item.text + '」？',
+      text: '用当前音色重新合成，约 1 秒',
+      confirmLabel: '重新生成',
+      cancelLabel: '取消',
+    });
+    if (!ok) return;
+
+    state.regenerating = true;
+    try {
+      await API.regenerateWord(lessonId, item.text);
+      toast('已重新生成，下次进入这一课生效');
+    } catch (err) {
+      toast((err && err.message) || '重新生成失败，稍后再试');
+      if (window.console) console.warn('regenerate failed', err);
+    } finally {
+      state.regenerating = false;
+    }
   }
 
   function enterCheck() {
@@ -1496,6 +1742,8 @@
   function bindEvents() {
     els.btnToggle.addEventListener('click', togglePause);
     els.btnReplay.addEventListener('click', requestReplay);
+    els.btnPrev.addEventListener('click', () => jumpTo(player.index - 1));
+    els.btnNext.addEventListener('click', () => jumpTo(player.index + 1));
 
     els.playerBack.addEventListener('click', () => {
       askLeave();
@@ -1521,8 +1769,27 @@
       if (event.target === els.modal) closeModal(false);
     });
 
+    // 隐藏入口：首页标题长按 1.5s
+    attachLongPress(els.homeTitle, openTimingPanel);
+    els.timingClose.addEventListener('click', closeTimingPanel);
+    els.timingSave.addEventListener('click', submitTimingPanel);
+    els.timingReset.addEventListener('click', resetTimingPanel);
+    els.timingModal.addEventListener('click', (event) => {
+      if (event.target !== els.timingModal) return;
+      if (Date.now() - timingOpenedAt < 400) return;
+      closeTimingPanel();
+    });
+    els.timingGap.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        submitTimingPanel();
+      }
+    });
+
     document.addEventListener('keydown', (event) => {
-      if (event.key === 'Escape' && !els.modal.hidden) closeModal(false);
+      if (event.key !== 'Escape') return;
+      if (!els.timingModal.hidden) { closeTimingPanel(); return; }
+      if (!els.modal.hidden) closeModal(false);
     });
 
     audio.addEventListener('ended', () => {
@@ -1551,6 +1818,7 @@
   function boot() {
     els = {
       'home-date': $('home-date'),
+      homeTitle: $('home-title'),
       homeBody: $('home-body'),
       'mock-badge': $('mock-badge'),
       'screen-home': $('screen-home'),
@@ -1571,6 +1839,8 @@
       btnToggleLabel: $('btn-toggle-label'),
       btnToggleUse: $('btn-toggle').querySelector('use'),
       btnReplay: $('btn-replay'),
+      btnPrev: $('btn-prev'),
+      btnNext: $('btn-next'),
 
       doneMeta: $('done-meta'),
       btnCheck: $('btn-check'),
@@ -1595,6 +1865,12 @@
       modalText: $('modal-text'),
       modalConfirm: $('modal-confirm'),
       modalCancel: $('modal-cancel'),
+
+      timingModal: $('timing-modal'),
+      timingGap: $('timing-gap'),
+      timingClose: $('timing-close'),
+      timingReset: $('timing-reset'),
+      timingSave: $('timing-save'),
 
       toast: $('toast'),
     };

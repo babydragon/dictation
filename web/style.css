@@ -153,6 +153,14 @@ body {
 
 .center-wrap .stack { max-width: 360px; }
 
+/* 隐藏长按目标：禁掉系统长按菜单与文本选中，仍允许页面滚动 / 双击缩放 */
+.hold-target {
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+  touch-action: manipulation;
+}
+
 /* ------------------------------------------------------------------- 按钮 */
 
 .btn {
@@ -758,6 +766,22 @@ body {
 .seg.done { background: var(--ink); }
 .seg.now { background: var(--accent); }
 
+/* 上一个 / 下一个：独立一行，与进度条同宽 */
+.player-nav {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  width: 100%;
+  max-width: 340px;
+}
+
+.player-nav .btn {
+  min-height: 56px;
+  padding: 0 12px;
+  font-size: 17px;
+  white-space: nowrap;
+}
+
 .player-actions {
   display: flex;
   flex-direction: column;
@@ -1070,6 +1094,136 @@ body {
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+
+/* ------------------------------------------- 听写节奏面板（隐藏：标题长按） */
+
+/* 顶部留出标题 / 返回按钮的空间，小屏时卡片内部滚动 */
+.modal.modal-top {
+  place-items: center;
+  padding: calc(84px + env(safe-area-inset-top)) 20px calc(24px + env(safe-area-inset-bottom));
+}
+
+.timing-card {
+  width: 100%;
+  max-width: 340px;
+  max-height: calc(100vh - 108px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+  max-height: calc(100dvh - 108px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 20px 20px 18px;
+}
+
+.timing-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.timing-head .modal-title {
+  margin: 0;
+  font-size: 21px;
+}
+
+.timing-close {
+  appearance: none;
+  -webkit-appearance: none;
+  display: grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  margin-right: -8px;
+  flex: none;
+  border: 0;
+  border-radius: 12px;
+  background: transparent;
+  color: var(--ink-2);
+  font-family: inherit;
+  font-size: 26px;
+  line-height: 1;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+.timing-close:active { background: var(--paper-2); }
+.timing-close:focus-visible {
+  outline: 3px solid rgba(217, 99, 52, 0.5);
+  outline-offset: 2px;
+}
+
+.timing-field {
+  display: block;
+  margin: 0 0 10px;
+}
+
+.timing-label {
+  display: block;
+  margin-bottom: 8px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--ink-2);
+}
+
+.timing-input-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 56px;
+  padding: 0 16px;
+  border: 1.5px solid var(--line-strong);
+  border-radius: 14px;
+  background: var(--paper);
+  transition: border-color 0.15s var(--ease);
+}
+.timing-input-row:focus-within { border-color: var(--accent); }
+
+.timing-input {
+  flex: 1;
+  min-width: 0;
+  height: 54px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font-family: inherit;
+  font-size: 22px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+  -webkit-appearance: none;
+  appearance: textfield;
+}
+.timing-input:focus { outline: none; }
+.timing-input::-webkit-outer-spin-button,
+.timing-input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.timing-unit {
+  flex: none;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--ink-2);
+}
+
+.timing-note {
+  margin: 0 0 18px;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--ink-2);
+}
+
+.timing-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+.timing-actions .btn {
+  width: 100%;
+  min-height: 56px;
+  padding: 0 12px;
+  font-size: 17px;
 }
 
 .toast {

@@ -90,6 +90,45 @@ impl Cache {
             .with_context(|| format!("写缓存元数据失败: {}", meta_path.display()))?;
         Ok(wav_path)
     }
+
+    /// Drop every cached sample whose metadata `text` matches exactly, so the
+    /// next render re-synthesizes it. Returns the removed keys.
+    ///
+    /// Used by "regenerate this word": TTS output is non-deterministic, but the
+    /// content-hash cache would otherwise pin one unlucky sample forever.
+    pub fn purge_text(&self, text: &str) -> Result<Vec<String>> {
+        let mut removed = Vec::new();
+        let Ok(entries) = fs::read_dir(&self.root) else {
+            return Ok(removed);
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(raw) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(meta) = serde_json::from_str::<CacheMeta>(&raw) else {
+                continue;
+            };
+            if meta.text != text {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            let wav_path = self.root.join(format!("{stem}.wav"));
+            if wav_path.is_file() {
+                fs::remove_file(&wav_path)
+                    .with_context(|| format!("删除缓存片段失败: {}", wav_path.display()))?;
+            }
+            fs::remove_file(&path)
+                .with_context(|| format!("删除缓存元数据失败: {}", path.display()))?;
+            removed.push(stem.to_string());
+        }
+        Ok(removed)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -602,5 +641,37 @@ mod tests {
         assert_eq!(plan.scanned, 0);
         assert!(plan.files.is_empty());
         assert!(outside.exists());
+    }
+    #[test]
+    fn purge_text_removes_only_matching_samples() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = Cache::new(temp.path());
+        let meta = |text: &str, rate: f32| CacheMeta {
+            duration_ms: 100,
+            sample_rate: audio::SAMPLE_RATE,
+            provider: "mock".to_string(),
+            voice: "mock".to_string(),
+            rate,
+            text: text.to_string(),
+            pipeline_version: PIPELINE_VERSION,
+        };
+        let samples = vec![0_i16; 2400];
+        for (text, rate, key) in [
+            ("摇晃", 0.9, "k-shake-a"),
+            ("摇晃", 1.0, "k-shake-b"),
+            ("粗壮", 0.9, "k-strong"),
+        ] {
+            cache.put(key, &samples, &meta(text, rate)).unwrap();
+        }
+
+        let removed = cache.purge_text("摇晃").unwrap();
+        assert_eq!(removed.len(), 2, "{removed:?}");
+        assert!(!temp.path().join("k-shake-a.wav").exists());
+        assert!(!temp.path().join("k-shake-a.json").exists());
+        assert!(!temp.path().join("k-shake-b.wav").exists());
+        assert!(temp.path().join("k-strong.wav").exists());
+        assert!(temp.path().join("k-strong.json").exists());
+
+        assert!(cache.purge_text("没有这个").unwrap().is_empty());
     }
 }

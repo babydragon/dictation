@@ -175,6 +175,7 @@ fn router(state: AppState) -> Router {
         .route("/api/health", get(health))
         .route("/api/lessons", get(list_lessons).post(import_lesson))
         .route("/api/lessons/{id}/generate", post(generate_lesson))
+        .route("/api/lessons/{id}/regenerate-word", post(regenerate_word))
         .route("/api/lessons/{id}/generate/cancel", post(cancel_generation))
         .route("/api/jobs/{id}", get(get_job))
         .route("/api/review/summary", get(review_summary))
@@ -636,20 +637,7 @@ async fn generate_lesson(
         .tts
         .as_ref()
         .ok_or_else(|| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, NO_TTS_MESSAGE))?;
-    let kind = match body.provider.as_deref().map(str::trim) {
-        Some(raw) if !raw.is_empty() => raw
-            .parse::<ProviderKind>()
-            .map_err(|_| ApiError::bad_request(format!("未知 provider：{raw}")))?,
-        _ => config.default_provider,
-    };
-    if missing_key(config, kind) {
-        return Err(ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            NO_TTS_MESSAGE,
-        ));
-    }
-    let provider = tts::build_provider(kind, config)
-        .map_err(|_| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, NO_TTS_MESSAGE))?;
+    let (_kind, provider) = resolve_provider(config, body.provider.as_deref())?;
 
     let (dir_name, dir_path) = resolve_lesson(&state, &id).await?;
 
@@ -663,6 +651,18 @@ async fn generate_lesson(
         .into_response());
     }
 
+    enqueue_generation(&state, provider, dir_name, dir_path, body.full_track).await
+}
+
+/// Queue a force re-render for one lesson, reusing an in-flight job when there
+/// is one. Shared by `generate` and `regenerate-word`.
+async fn enqueue_generation(
+    state: &AppState,
+    provider: Arc<dyn tts::TtsProvider>,
+    dir_name: String,
+    dir_path: PathBuf,
+    full_track: bool,
+) -> Result<Response, ApiError> {
     let job_id = uuid::Uuid::new_v4().simple().to_string();
     {
         let mut jobs = state.jobs.lock().unwrap();
@@ -691,7 +691,6 @@ async fn generate_lesson(
     let task_job_id = job_id.clone();
     let task_lesson = dir_name.clone();
     let task_dir = dir_path.clone();
-    let full_track = body.full_track;
     tokio::spawn(async move {
         run_generation(
             task_state,
@@ -713,6 +712,82 @@ async fn generate_lesson(
         })),
     )
         .into_response())
+}
+
+/// Resolve the provider for a write request (explicit `provider` or default).
+fn resolve_provider(
+    config: &Config,
+    raw: Option<&str>,
+) -> Result<(ProviderKind, Arc<dyn tts::TtsProvider>), ApiError> {
+    let kind = match raw.map(str::trim) {
+        Some(value) if !value.is_empty() => value
+            .parse::<ProviderKind>()
+            .map_err(|_| ApiError::bad_request(format!("未知 provider：{value}")))?,
+        _ => config.default_provider,
+    };
+    if missing_key(config, kind) {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            NO_TTS_MESSAGE,
+        ));
+    }
+    let provider = tts::build_provider(kind, config)
+        .map_err(|_| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, NO_TTS_MESSAGE))?;
+    Ok((kind, provider))
+}
+
+/// Regenerate one word: drop its cached samples, then force a re-render.
+///
+/// TTS output is non-deterministic while the cache key is content-only, so one
+/// unlucky sample would otherwise be served forever. Re-rendering hits the
+/// cache for every other word (1 TTS call) and keeps the clip file name.
+#[derive(Debug, Deserialize)]
+struct RegenerateWordRequest {
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    provider: Option<String>,
+}
+
+async fn regenerate_word(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    UrlPath(id): UrlPath<String>,
+    payload: Result<Json<RegenerateWordRequest>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    authorize(&state, &headers)?;
+    let Json(body) = payload.map_err(json_rejection)?;
+    let text = body.text.trim().to_string();
+    if text.is_empty() {
+        return Err(ApiError::bad_request("text 不能为空"));
+    }
+
+    let config = state
+        .tts
+        .as_ref()
+        .ok_or_else(|| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, NO_TTS_MESSAGE))?;
+    let (_kind, provider) = resolve_provider(config, body.provider.as_deref())?;
+    let (dir_name, dir_path) = resolve_lesson(&state, &id).await?;
+
+    let manifest = read_manifest(&dir_path)
+        .map_err(|_| ApiError::not_found("课时还没有生成音频，先听写一次"))?;
+    if !manifest.items.iter().any(|item| item.text == text) {
+        return Err(ApiError::not_found("这一课没有这个词"));
+    }
+
+    let cache = Cache::new(state.cache_dir.clone());
+    let purge_text = text.clone();
+    let purged = tokio::task::spawn_blocking(move || cache.purge_text(&purge_text))
+        .await
+        .map_err(|err| ApiError::internal(anyhow::anyhow!("清理缓存任务失败：{err}")))?
+        .map_err(ApiError::internal)?;
+    tracing::info!(
+        "重新生成「{text}」：清除 {} 条缓存样本（{}）",
+        purged.len(),
+        purged.join(", ")
+    );
+
+    enqueue_generation(&state, provider, dir_name, dir_path, false).await
 }
 
 async fn get_job(
@@ -4072,5 +4147,60 @@ mod tests {
         )
         .await;
         assert_eq!(replayed["items"], body["items"]);
+    }
+    #[tokio::test]
+    async fn regenerate_word_resynthesizes_only_that_word() {
+        let temp = tempfile::tempdir().unwrap();
+        let opts = test_opts(&temp);
+        let tts = mock_config(&opts.cache_dir);
+        let app = router(test_state(&opts, Some(tts), None));
+
+        let response = post(&app, "/api/lessons", import_payload()).await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let response = post(
+            &app,
+            "/api/lessons/第5课/generate",
+            json!({"provider": "mock"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let job_id = body_json(response).await["job_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(wait_job(&app, &job_id).await["status"], "done");
+
+        // 只重建一个词：其余片段应当命中缓存
+        let response = post(
+            &app,
+            "/api/lessons/第5课/regenerate-word",
+            json!({"text": "摇晃", "provider": "mock"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let job_id = body_json(response).await["job_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let job = wait_job(&app, &job_id).await;
+        assert_eq!(job["status"], "done", "job: {job}");
+        assert_eq!(job["result"]["tts_calls"], 1, "只应重新合成一个词: {job}");
+
+        let response = post(
+            &app,
+            "/api/lessons/第5课/regenerate-word",
+            json!({"text": "这一课没有的词"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = post(
+            &app,
+            "/api/lessons/第5课/regenerate-word",
+            json!({"text": "   "}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

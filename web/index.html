@@ -34,7 +34,7 @@
     <header class="home-head">
       <div class="home-head-main">
         <p class="eyebrow" id="home-date">今天</p>
-        <h1 class="brand">听写</h1>
+        <h1 class="brand hold-target" id="home-title">听写</h1>
       </div>
       <span class="mock-badge" id="mock-badge" hidden>预览模式</span>
     </header>
@@ -59,6 +59,16 @@
         <span class="counter-total" id="counter-total">1</span>
       </p>
       <div class="segments" id="segments" aria-hidden="true"></div>
+      <div class="player-nav" role="group" aria-label="切换词语">
+        <button class="btn btn-ghost" id="btn-prev" type="button" disabled>
+          <svg class="icon" aria-hidden="true" focusable="false"><use href="#i-back" xlink:href="#i-back"></use></svg>
+          <span>上一个</span>
+        </button>
+        <button class="btn btn-ghost" id="btn-next" type="button" disabled>
+          <span>下一个</span>
+          <svg class="icon" aria-hidden="true" focusable="false"><use href="#i-chev" xlink:href="#i-chev"></use></svg>
+        </button>
+      </div>
     </div>
 
     <div class="player-actions">
@@ -148,6 +158,31 @@
 </div>
 
 <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+<!-- 听写节奏（隐藏：首页标题长按 1.5s） -->
+<div class="modal modal-top" id="timing-modal" hidden>
+  <div class="modal-card timing-card" role="dialog" aria-modal="true" aria-labelledby="timing-title">
+    <div class="timing-head">
+      <h2 class="modal-title" id="timing-title">听写节奏</h2>
+      <button class="timing-close" id="timing-close" type="button" aria-label="关闭">
+        <span aria-hidden="true">×</span>
+      </button>
+    </div>
+    <label class="timing-field" for="timing-gap">
+      <span class="timing-label">每个词后等待</span>
+      <span class="timing-input-row">
+        <input class="timing-input" id="timing-gap" type="number" inputmode="decimal"
+          min="0" max="120" step="0.5" autocomplete="off" />
+        <span class="timing-unit">秒</span>
+      </span>
+    </label>
+    <p class="timing-note">实际可听静音 ≈ 你填的秒数（片段自带 80ms 已自动扣除）</p>
+    <div class="timing-actions">
+      <button class="btn btn-ghost" id="timing-reset" type="button">恢复默认</button>
+      <button class="btn btn-primary" id="timing-save" type="button">保存</button>
+    </div>
+  </div>
+</div>
 
 <audio id="audio" preload="auto" playsinline></audio>
 

@@ -790,6 +790,7 @@ DOUBAO_VOICE_EN=en_female_stokie_uranus_bigtts
 | iOS 局域网 HTTP 无 SW | 无离线缓存 | SBC 常开；或 mkcert HTTPS |
 | 手写识别误差 | 误判 | 固定答案纸 + 题号 + 置信度 + 人工确认 |
 | 复习量过大 | 孩子抵触 | 默认 5，后续可调 |
+| TTS 采样非确定性（同输入语速/韵律会变） | 一次坏采样被内容哈希缓存永久固定 | 孩子端长按该词重新生成（删缓存 + 1 次 TTS）；必要时用 `overrides` 固化选中的样本 |
 | `-sys` 依赖 | riscv64 交叉编译失败 | 优先纯 Rust；zigbuild 验证；必要时替换存储 |
 
 ---
