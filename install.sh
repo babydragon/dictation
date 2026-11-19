@@ -35,6 +35,11 @@ DATA_ROOT="/var/lib/dictation"
 EFFECTIVE_BASE=""
 DATA_DIR=""
 TMP_DIR=""
+# agent skill：安装前后比内容哈希，有变化要提醒同步
+SKILL_REL="skills/dictation-prep/SKILL.md"
+SKILL_BEFORE_HASH=""
+SKILL_AFTER_HASH=""
+SKILL_STATE=""
 
 log()  { printf '==> %s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
@@ -145,6 +150,20 @@ run() {
     printf '[dry-run] %s\n' "$*"
   else
     "$@"
+  fi
+}
+
+# 文件内容哈希：sha256sum / shasum / openssl，最后退到 cksum。
+hash_file() {
+  local file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$file" | awk '{print $1}'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 -r "$file" | awk '{print $1}'
+  else
+    cksum "$file" | awk '{print $1"-"$2}'
   fi
 }
 
@@ -431,6 +450,12 @@ copy_tree() {
 
 install_files() {
   log "安装程序到 $OPT_DIR"
+  local installed_skill="$OPT_DIR/$SKILL_REL"
+  if [ -f "$installed_skill" ]; then
+    SKILL_BEFORE_HASH="$(hash_file "$installed_skill")"
+  else
+    SKILL_BEFORE_HASH=""
+  fi
   run install -d -m 0755 "$OPT_DIR"
   # 先写临时文件再原子替换，避免覆盖正在运行的二进制。
   run install -m 0755 "$SRC/dictation" "$OPT_DIR/dictation.new"
@@ -440,6 +465,19 @@ install_files() {
   copy_tree "$SRC/deploy" "$OPT_DIR/deploy"
   copy_tree "$SRC/docs" "$OPT_DIR/docs"
   copy_tree "$SRC/skills" "$OPT_DIR/skills"
+  # 包里的 skill 是"新"，安装后的文件是"旧"：比较的是内容而不是版本号。
+  if [ -f "$SRC/$SKILL_REL" ]; then
+    SKILL_AFTER_HASH="$(hash_file "$SRC/$SKILL_REL")"
+    if [ -z "$SKILL_BEFORE_HASH" ]; then
+      SKILL_STATE="new"
+    elif [ "$SKILL_BEFORE_HASH" = "$SKILL_AFTER_HASH" ]; then
+      SKILL_STATE="same"
+    else
+      SKILL_STATE="updated"
+    fi
+  else
+    SKILL_STATE="missing"
+  fi
   run install -m 0644 "$SRC/INSTALL.md" "$OPT_DIR/INSTALL.md"
   run install -m 0644 "$SRC/README.md" "$OPT_DIR/README.md"
   [ -f "$SRC/LICENSE" ] && run install -m 0644 "$SRC/LICENSE" "$OPT_DIR/LICENSE"
@@ -620,7 +658,29 @@ health_check() {
   return 0
 }
 
+report_skill() {
+  local dry=""
+  [ "$DRY_RUN" -eq 1 ] && dry="[dry-run] "
+  case "$SKILL_STATE" in
+    new)
+      log "${dry}已安装 agent skill（首次）：$OPT_DIR/$SKILL_REL"
+      ;;
+    updated)
+      warn "${dry}agent skill 内容有更新：$OPT_DIR/$SKILL_REL"
+      warn "${dry}  sha256 ${SKILL_BEFORE_HASH:0:12} -> ${SKILL_AFTER_HASH:0:12}"
+      warn "${dry}  请把这份 SKILL.md 同步到你 agent 使用的 skills 目录，否则 agent 仍按旧流程工作"
+      ;;
+    same)
+      log "agent skill 未变化"
+      ;;
+    *)
+      warn "$OPT_DIR/$SKILL_REL 缺失（安装包里没有 skills/dictation-prep/SKILL.md）"
+      ;;
+  esac
+}
+
 install_files
+report_skill
 install_config
 resolve_effective_base
 ensure_user

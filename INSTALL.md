@@ -633,7 +633,22 @@ curl http://127.0.0.1:8080/api/lessons
 
 ## 8. 升级 / 备份
 
-### 升级二进制
+### 升级（推荐用 install.sh）
+
+```bash
+curl -fsSL https://github.com/babydragon/dictation/releases/download/<tag>/install.sh \
+  | sudo bash -s -- --version <tag>
+```
+
+安装器会保留 `config.toml` / `env` / `lessons/` / `data/` / `cache/`，并且：
+
+- **比对 agent skill 内容哈希**：安装前后算 `skills/dictation-prep/SKILL.md` 的
+  sha256，内容变了会打印 `agent skill 内容有更新` 和前后哈希前缀，提醒你把
+  `/opt/dictation/skills/dictation-prep/SKILL.md` 同步到 agent 使用的 skills 目录；
+  未变化时只打印 `agent skill 未变化`。
+- 数据库 schema 会自动迁移（迁移前 `VACUUM INTO` 备份，保留 3 份）。
+
+### 手动替换二进制
 
 ```bash
 # 开发机重新构建
@@ -645,7 +660,8 @@ sudo install -Dm755 /tmp/dictation /opt/dictation/dictation
 sudo systemctl start dictation
 ```
 
-数据库表用 `CREATE TABLE IF NOT EXISTS`，当前没有迁移步骤；升级前建议备份。
+数据库 schema 用 `PRAGMA user_version` 管理（当前 v4）；服务启动时自动迁移，
+迁移前会 `VACUUM INTO` 备份到 `data/` 下（保留最近 3 份）。仍建议升级前手动备份一次。
 
 ### 更新前端
 
