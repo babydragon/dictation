@@ -774,6 +774,11 @@ async fn regenerate_word(
     if !manifest.items.iter().any(|item| item.text == text) {
         return Err(ApiError::not_found("这一课没有这个词"));
     }
+    if !dir_path.join("lesson.txt").is_file() {
+        return Err(ApiError::bad_request(
+            "课时缺少 lesson.txt，无法重新生成；请重新导入这一课",
+        ));
+    }
 
     let cache = Cache::new(state.cache_dir.clone());
     let purge_text = text.clone();

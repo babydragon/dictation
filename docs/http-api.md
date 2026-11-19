@@ -568,6 +568,8 @@ body 全部可选：
 - `text` 必填（trim 后非空，否则 400）；`provider` 可选，省略用默认。
 - `{id}` 解析同 `generate`；课时还没生成音频 → `404 {"error":"课时还没有生成音频，先听写一次"}`。
 - 词不在该课 `manifest.json` 里 → `404 {"error":"这一课没有这个词"}`。
+- 课时缺 `lesson.txt`（只有产物、没有词表）→
+  `400 {"error":"课时缺少 lesson.txt，无法重新生成；请重新导入这一课"}`。
 - 行为：把 `cache/*.json` 中 `text` 完全相等的样本（wav + json）全部删除，然后按
   `force` 语义入队重渲染；只会为该词产生一次 TTS 调用（其它片段命中缓存）。
 - 片段文件名不变（缓存键不变），`manifest.json` 的 `duration_ms`/`total_ms` 会更新；

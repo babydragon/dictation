@@ -153,6 +153,22 @@ body {
 
 .center-wrap .stack { max-width: 360px; }
 
+/* 全局禁掉文本选中：这是儿童听写界面，不需要选区；Android 浏览器长按
+   会先启动选字手势（微信/手机自带浏览器都遇到过），仅在目标上加
+   user-select 不够，必须在根节点再兜一层。输入框保留正常选择。 */
+html,
+body {
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+input,
+textarea {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
 /* 隐藏长按目标：禁掉系统长按菜单与文本选中，仍允许页面滚动 / 双击缩放 */
 .hold-target {
   -webkit-touch-callout: none;

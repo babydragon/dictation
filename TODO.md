@@ -546,6 +546,17 @@ dictation result import <file|-> [--json]
   都指向词表。
 - 代码未动，因此没有跑 fmt/clippy/test。
 
+### 2026-11-19（长按兼容与播放页重掷）
+
+- 播放页长按「重听这个词」= 重掷当前词；前端轮询 `/api/jobs/{id}` 到 `done` 再提示。
+- 重掷后重听给 URL 加 `?v=<时间戳>`，绕过浏览器对同名片段的内存缓存。
+- Android 选字手势：`html,body` 全局 `user-select: none` +
+  `selectstart` 捕获拦截（输入框例外）；微信 `contextmenu` 也当作长按
+  （与 pointer 计时 800ms 去重）。
+- `regenerate-word` 前置校验 `lesson.txt`，缺失返回 400 而不是任务报错。
+- 验证：CDP 鼠标/触摸两条路径、`?v=` 实际出现在资源请求里；
+  `cargo test` 200 passed、fmt/clippy、`node --check`。
+
 ### 2026-11-19（播放导航 / 隐藏节奏面板 / 单词重新生成）
 
 - 播放页新增「上一个 / 下一个」：独立一行、56px；`jumpTo` 重开时间轴，

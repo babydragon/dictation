@@ -143,8 +143,18 @@ done
   - 只覆盖词后等待；`repeat_gap_ms`、`lead_in_ms`、`intro_gap_ms` 不变。
   - 存 `localStorage["dictation.timing.v1"] = {"gapSeconds": 10}`；「恢复默认」删除该键。
   - 纯客户端：所有会话生效，离线/静态发布同样可用（每个设备一份）。
-- **单词重新生成**：检查页长按某个**词文本** 1.5 秒 → 确认 →
-  `POST /api/lessons/{lesson_id}/regenerate-word {text}`。
+- **单词重新生成**：两处入口，都是长按 1.5 秒 + 确认框：
+  - 播放页长按「重听这个词」→ 重掷**当前这个词**（45 词的长课不用等检查页）；
+  - 检查页长按某个**词文本**。
+  都调 `POST /api/lessons/{lesson_id}/regenerate-word {text}`，前端轮询
+  `GET /api/jobs/{id}` 到 `done` 才提示成功（最长 45 秒）。
+  重掷后片段是同名覆盖，重听时 URL 追加 `?v=<时间戳>` 强制回源。
+  - 长按必须吞掉松手后补发的 click，否则刚弹出的确认框会被立刻点掉。
+  - **Android 兼容**：手机自带浏览器/微信长按会先启动「选中文字」手势，
+    只给元素加 `user-select: none` 不够；必须在 `html, body` 再禁一次，
+    并用 `selectstart` 捕获阶段 `preventDefault`（输入框除外）。
+  - 微信内置 WebView 会把长按转成 `contextmenu`：拦下系统菜单并当作长按触发，
+    与 pointer 计时 800ms 内去重。
   - `lesson_id` 从 `player.manifest.base` 的 `/media/<id>` 解析；
     `kind != "lesson"`（复习/自定义会话）不启用。
   - 成功后 toast「已重新生成，下次进入这一课生效」；正在播放的会话仍用旧片段。

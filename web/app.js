@@ -301,6 +301,11 @@
             resolve(buildMockManifest('review', lessonId));
             return;
           }
+          const mockJob = /^\/api\/jobs\/([^/]+)$/.exec(path);
+          if (mockJob && method === 'GET') {
+            resolve({ job_id: mockJob[1], status: 'done', result: { tts_calls: 1 } });
+            return;
+          }
           const regenerate = /^\/api\/lessons\/([^/]+)\/regenerate-word$/.exec(path);
           if (regenerate && method === 'POST') {
             if (!body || !body.text) throw httpError(400, '缺少要重新生成的词');
@@ -385,6 +390,7 @@
         method: 'POST',
         body: { text: text },
       }),
+    job: (jobId) => request('/api/jobs/' + encodeURIComponent(jobId)),
   };
 
   /* --------------------------------------------------------------- 界面状态 */
@@ -401,6 +407,7 @@
     busy: false,
     submitting: false,
     regenerating: false,
+    clipVersions: new Map(),
     screen: 'home',
   };
 
@@ -466,6 +473,17 @@
     let startY = 0;
     let armed = false;
 
+    // 同一个长按可能同时走到 pointer 计时和 contextmenu（微信/部分 WebView
+    // 会把长按转成 contextmenu），800ms 内只触发一次。
+    let lastFiredAt = 0;
+    const fire = () => {
+      const now = Date.now();
+      if (now - lastFiredAt < 800) return;
+      lastFiredAt = now;
+      swallowNextClick();
+      onHold();
+    };
+
     // 长按抬手时浏览器还会补发一次 click：在捕获阶段吞掉它，
     // 否则刚弹出的面板/确认框会被这次 click 立刻点掉。
     // 只吞一次、且 400ms 内失效，避免挡住家长随后的真实点击。
@@ -501,8 +519,7 @@
       timer = setTimeout(() => {
         timer = null;
         armed = false;
-        swallowNextClick();
-        onHold();
+        fire();
       }, HOLD_MS);
     });
 
@@ -516,7 +533,12 @@
     node.addEventListener('pointerup', cancel);
     node.addEventListener('pointercancel', cancel);
     node.addEventListener('lostpointercapture', cancel);
-    node.addEventListener('contextmenu', (event) => event.preventDefault());
+    // 微信内置 WebView 等会把长按转成 contextmenu：拦下系统菜单并当作长按。
+    node.addEventListener('contextmenu', (event) => {
+      event.preventDefault();
+      cancel();
+      fire();
+    });
   }
 
   /* ------------------------------------------- 隐藏：听写节奏（纯本地设置） */
@@ -705,7 +727,13 @@
     if (!item || !item.clips || !item.clips.length) return null;
     const base = item.base || (player.manifest && player.manifest.base) || '';
     const clip = item.clips[0];
-    return mediaUrl(base, clip.path, clip.duration_ms);
+    const url = mediaUrl(base, clip.path, clip.duration_ms);
+    if (!url || MOCK) return url;
+    // 重新生成后片段是同名覆盖的：同一个 URL 浏览器可能复用旧音频，
+    // 加一个每次重生成都会变的查询参数强制回源。
+    const version = state.clipVersions.get(item.text);
+    if (!version) return url;
+    return url + (url.indexOf('?') === -1 ? '?' : '&') + 'v=' + version;
   }
 
   /* --------------------------------------------------------------- 播放引擎 */
@@ -1606,6 +1634,47 @@
     return id ? id : null;
   }
 
+  /** 触发重生成并轮询到任务结束；片段文件同名覆盖，重听即生效 */
+  async function regenerateWordAndWait(lessonId, text) {
+    const res = await API.regenerateWord(lessonId, text);
+    const jobId = res && res.job_id;
+    if (!jobId) return;
+    // 45 个词的课时首次渲染可能要几十秒（缓存冷时），给足时间
+    for (let i = 0; i < 225; i++) {
+      const job = await API.job(jobId);
+      if (job && job.status === 'done') return;
+      if (job && job.status === 'error') {
+        throw new Error(job.error || '重新生成失败');
+      }
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    throw new Error('重新生成超时，稍后回到这一课再试');
+  }
+
+  async function regenerateDuringPlayback(item, lessonId) {
+    if (state.regenerating || state.submitting) return;
+    const ok = await confirmDialog({
+      title: '重新生成「' + item.text + '」？',
+      text: '用当前音色重新合成，约 1 秒；完成后重听这个词就是新版',
+      confirmLabel: '重新生成',
+      cancelLabel: '取消',
+    });
+    if (!ok) return;
+
+    state.regenerating = true;
+    toast('正在重新生成…');
+    try {
+      await regenerateWordAndWait(lessonId, item.text);
+      state.clipVersions.set(item.text, Date.now());
+      toast('已重新生成，重听这个词即可（不满意可再长按一次）');
+    } catch (err) {
+      toast((err && err.message) || '重新生成失败，稍后再试');
+      if (window.console) console.warn('regenerate failed', err);
+    } finally {
+      state.regenerating = false;
+    }
+  }
+
   async function regenerateCheckWord(item, lessonId) {
     if (state.regenerating || state.submitting) return;
     const ok = await confirmDialog({
@@ -1618,8 +1687,9 @@
 
     state.regenerating = true;
     try {
-      await API.regenerateWord(lessonId, item.text);
-      toast('已重新生成，下次进入这一课生效');
+      await regenerateWordAndWait(lessonId, item.text);
+      state.clipVersions.set(item.text, Date.now());
+      toast('已重新生成，重听这个词即可（不满意可再长按一次）');
     } catch (err) {
       toast((err && err.message) || '重新生成失败，稍后再试');
       if (window.console) console.warn('regenerate failed', err);
@@ -1739,9 +1809,35 @@
 
   /* ---------------------------------------------------------------- 事件绑定 */
 
+  /**
+   * Android 浏览器（含微信/手机自带浏览器）长按会在部分内核上无视
+   * user-select: none 直接开始选字；selectstart 是唯一可靠的拦截点，
+   * 而且不会影响滚动。输入框保留正常选择。
+   */
+  function preventTextSelection() {
+    document.addEventListener(
+      'selectstart',
+      (event) => {
+        const tag = event.target && event.target.tagName;
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || (event.target && event.target.isContentEditable)) {
+          return;
+        }
+        event.preventDefault();
+      },
+      true,
+    );
+  }
+
   function bindEvents() {
     els.btnToggle.addEventListener('click', togglePause);
     els.btnReplay.addEventListener('click', requestReplay);
+    // 听写界面直接重掷当前词（45 个词的课不用等到检查页）
+    attachLongPress(els.btnReplay, () => {
+      const lessonId = lessonIdFromManifest(player.manifest);
+      const item = player.item;
+      if (!lessonId || !item) return;
+      regenerateDuringPlayback(item, lessonId);
+    });
     els.btnPrev.addEventListener('click', () => jumpTo(player.index - 1));
     els.btnNext.addEventListener('click', () => jumpTo(player.index + 1));
 
@@ -1770,6 +1866,7 @@
     });
 
     // 隐藏入口：首页标题长按 1.5s
+    preventTextSelection();
     attachLongPress(els.homeTitle, openTimingPanel);
     els.timingClose.addEventListener('click', closeTimingPanel);
     els.timingSave.addEventListener('click', submitTimingPanel);
