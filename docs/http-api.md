@@ -486,6 +486,7 @@ agent 不持有 TTS 密钥、也不需要文件系统权限：导入与合成全
   - `POST /api/lessons`
   - `POST /api/lessons/{id}/generate`
   - `POST /api/lessons/{id}/regenerate-word`
+  - `POST /api/lessons/{id}/delete`
   - `POST /api/lessons/{id}/generate/cancel`
 
 ### `POST /api/lessons`
@@ -577,6 +578,42 @@ body 全部可选：
 - 返回同 `generate`：`202 {"job_id":"...","status":"queued","lesson":"..."}`；
   已有进行中的任务时复用同一个 `job_id`。
 - `503`（无密钥）、`429`（队列已满）与 `generate` 相同。
+
+### `POST /api/lessons/{id}/delete`
+
+删除课时（目录 + `lessons` 行）。**默认只返回计划**，必须显式 `apply` 才执行。
+
+```json
+{ "apply": false }
+```
+
+- `{id}` 解析同 `generate`；不存在 → `404 {"error":"课时不存在"}`。
+- 响应（dry-run / 执行同形，`applied` 区分）：
+
+```json
+{
+  "applied": false,
+  "lesson": "第5课-旧", "lesson_id": "1e42df2f02a8", "title": "第5课",
+  "files": 8, "bytes": 1725560, "sessions": 1,
+  "words_repointed": [{ "text": "甲", "to_lesson": "第5课-新", "to_lesson_id": "1a80eda4e5ef" }],
+  "words_cleared": ["乙"]
+}
+```
+
+- **历史保留**：`sessions` / `attempts` / `review_state` 不动；删除后旧的课时会话无法重放
+  （音频没了），但结果查询照常。
+- **词的音源重指向**：`words` 中 `clip_lesson` 指向被删课时的词，改指另一课里
+  **同科目同文本**的片段；没有任何课还包含该词时才清空 clip（退出复习池）。
+- 拒绝删除 `lessons/` 之外的路径；先更新 DB 再删目录，DB 失败时文件和计划都还在，可重跑。
+
+### `GET /api/lessons/duplicates`
+
+按 `(subject, title)` 分组的重复课时，用于“重新导入后删旧的”这种清理。
+
+```json
+{ "duplicates": [ { "subject": "chinese", "title": "第5课",
+  "lessons": [{ "dir": "第5课-新", "id": "1a80eda4e5ef", "item_count": 2, "total_ms": 19952 }] } ] }
+```
 
 ### `GET /api/jobs/{job_id}`
 

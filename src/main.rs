@@ -256,6 +256,23 @@ enum LessonCommand {
         #[arg(long)]
         json: bool,
     },
+    /// 列出同科目同标题的重复课时
+    Duplicates {
+        /// 输出 JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// 删除课时（词表、清单、片段、整轨、DB 行）；默认 dry-run
+    Delete {
+        /// 课时目录名或 12 位 id
+        lesson: String,
+        /// 真正执行删除，不加只打印计划
+        #[arg(long)]
+        apply: bool,
+        /// 输出 JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main]
@@ -373,6 +390,28 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            LessonCommand::Duplicates { json } => match cmd_lesson_duplicates(&app, json) {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    if json {
+                        exit_with_json_error(&err);
+                    }
+                    Err(err)
+                }
+            },
+            LessonCommand::Delete {
+                lesson,
+                apply,
+                json,
+            } => match cmd_lesson_delete(&app, &lesson, apply, json) {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    if json {
+                        exit_with_json_error(&err);
+                    }
+                    Err(err)
+                }
+            },
             LessonCommand::List { json } => match cmd_lesson_list(&app, json) {
                 Ok(()) => Ok(()),
                 Err(err) => {
@@ -926,6 +965,89 @@ fn cmd_lesson_list(app: &AppConfig, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn cmd_lesson_duplicates(app: &AppConfig, json: bool) -> Result<()> {
+    let lessons = lesson::list::scan(&app.lessons_dir)?;
+    let groups = lesson::delete::duplicates(&lessons);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "duplicates": groups }))?
+        );
+        return Ok(());
+    }
+    if groups.is_empty() {
+        println!("没有重复课时（按科目 + 标题分组）");
+        return Ok(());
+    }
+    for group in &groups {
+        println!(
+            "{} / {}：{} 份",
+            subject_label(&group.subject),
+            group.title,
+            group.lessons.len()
+        );
+        for item in &group.lessons {
+            println!(
+                "  {:<28} {:<14} {:>3} 词",
+                item.dir, item.id, item.item_count
+            );
+        }
+    }
+    println!("\n确认保留哪一份后：dictation lesson delete <目录|id> --apply");
+    Ok(())
+}
+
+fn cmd_lesson_delete(app: &AppConfig, lesson: &str, apply: bool, json: bool) -> Result<()> {
+    let db = dictation::db::Db::open(&app.db_path())?;
+    let plan = dictation::lesson::delete::plan(&app.lessons_dir, &db, lesson)?;
+    if apply {
+        dictation::lesson::delete::apply(&app.lessons_dir, &db, &plan)?;
+    }
+    if json {
+        let mut value = serde_json::to_value(&plan)?;
+        if let Some(map) = value.as_object_mut() {
+            map.insert("applied".to_string(), json!(apply));
+        }
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+
+    println!("{}（{}，{}）", plan.title, plan.lesson, plan.lesson_id);
+    println!("文件 {} 个，共 {}", plan.files, human_bytes(plan.bytes));
+    println!(
+        "保留历史会话 {} 条（attempts / review_state 不动）",
+        plan.sessions
+    );
+    if !plan.words_repointed.is_empty() {
+        println!("词的音源重指向：");
+        for item in &plan.words_repointed {
+            println!("  {} -> {}", item.text, item.to_lesson);
+        }
+    }
+    if !plan.words_cleared.is_empty() {
+        println!(
+            "无其他课时包含、将清空音源（退出复习池）：{}",
+            plan.words_cleared.join("、")
+        );
+    }
+    if apply {
+        println!("已删除。");
+    } else {
+        println!("\n这是 dry-run；确认无误后加 --apply 执行。");
+    }
+    Ok(())
+}
+
+fn human_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // result: read-only views over the SQLite session history
 // ---------------------------------------------------------------------------
@@ -1150,21 +1272,6 @@ fn effective_cache_dir(app: &AppConfig) -> PathBuf {
     match std::env::var("DICTATION_CACHE_DIR") {
         Ok(raw) if !raw.trim().is_empty() => PathBuf::from(raw.trim()),
         _ => app.cache_dir.clone(),
-    }
-}
-
-fn human_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
     }
 }
 

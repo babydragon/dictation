@@ -31,6 +31,8 @@
 | 范围复习 | ✅ `/api/review/queue`、`/api/sessions/custom`、`GET /api/sessions/{id}`、`?s=` 深链 |
 | 复习第二轮（课内复习 + 范围复习） | ✅ schema v4 / 排序 / 提前复习调度 / `lesson_id` / `/api/review/lessons` / `/api/words` / `custom.shuffle` / PWA「复习 N」 |
 | 播放页导航 | ✅ 上一个 / 下一个；暂停态跳转保持暂停，首尾置灰 |
+| 删除课时 | ✅ `lesson delete` / `POST .../delete`（默认 dry-run，保留历史、词音源重指向）|
+| 重复课时报告 | ✅ `lesson duplicates` / `GET /api/lessons/duplicates` |
 | 单词重新生成 | ✅ `POST /api/lessons/{id}/regenerate-word` + 检查页长按（删缓存样本、只花 1 次 TTS） |
 | 听写节奏（隐藏） | ✅ 长按首页标题设置词后等待（本地设置，静态发布同样可用） |
 | 缓存清理 | ✅ `clean --unused/--older-than`，默认 dry-run |
@@ -545,6 +547,19 @@ dictation result import <file|-> [--json]
   `http-api.md` / `player.md` / `review-scheduling.md` / `README.md` / skill 顶部
   都指向词表。
 - 代码未动，因此没有跑 fmt/clippy/test。
+
+### 2026-11-19（删除课时）
+
+- 新增 `src/lesson/delete.rs`：`plan` 生成可审阅的删除计划，`apply` 执行；
+  CLI `lesson delete`（默认 dry-run）与 `POST /api/lessons/{id}/delete`
+  （`{"apply":true}` 才执行）共用同一实现。
+- 语义：保留 `sessions`/`attempts`/`review_state`；`words.clip_lesson` 指向被删课时的词，
+  自动重指向仍包含该词的同科目课时，否则清空 clip（退出复习池）。
+- 新增 `lesson duplicates` / `GET /api/lessons/duplicates`，按科目+标题分组列出重复项。
+- 安全：拒绝 `lessons/` 之外的路径；先 DB 后删目录，失败可重跑。
+- 实测（临时目录 + HTTP）：两课同标题，旧课有 1 节课历史；dry-run 报
+  `words_repointed=[甲→新课]`、`words_cleared=[乙]`、files/bytes/sessions；
+  apply 后旧目录消失、新课保留、`results` 仍能查到历史会话、甲可播放、乙退出复习池。
 
 ### 2026-11-19（长按兼容与播放页重掷）
 

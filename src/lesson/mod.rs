@@ -7,6 +7,7 @@ use serde::Deserialize;
 
 use crate::model::{Cue, Item, Lang, Lesson, LessonConfig, Subject};
 
+pub mod delete;
 pub mod import;
 pub mod list;
 

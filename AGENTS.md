@@ -765,6 +765,9 @@ DOUBAO_VOICE_EN=en_female_stokie_uranus_bigtts
   破坏性操作默认 dry-run，必须显式 `--apply`/`--force`；错误用
   `{"error": ...}` + 非零退出；路径/配置走 `AppConfig`。
 - **完成工作后更新 `TODO.md`**（状态/勾选/日志）；只有设计变化才改本文件。
+- **删除类操作默认 dry-run**：`lesson delete` / `POST .../delete` 不传 `--apply` /
+  `{"apply":true}` 时只返回计划；删除课时保留 `sessions`/`attempts`/`review_state`，
+  词音源优先重指向仍包含该词的其他课时。
 - **术语先登记，再使用**：新增概念、字段、端点、状态值、UI 文案时，先在
   [`docs/glossary.md`](docs/glossary.md) 加一行（含代码标识与「不要用」的旧称），
   再改 `AGENTS.md` / `docs/*.md` / 代码 / skill。

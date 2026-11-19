@@ -385,6 +385,21 @@ dictation clean --unused --older-than 30d --apply --json
 - 先跑 dry-run，把 `candidates` / `bytes` 报给家长；确认后再 `--apply`。
 - 不要用 `rm` 或文件工具直接删缓存。
 
+## 清理重复课时
+
+家长说“以前导入的课重复了，删掉旧的”时：
+
+1. `GET /api/lessons/duplicates` 看哪些 `(subject, title)` 有多份；
+2. 和家长确认**保留哪一份**（通常是以最新批量导入的为准）；
+3. `POST /api/lessons/{id}/delete` 先不带 `apply`（或 `{"apply":false}`）拿计划，
+   把 `words_repointed` / `words_cleared` / `files` 报给家长确认；
+4. 确认后再 `{"apply":true}`。
+
+- 删除**保留历史**：孩子的对错记录、错词、复习进度都不受影响。
+- 词音源会自动指向仍包含该词的课时；`words_cleared` 里的词会退出复习池，
+  如果不想丢，先确认保留的课时里确实有这些词。
+- 不要一次删多课再汇报；一课一确认，删除前先给计划。
+
 ## 多音字与读法
 
 只在**明显会读错**时加 `speak=`，不要逐词加：

@@ -176,6 +176,8 @@ fn router(state: AppState) -> Router {
         .route("/api/lessons", get(list_lessons).post(import_lesson))
         .route("/api/lessons/{id}/generate", post(generate_lesson))
         .route("/api/lessons/{id}/regenerate-word", post(regenerate_word))
+        .route("/api/lessons/{id}/delete", post(delete_lesson))
+        .route("/api/lessons/duplicates", get(duplicate_lessons))
         .route("/api/lessons/{id}/generate/cancel", post(cancel_generation))
         .route("/api/jobs/{id}", get(get_job))
         .route("/api/review/summary", get(review_summary))
@@ -734,6 +736,71 @@ fn resolve_provider(
     let provider = tts::build_provider(kind, config)
         .map_err(|_| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, NO_TTS_MESSAGE))?;
     Ok((kind, provider))
+}
+
+/// Lessons that share `(subject, title)` — usually a re-import that left the
+/// old copy behind. Read-only; deletion is a separate explicit call.
+async fn duplicate_lessons(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let lessons_dir = state.lessons_dir.clone();
+    let db = state.db.clone();
+    let groups = run_db(db, move |db| {
+        let entries = db.scan_lessons(&lessons_dir).map_err(ApiError::internal)?;
+        let listings: Vec<_> = entries.iter().map(|entry| entry.listing()).collect();
+        Ok(crate::lesson::delete::duplicates(&listings))
+    })
+    .await?;
+    Ok(Json(json!({ "duplicates": groups })))
+}
+
+fn map_delete_error(err: crate::lesson::delete::DeleteError) -> ApiError {
+    match err {
+        crate::lesson::delete::DeleteError::NotFound => ApiError::not_found("课时不存在"),
+        crate::lesson::delete::DeleteError::Other(err) => ApiError::internal(err),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct DeleteLessonRequest {
+    /// `false`（默认）只返回将要删除的内容，`true` 才真正执行。
+    #[serde(default)]
+    apply: bool,
+}
+
+/// Delete a lesson's files and `lessons` row, keeping the child's history.
+///
+/// Words whose audio came from this lesson are repointed to another lesson that
+/// still contains the same text; only orphans lose their clip.
+async fn delete_lesson(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    UrlPath(id): UrlPath<String>,
+    payload: Result<Json<DeleteLessonRequest>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    authorize(&state, &headers)?;
+    let Json(body) = payload.map_err(json_rejection)?;
+
+    let lessons_dir = state.lessons_dir.clone();
+    let db = state.db.clone();
+    let plan = run_db(db, move |db| {
+        crate::lesson::delete::plan(&lessons_dir, db, &id).map_err(map_delete_error)
+    })
+    .await?;
+
+    if body.apply {
+        let lessons_dir = state.lessons_dir.clone();
+        let db = state.db.clone();
+        let to_apply = plan.clone();
+        run_db(db, move |db| {
+            crate::lesson::delete::apply(&lessons_dir, db, &to_apply).map_err(ApiError::internal)
+        })
+        .await?;
+    }
+
+    let mut value = serde_json::to_value(&plan).map_err(|err| ApiError::internal(err.into()))?;
+    if let Some(map) = value.as_object_mut() {
+        map.insert("applied".to_string(), json!(body.apply));
+    }
+    Ok(Json(value))
 }
 
 /// Regenerate one word: drop its cached samples, then force a re-render.
@@ -4217,5 +4284,50 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn delete_lesson_dry_run_then_apply() {
+        let temp = tempfile::tempdir().unwrap();
+        let opts = test_opts(&temp);
+        fs::create_dir_all(&opts.lessons_dir).unwrap();
+        write_lesson_manifest(&opts.lessons_dir, "第5课", "第5课", 2, 20_000);
+        write_lesson_manifest(&opts.lessons_dir, "第5课-新", "第5课", 2, 20_000);
+        let state = test_state(&opts, None, None);
+        let app = router(state.clone());
+        let id = db::lesson_id("第5课");
+
+        let response = post(&app, &format!("/api/lessons/{id}/delete"), json!({})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["applied"], false);
+        assert_eq!(body["lesson"], "第5课");
+        assert!(
+            opts.lessons_dir.join("第5课").is_dir(),
+            "dry-run 不能删文件"
+        );
+
+        let response = post(
+            &app,
+            &format!("/api/lessons/{id}/delete"),
+            json!({"apply": true}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["applied"], true);
+        assert!(!opts.lessons_dir.join("第5课").exists());
+        assert!(
+            opts.lessons_dir.join("第5课-新").exists(),
+            "保留的课时不受影响"
+        );
+
+        let response = post(
+            &app,
+            "/api/lessons/deadbeefcafe/delete",
+            json!({"apply": true}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }

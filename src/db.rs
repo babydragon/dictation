@@ -484,6 +484,24 @@ pub struct CheckOutcome {
     pub due_count: u32,
 }
 
+/// Where a word's audio lives after a lesson is deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipRef {
+    pub lesson_id: String,
+    pub path: String,
+    pub duration_ms: i64,
+    pub gap_ms: i64,
+    pub repeat: i64,
+}
+
+/// One word affected by deleting a lesson: repoint to `clip`, or clear it.
+#[derive(Debug, Clone)]
+pub struct WordClipMove {
+    pub subject: String,
+    pub text: String,
+    pub clip: Option<ClipRef>,
+}
+
 /// Review counters for one lesson's word set (home lesson card "复习 N").
 ///
 /// All counters may overlap: `due` and `wrong` are independent, and `review`
@@ -1350,6 +1368,69 @@ impl Db {
             *seen += 1;
         }
         Ok(profiles)
+    }
+
+    /// `(subject, text)` for every word whose clip came from `lesson_id`.
+    pub fn words_for_clip_lesson(&self, lesson_id: &str) -> Result<Vec<(String, String)>> {
+        let conn = self.conn()?;
+        let mut stmt =
+            conn.prepare("SELECT subject, text FROM words WHERE clip_lesson = ?1 ORDER BY id")?;
+        let rows = stmt.query_map([lesson_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Number of sessions that reference a lesson (history is kept on delete).
+    pub fn session_count_for_lesson(&self, lesson_id: &str) -> Result<u32> {
+        let conn = self.conn()?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE lesson_id = ?1",
+            [lesson_id],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as u32)
+    }
+
+    /// Drop a lesson row after repointing (or clearing) the words it provided.
+    pub fn apply_lesson_delete(
+        &self,
+        lesson_id: &str,
+        repointed: &[WordClipMove],
+        cleared: &[(String, String)],
+    ) -> Result<()> {
+        let conn = self.conn()?;
+        let tx = conn.unchecked_transaction()?;
+        let now = now_secs();
+        for item in repointed {
+            let Some(clip) = &item.clip else {
+                continue;
+            };
+            tx.execute(
+                "UPDATE words SET clip_lesson = ?1, clip_path = ?2, duration_ms = ?3,
+                        gap_ms = ?4, repeat = ?5, updated_at = ?6
+                 WHERE subject = ?7 AND text = ?8",
+                params![
+                    clip.lesson_id,
+                    clip.path,
+                    clip.duration_ms,
+                    clip.gap_ms,
+                    clip.repeat,
+                    now,
+                    item.subject,
+                    item.text
+                ],
+            )?;
+        }
+        for (subject, text) in cleared {
+            tx.execute(
+                "UPDATE words SET clip_lesson = NULL, clip_path = NULL, duration_ms = NULL,
+                        gap_ms = NULL, repeat = NULL, updated_at = ?1
+                 WHERE subject = ?2 AND text = ?3",
+                params![now, subject, text],
+            )?;
+        }
+        tx.execute("DELETE FROM lessons WHERE id = ?1", [lesson_id])?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn review_summary(&self) -> Result<ReviewSummary> {

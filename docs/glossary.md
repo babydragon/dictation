@@ -83,6 +83,8 @@
 | **整课重排** | 范围复习的一种（`items` = 本课全部词） | 顺序：错词分桶 → 桶内洗牌；仅 agent / 家长端 | 整课复习、重听（那是「再听一遍」） |
 | **组卷** | `review_items_for_mix` / `create_custom_session` | 决定一次会话包含哪些词、什么顺序 | 排卷 |
 | **积压** | `GET /api/review/summary` | 某科目待复习词的合计与逾期天数分布，用来判断是否需要主动复习 | 库存、欠账 |
+| **删除课时** | `lesson delete` / `POST /api/lessons/{id}/delete` | 删除课时目录与 `lessons` 行；**默认 dry-run**；保留历史，词音源重指向其他课时 | 清理、移除 |
+| **重复课时** | `GET /api/lessons/duplicates` | 同科目同标题的多份课时（通常是重新导入留下的旧副本） | 冲突课时 |
 | **重新生成** | `POST /api/lessons/{id}/regenerate-word` | 删除某个词的全部缓存样本后强制重渲染；其它词命中缓存，只花 1 次 TTS；片段文件名不变 | 重掷（口语可） |
 | **听写节奏** | `localStorage["dictation.timing.v1"]` | 孩子端本地设置，只改**词后等待**的秒数（换算 `gap_ms = 秒×1000 − 80`）；纯客户端，静态发布同样可用 | 语速（另有所指） |
 | **掌握度统计** | `attempts`/`wrong`/`correct`/`correct_streak`/`wrong_recent` | 词的客观练习数据；**服务端不判定「是否掌握」** | 掌握度（不要当结论用） |
