@@ -548,6 +548,17 @@ dictation result import <file|-> [--json]
   都指向词表。
 - 代码未动，因此没有跑 fmt/clippy/test。
 
+### 2026-11-19（接口示例规范）
+
+- skill 的「清理重复课时」补真实请求/响应示例与**字段类型表**
+  （`files` 是整数、`words_repointed` 是对象数组、`words_cleared` 是字符串数组）。
+- skill 的 `regenerate-word` 补请求/响应示例（返回 job，需要轮询）。
+- `AGENTS.md §16` 新增：**每个接口都必须有请求示例 + 真实响应示例**，
+  新增/修改字段同提交更新示例；调用方不得靠字段名猜结构。
+- `docs/http-api.md` 开头补「示例与字段类型」约定。
+- 起因：外部 agent 只看到字段名，自行编了 mock 结构（把 `words_repointed` 当成
+  字符串数组），真实返回是对象数组导致崩溃。
+
 ### 2026-11-19（删除课时）
 
 - 新增 `src/lesson/delete.rs`：`plan` 生成可审阅的删除计划，`apply` 执行；

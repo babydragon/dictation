@@ -389,16 +389,87 @@ dictation clean --unused --older-than 30d --apply --json
 
 家长说“以前导入的课重复了，删掉旧的”时：
 
-1. `GET /api/lessons/duplicates` 看哪些 `(subject, title)` 有多份；
-2. 和家长确认**保留哪一份**（通常是以最新批量导入的为准）；
-3. `POST /api/lessons/{id}/delete` 先不带 `apply`（或 `{"apply":false}`）拿计划，
-   把 `words_repointed` / `words_cleared` / `files` 报给家长确认；
-4. 确认后再 `{"apply":true}`。
+1. 列出重复项；
+2. 和家长确认**保留哪一份**（通常以最新批量导入的为准）；
+3. 先拿删除计划，把影响报给家长确认；
+4. 确认后再执行。
 
-- 删除**保留历史**：孩子的对错记录、错词、复习进度都不受影响。
-- 词音源会自动指向仍包含该词的课时；`words_cleared` 里的词会退出复习池，
-  如果不想丢，先确认保留的课时里确实有这些词。
-- 不要一次删多课再汇报；一课一确认，删除前先给计划。
+### 1. 列出重复课时
+
+```bash
+curl -sS "$API/api/lessons/duplicates"
+```
+
+响应（`lessons` 里是**对象数组**，同一 title 可能多份）：
+
+```json
+{
+  "duplicates": [
+    {
+      "subject": "chinese",
+      "title": "第5课 词语听写",
+      "lessons": [
+        { "dir": "第5课-新", "id": "1a80eda4e5ef", "item_count": 20, "total_ms": 19952 },
+        { "dir": "第5课-旧", "id": "1e42df2f02a8", "item_count": 20, "total_ms": 19952 }
+      ]
+    }
+  ]
+}
+```
+
+没有重复时返回 `{"duplicates": []}`。
+
+### 2. 拿删除计划（dry-run）
+
+```bash
+curl -sS -X POST "$API/api/lessons/第5课-旧/delete" \
+  -H 'content-type: application/json' -d '{"apply": false}'
+```
+
+`{id}` 可以是**目录名**，也可以是 12 位 id。响应（`apply` 缺省即 `false`）：
+
+```json
+{
+  "applied": false,
+  "lesson": "第5课-旧",
+  "lesson_id": "1e42df2f02a8",
+  "title": "第5课 词语听写",
+  "files": 45,
+  "bytes": 1725560,
+  "sessions": 1,
+  "words_repointed": [
+    { "text": "亲密", "to_lesson": "富饶的西沙群岛", "to_lesson_id": "fc43428ce48c" },
+    { "text": "祖国", "to_lesson": "富饶的西沙群岛", "to_lesson_id": "fc43428ce48c" }
+  ],
+  "words_cleared": ["搭船", "搭话", "搭乘"]
+}
+```
+
+**字段类型（照这里写，不要猜）**：
+
+| 字段 | 类型 | 含义 |
+|---|---|---|
+| `applied` | boolean | 是否真的执行了删除 |
+| `lesson` | string | 课时目录名 |
+| `lesson_id` | string | 12 位 id |
+| `title` | string | 课时标题 |
+| `files` | **integer** | 将删除的文件**个数**（不提供文件名列表） |
+| `bytes` | integer | 这些文件的总字节数 |
+| `sessions` | integer | 引用该课时的历史会话数（会被保留） |
+| `words_repointed` | **object[]** | 每项 `{text, to_lesson, to_lesson_id}`，不是字符串数组 |
+| `words_cleared` | **string[]** | 没有任何课时再包含、音源将被清空的词 |
+
+报给家长时说清：`files` 是文件个数、`bytes` 是体积、`words_cleared` 会退出复习池。
+
+### 3. 执行删除
+
+家长确认后，同一个接口带 `{"apply": true}`，返回结构同上、`applied` 为 `true`。
+
+- 删除**保留历史**：`sessions` / `attempts` / `review_state` 不动，结果查询照常。
+- `words_repointed` 里的词，音源改指 `to_lesson`；`words_cleared` 里的词退出复习池。
+- **不要**在没有 `applied: true` 前告诉家长“已删除”。
+- 不要一次删多课再汇报；一课一确认，先给计划。
+- 删除**不会**清 `cache/`；需要时在主机上跑 `dictation clean --unused`（你一般不需要管）。
 
 ## 多音字与读法
 
@@ -419,7 +490,21 @@ dictation clean --unused --older-than 30d --apply --json
    同一个词每次合成的语速/韵律都会变，而缓存会把那一次固定下来。
    - 首选：让家长在孩子端**长按播放页「重听这个词」**（当前词）或检查页里的那个词，
      触发重新生成（1 次 TTS，不影响别的词；长课不用等到检查页）；
-   - 或者你直接调 `POST /api/lessons/{id}/regenerate-word {"text":"..."}`
+   - 或者你直接调：
+
+     ```bash
+     curl -sS -X POST "$API/api/lessons/金色的草地/regenerate-word" \
+       -H 'content-type: application/json' -d '{"text":"一本正经"}'
+     ```
+
+     响应（`202`，返回的是**任务**，不是音频结果）：
+
+     ```json
+     { "job_id": "c2de607831514ad9", "status": "queued", "lesson": "金色的草地" }
+     ```
+
+     之后要轮询 `GET /api/jobs/{job_id}`，`status` 变成 `done` 才算完成；
+     失败时 `status` 为 `error` 且 `error` 是中文原因。
      （写操作，服务端设了 `DICTATION_API_TOKEN` 时要带 `X-Dictation-Token`）；
    - **不要**为了换样本而整课重新导入/重新生成；也不要批量重生成「碰运气」。
    - 加句号（`speak=词。`）有时也能改善语调，但它同时换了缓存键，属于「换一次采样」
@@ -438,6 +523,8 @@ dictation clean --unused --older-than 30d --apply --json
 - 不要生成 Markdown 表格或 YAML 作为 `text`。
 - 不要在 import 后、家长确认前执行 `gen`。
 - 不要删除家长给的词，即使你觉得重复或简单。
+- **不要假设接口返回结构**：`docs/http-api.md` 和本 skill 里的示例就是唯一依据；
+  字段名看不懂类型时先真实调用一次取原始 JSON，不要自己编 mock 结构当成真实返回。
 - 不要在没有 `apply:true` 前声称课时已删除；`lesson delete` 默认只返回计划。
 - 不要未经家长逐课确认就批量删课时；每删一课先把 `words_repointed` /
   `words_cleared` 报给家长。
