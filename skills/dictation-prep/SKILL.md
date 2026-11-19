@@ -417,7 +417,8 @@ dictation clean --unused --older-than 30d --apply --json
 1. **字读错**（多音字）→ 用 `speak=` 消歧。
 2. **没读错但语调怪**（听起来像赶时间、收尾塌下去）→ 这是 TTS 采样波动，
    同一个词每次合成的语速/韵律都会变，而缓存会把那一次固定下来。
-   - 首选：让家长在孩子端**长按检查页里那个词**触发重新生成（1 次 TTS，不影响别的词）；
+   - 首选：让家长在孩子端**长按播放页「重听这个词」**（当前词）或检查页里的那个词，
+     触发重新生成（1 次 TTS，不影响别的词；长课不用等到检查页）；
    - 或者你直接调 `POST /api/lessons/{id}/regenerate-word {"text":"..."}`
      （写操作，服务端设了 `DICTATION_API_TOKEN` 时要带 `X-Dictation-Token`）；
    - **不要**为了换样本而整课重新导入/重新生成；也不要批量重生成「碰运气」。
@@ -437,4 +438,7 @@ dictation clean --unused --older-than 30d --apply --json
 - 不要生成 Markdown 表格或 YAML 作为 `text`。
 - 不要在 import 后、家长确认前执行 `gen`。
 - 不要删除家长给的词，即使你觉得重复或简单。
+- 不要在没有 `apply:true` 前声称课时已删除；`lesson delete` 默认只返回计划。
+- 不要未经家长逐课确认就批量删课时；每删一课先把 `words_repointed` /
+  `words_cleared` 报给家长。
 - 不要提交 git，不要写 API key 到文件。
