@@ -2054,7 +2054,12 @@ async fn media(
 
     Ok((
         StatusCode::OK,
-        [(header::CONTENT_TYPE, content_type(&path))],
+        [
+            (header::CONTENT_TYPE, content_type(&path)),
+            // 片段文件名由内容哈希决定，但 regenerate-word 会原地覆盖同名文件，
+            // 所以不能标 immutable；每次都回源校验。
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
         bytes,
     )
         .into_response())
@@ -2128,7 +2133,12 @@ async fn static_file(State(state): State<AppState>, uri: Uri) -> Result<Response
         .map_err(|err| ApiError::not_found(format!("读取文件失败：{err}")))?;
     Ok((
         StatusCode::OK,
-        [(header::CONTENT_TYPE, content_type(&candidate))],
+        [
+            (header::CONTENT_TYPE, content_type(&candidate)),
+            // 前端是纯静态文件且会被安装包直接替换：必须每次回源，
+            // 否则浏览器会拿旧 app.js 配新 index.html（按钮错位、手势失效）。
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
         bytes,
     )
         .into_response())

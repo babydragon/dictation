@@ -465,6 +465,10 @@ GET /api/words?subject=english&lessons=<id1>,<id2>&limit=200&offset=0
 - `GET /` → `web/index.html`
 - `GET /app.js`、`/style.css`、`/manifest.webmanifest` 等 → 对应文件。
 - API 与 `/media` 优先于静态 fallback。
+- **缓存**：静态文件和 `/media/<lesson>/clips/*` 都返回 `Cache-Control: no-cache`。
+  前端是安装包直接替换的，片段又会被 `regenerate-word` 原地覆盖；若让浏览器
+  启发式缓存，会出现「新 index.html + 旧 app.js/style.css」导致按钮错位、
+  手势失效。局域网回源成本可以忽略。
 
 ## 服务端生成（agent 走 HTTP）
 
