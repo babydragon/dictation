@@ -2,6 +2,8 @@
    听写 — 儿童端 PWA
    - 纯原生 JS，无构建步骤，无外部依赖
    - 首页 / 播放 / 完成 / 检查 / 结果 五个状态
+   - 两种模式共用一份代码：server（本地 serve，同源 /api）与
+     static（Cloudflare Pages 壳 + R2 只读数据），由 config.js 决定
    - ?mock=1 进入本地预览（内存假数据 + 合成音频），默认走真实 fetch
    ========================================================================== */
 (function () {
@@ -13,6 +15,40 @@
   const MOCK = new URLSearchParams(location.search).has('mock');
   const SVG_NS = 'http://www.w3.org/2000/svg';
   const XLINK_NS = 'http://www.w3.org/1999/xlink';
+
+  /* ------------------------------------------------------- 运行模式与数据源 */
+
+  /**
+   * 配置由 <script src="config.js"> 提供；缺失、解析失败或 mode 非 static
+   * 一律按 server 处理，不做隐式降级试探。
+   */
+  const CONFIG = (function () {
+    const raw = window.DICTATION_CONFIG;
+    if (!raw || typeof raw !== 'object') return { mode: 'server' };
+    if (String(raw.mode || '') !== 'static') return { mode: 'server' };
+    return { mode: 'static', dataBase: String(raw.dataBase || '') };
+  })();
+  const STATIC = CONFIG.mode === 'static';
+
+  /**
+   * 访问只读数据源的唯一出口。v1 没有口令，原样返回；
+   * 以后加口令只改这里（追加 ?k=），不要在其他地方拼 URL。
+   * base 必须保持干净，否则会写进断点续听快照。
+   */
+  function dataUrl(path) {
+    if (!CONFIG.dataBase) return path;
+    const base = CONFIG.dataBase.replace(/\/+$/, '') + '/';
+    return new URL(path, base).href;
+  }
+
+  /** 静态模式没有的入口，一律不渲染，而不是点了才报错。 */
+  const CAP = {
+    review: !STATIC,
+    lessonReview: !STATIC,
+    regenerate: !STATIC,
+    sessionLink: !STATIC,
+    importResult: !STATIC,
+  };
 
   function el(tag, props, children) {
     const node = document.createElement(tag);
@@ -368,7 +404,45 @@
     return data;
   }
 
-  const API = {
+  /** 静态模式：只读 JSON（R2 / Pages），无鉴权、无写操作。 */
+  async function fetchJson(url) {
+    let res;
+    try {
+      res = await fetch(url, { cache: 'no-cache' });
+    } catch (err) {
+      throw httpError(0, defaultStatusMessage(0));
+    }
+    let data = null;
+    const text = await res.text();
+    if (text) {
+      try { data = JSON.parse(text); } catch (err) { data = null; }
+    }
+    if (!res.ok) {
+      throw httpError(res.status, (data && data.error) || defaultStatusMessage(res.status));
+    }
+    return data;
+  }
+
+  function newSessionId() {
+    try {
+      if (window.crypto && window.crypto.randomUUID) return window.crypto.randomUUID();
+    } catch (err) { /* 老浏览器走 fallback */ }
+    return 'st-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+  }
+
+  /**
+   * 发布的 lesson.json 缺 session_id / base，条目也不带 item.base；
+   * 补成 SessionManifest 的形状，播放器无需感知差异。
+   */
+  function hydrateStaticManifest(lesson, lessonUrl) {
+    const manifest = Object.assign({}, lesson);
+    manifest.session_id = newSessionId();
+    manifest.kind = manifest.kind || 'lesson';
+    manifest.base = new URL('.', lessonUrl).href.replace(/\/+$/, '');
+    return manifest;
+  }
+
+  const serverApi = {
     lessons: () => request('/api/lessons'),
     reviewSummary: () => request('/api/review/summary'),
     reviewLessons: () => request('/api/review/lessons'),
@@ -391,7 +465,51 @@
         body: { text: text },
       }),
     job: (jobId) => request('/api/jobs/' + encodeURIComponent(jobId)),
+    importResult: (payload) =>
+      request('/api/results/import', { method: 'POST', body: payload }),
   };
+
+  const staticApi = {
+    async lessons() {
+      const index = await fetchJson(dataUrl('lessons/index.json'));
+      const lessons = Array.isArray(index && index.lessons) ? index.lessons : [];
+      return { lessons: lessons };
+    },
+    // 没有复习概念：返回空让首页自然不渲染复习入口
+    reviewSummary: () =>
+      Promise.resolve({ due_count: 0, wrong_count: 0, review_count: 0, subjects: [] }),
+    reviewLessons: () => Promise.resolve({ lessons: [] }),
+    async createSession(lessonId) {
+      const entry = (state.lessons || []).find((l) => String(l.id) === String(lessonId));
+      const url = entry && entry.path
+        ? dataUrl(entry.path)
+        : dataUrl('lessons/' + encodeURIComponent(lessonId) + '/lesson.json');
+      const lesson = await fetchJson(url);
+      if (!lesson || typeof lesson !== 'object') {
+        throw httpError(404, '找不到这一课');
+      }
+      if (Number(lesson.schema_version) > 1) {
+        throw httpError(400, '这一课用了更新的格式，先刷新页面');
+      }
+      if (!Array.isArray(lesson.items) || !lesson.items.length) {
+        throw httpError(400, '这一课还没有可播放的内容');
+      }
+      return hydrateStaticManifest(lesson, url);
+    },
+    // 本地判分：只统计对错，结果不入库（导出走结果页）
+    check: (sessionId, results) => {
+      const wrong = results.filter((r) => !r.correct).length;
+      return Promise.resolve({ correct: results.length - wrong, wrong: wrong, due_count: 0 });
+    },
+    createReview: () => Promise.reject(httpError(400, '分享版不支持错词复习')),
+    lessonReview: () => Promise.reject(httpError(400, '分享版不支持课内复习')),
+    getSession: () => Promise.reject(httpError(404, '分享版没有会话记录')),
+    regenerateWord: () => Promise.reject(httpError(400, '分享版不能重新生成音频')),
+    job: () => Promise.reject(httpError(404, '分享版没有后台任务')),
+    importResult: () => Promise.reject(httpError(400, '分享版不能导入结果')),
+  };
+
+  const API = STATIC ? staticApi : serverApi;
 
   /* --------------------------------------------------------------- 界面状态 */
 
@@ -407,7 +525,10 @@
     busy: false,
     submitting: false,
     regenerating: false,
+    patching: false,
+    importing: false,
     clipVersions: new Map(),
+    lastExport: null,
     screen: 'home',
   };
 
@@ -624,6 +745,75 @@
     toast('已恢复默认节奏');
   }
 
+  /* ------------------------------------------------ 导入结果（家长） */
+
+  function openImportModal() {
+    if (!CAP.importResult) return;
+    closeTimingPanel();
+    els.importFile.value = '';
+    els.importText.value = '';
+    els.importStatus.textContent = '';
+    els.importModal.hidden = false;
+  }
+
+  function closeImportModal() {
+    els.importModal.hidden = true;
+  }
+
+  function readFileText(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ''));
+      reader.onerror = () => reject(new Error('读取文件失败'));
+      reader.readAsText(file);
+    });
+  }
+
+  async function submitImport() {
+    if (state.importing) return;
+    const file = els.importFile.files && els.importFile.files[0];
+    let text = els.importText.value.trim();
+    if (file) {
+      try {
+        text = (await readFileText(file)).trim();
+      } catch (e) {
+        toast('读取文件失败，换一个文件试试');
+        return;
+      }
+    }
+    if (!text) {
+      toast('先选文件，或粘贴结果 JSON');
+      return;
+    }
+
+    let payload;
+    try {
+      payload = JSON.parse(text);
+    } catch (e) {
+      els.importStatus.textContent = '这不是有效的 JSON。';
+      return;
+    }
+
+    state.importing = true;
+    els.importSubmit.disabled = true;
+    els.importStatus.textContent = '导入中…';
+    try {
+      const data = await API.importResult(payload);
+      const duplicate = data && data.status === 'duplicate';
+      els.importStatus.textContent = duplicate
+        ? '这份结果之前已经导入过，没有重复计分。'
+        : '已导入：' + data.correct + ' 对 / ' + data.wrong + ' 错'
+          + (data.review_count > 0 ? '；待复习 ' + data.review_count + ' 个词' : '');
+      toast(duplicate ? '已经导入过了' : '导入完成');
+      await loadHome(); // 刷新首页的复习入口
+    } catch (err) {
+      els.importStatus.textContent = (err && err.message) || '导入失败，再试一次';
+    } finally {
+      state.importing = false;
+      els.importSubmit.disabled = false;
+    }
+  }
+
   /* ------------------------------------------------ 返回拦截（误触保护） */
 
   const guard = { active: false, title: '', text: '', confirmLabel: '', cancelLabel: '', onLeave: null, pushed: false };
@@ -696,12 +886,23 @@
   function unlockAudio() {
     if (audioUnlocked) return;
     audioUnlocked = true;
+    const silent = wavDataUri(new Float32Array(160));
     try {
-      audio.src = wavDataUri(new Float32Array(160));
+      audio.src = silent;
       const p = audio.play();
       if (p && p.then) {
         p.then(() => { try { audio.pause(); } catch (e) { /* ignore */ } })
           .catch(() => { /* 解锁失败就等首次 play 再试 */ });
+      }
+    } catch (e) { /* ignore */ }
+    try {
+      if (trackEl && trackEl !== audio) {
+        trackEl.src = silent;
+        const p = trackEl.play();
+        if (p && p.then) {
+          p.then(() => { try { trackEl.pause(); } catch (e) { /* ignore */ } })
+            .catch(() => { /* 等整轨 play 时再试 */ });
+        }
       }
     } catch (e) { /* ignore */ }
   }
@@ -749,6 +950,7 @@
     replayRequested: false,
     activeMs: 0,
     segStart: 0,
+    startedAt: '',
   };
 
   function alive(runId) {
@@ -947,6 +1149,472 @@
     finishPlayback();
   }
 
+
+  /* ------------------------------------------------------------ 整轨引擎（C1） */
+
+  // 播放时把「片段 + 静音」在内存里拼成一条 WAV，交给单个 media 元素连续播放。
+  // 节奏存在于音频样本里，不依赖 JS 定时器：熄屏 / 切 App 不会被挂起。
+  // 契约与边界：docs/playback-track.md。拼装失败自动回退到分片引擎。
+
+  const TRACK_BYTES_PER_MS = 48; // 24000 Hz × 16-bit × mono
+  const TRACK_MAX_BYTES = 32 * 1024 * 1024;
+  const trackEl = $('track');
+  const track = {
+    head: [],
+    tail: null,
+    chunks: [],
+    starts: [],
+    bytes: 0,
+    durationMs: 0,
+    url: null,
+    ready: false,
+    lastError: '',
+  };
+
+  // ?track=0 强制分片引擎（钉钉/微信里没有 devtools，保留一个逃生口）
+  const trackFlag = new URLSearchParams(location.search).get('track');
+  let trackEnabled = trackFlag !== '0';
+  let trackBroken = false;
+
+  function usingTrack() {
+    return trackEnabled && track.ready && !trackBroken && !MOCK && !!trackEl;
+  }
+
+  function canAssembleTrack() {
+    return trackEnabled && !trackBroken && !MOCK && !!trackEl
+      && typeof Blob !== 'undefined' && typeof URL !== 'undefined'
+      && typeof URL.createObjectURL === 'function';
+  }
+
+  function silenceBytes(ms) {
+    const frames = Math.max(0, Math.round((Number(ms) || 0) * 24));
+    return new Uint8Array(frames * 2);
+  }
+
+  function wavHeader(dataBytes) {
+    const buf = new ArrayBuffer(44);
+    const dv = new DataView(buf);
+    const write = (off, str) => {
+      for (let i = 0; i < str.length; i++) dv.setUint8(off + i, str.charCodeAt(i));
+    };
+    write(0, 'RIFF');
+    dv.setUint32(4, 36 + dataBytes, true);
+    write(8, 'WAVE');
+    write(12, 'fmt ');
+    dv.setUint32(16, 16, true);
+    dv.setUint16(20, 1, true);      // PCM
+    dv.setUint16(22, 1, true);      // mono
+    dv.setUint32(24, 24000, true);
+    dv.setUint32(28, 48000, true);  // byte rate
+    dv.setUint16(32, 2, true);      // block align
+    dv.setUint16(34, 16, true);     // bits
+    write(36, 'data');
+    dv.setUint32(40, dataBytes, true);
+    return new Uint8Array(buf);
+  }
+
+  /** 按 chunk 遍历 RIFF，取 data；并校验 24k / mono / s16（不合规就回退）。 */
+  function readWavPcm(buf) {
+    const dv = new DataView(buf);
+    if (buf.byteLength < 44 || dv.getUint32(0, false) !== 0x52494646) {
+      throw new Error('不是 RIFF/WAV');
+    }
+    let off = 12;
+    let fmt = null;
+    let data = null;
+    while (off + 8 <= buf.byteLength) {
+      const id = dv.getUint32(off, false);
+      const size = dv.getUint32(off + 4, true);
+      if (id === 0x666d7420) {
+        fmt = {
+          format: dv.getUint16(off + 8, true),
+          channels: dv.getUint16(off + 10, true),
+          sampleRate: dv.getUint32(off + 12, true),
+          bits: dv.getUint16(off + 22, true),
+        };
+      } else if (id === 0x64617461) {
+        data = new Uint8Array(buf, off + 8, Math.min(size, buf.byteLength - off - 8));
+        break;
+      }
+      off += 8 + size + (size & 1);
+    }
+    if (!data) throw new Error('WAV 没有 data 块');
+    if (!fmt || fmt.format !== 1 || fmt.channels !== 1
+      || fmt.sampleRate !== 24000 || fmt.bits !== 16) {
+      throw new Error('片段格式不是 24k/mono/s16');
+    }
+    return data;
+  }
+
+  async function fetchClipPcm(item, runId) {
+    const src = clipSrc(item);
+    if (!src) throw new Error('缺少片段地址');
+    const res = await fetch(src);
+    if (!res.ok) throw httpError(res.status, '片段读取失败（' + res.status + '）');
+    const buf = await res.arrayBuffer();
+    if (!alive(runId)) throw new Error('cancelled');
+    return readWavPcm(buf);
+  }
+
+  /** 单个 item 的 chunk：repeat 份片段 + 遍间静音 + 词后静音。 */
+  function buildItemChunk(item, pcm, defaults, customGap) {
+    const d = defaults || {};
+    const repeat = Math.max(1, Math.round(num(item.repeat, d.repeat, 1)));
+    const repeatGap = silenceBytes(num(item.repeat_gap_ms, d.repeat_gap_ms, 1200));
+    // 隐藏节奏面板给的是「可听静音」，片段自带 80ms 尾音，这里复用同一换算
+    const gapMs = customGap === null ? num(item.gap_ms, d.gap_ms, 0) : customGap;
+    const gap = silenceBytes(gapMs);
+    const chunk = [];
+    for (let r = 0; r < repeat; r++) {
+      chunk.push(pcm);
+      if (r < repeat - 1) chunk.push(repeatGap);
+    }
+    chunk.push(gap);
+    const bytes = pcm.length * repeat + repeatGap.length * (repeat - 1) + gap.length;
+    return { chunk, bytes };
+  }
+
+  /** 拼整条整轨：总是从头拼（续听用 seek），返回 Blob URL 与每项起始偏移。 */
+  async function assembleTrack(manifest, runId) {
+    const d = manifest.defaults || {};
+    const items = manifest.items || [];
+    const customGap = timingGapMs();
+    const head = [];
+    let bytes = 0;
+
+    const pushSilence = (bucket, ms) => {
+      const silence = silenceBytes(ms);
+      if (!silence.length) return;
+      bucket.push(silence);
+      bytes += silence.length;
+    };
+
+    pushSilence(head, num(d.lead_in_ms, 3000));
+    if (manifest.intro) {
+      const pcm = await fetchClipPcm({ clips: [manifest.intro], text: '__intro__' }, runId);
+      head.push(pcm);
+      bytes += pcm.length;
+      pushSilence(head, num(d.intro_gap_ms, 1500));
+    }
+
+    const chunks = new Array(items.length);
+    const starts = new Array(items.length);
+    for (let i = 0; i < items.length; i++) {
+      if (!alive(runId)) throw new Error('cancelled');
+      starts[i] = bytes / TRACK_BYTES_PER_MS / 1000;
+      const pcm = await fetchClipPcm(items[i], runId);
+      const built = buildItemChunk(items[i], pcm, d, customGap);
+      chunks[i] = built.chunk;
+      bytes += built.bytes;
+      if (bytes > TRACK_MAX_BYTES) throw new Error('整轨超过 32MB');
+    }
+
+    let tail = null;
+    if (manifest.outro) {
+      tail = await fetchClipPcm({ clips: [manifest.outro], text: '__outro__' }, runId);
+      bytes += tail.length;
+    }
+
+    const parts = [wavHeader(bytes)];
+    parts.push.apply(parts, head);
+    chunks.forEach((chunk) => parts.push.apply(parts, chunk));
+    if (tail) parts.push(tail);
+
+    const blob = new Blob(parts, { type: 'audio/wav' });
+    return {
+      head: head,
+      tail: tail,
+      chunks: chunks,
+      starts: starts,
+      bytes: bytes,
+      durationMs: bytes / TRACK_BYTES_PER_MS,
+      url: URL.createObjectURL(blob),
+    };
+  }
+
+  /** 锁屏 / 通知栏的媒体卡片标题（按键仍交给系统默认媒体控制）。 */
+  function updateMediaSession() {
+    if (!('mediaSession' in navigator) || typeof MediaMetadata === 'undefined') return;
+    const manifest = player.manifest;
+    if (!manifest) return;
+    try {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: manifest.title || '听写',
+        artist: '听写',
+        album: subjectLabel(manifest.subject) || '',
+      });
+      navigator.mediaSession.playbackState = player.paused ? 'paused' : 'playing';
+    } catch (e) { /* 老内核不支持就跳过 */ }
+  }
+
+  function clearMediaSession() {
+    if (!('mediaSession' in navigator)) return;
+    try {
+      navigator.mediaSession.metadata = null;
+      navigator.mediaSession.playbackState = 'none';
+    } catch (e) { /* ignore */ }
+  }
+
+  function revokeTrackUrl() {
+    if (!track.url) return;
+    try { URL.revokeObjectURL(track.url); } catch (e) { /* ignore */ }
+    track.url = null;
+  }
+
+  function cleanupTrack() {
+    track.ready = false;
+    track.head = [];
+    track.tail = null;
+    track.chunks = [];
+    track.starts = [];
+    track.bytes = 0;
+    track.durationMs = 0;
+    try { trackEl.pause(); } catch (e) { /* ignore */ }
+    try {
+      trackEl.removeAttribute('src');
+      trackEl.load();
+    } catch (e) { /* ignore */ }
+    clearMediaSession();
+    revokeTrackUrl();
+  }
+
+  function applyTrack(built) {
+    revokeTrackUrl();
+    track.head = built.head;
+    track.tail = built.tail;
+    track.chunks = built.chunks;
+    track.starts = built.starts;
+    track.bytes = built.bytes;
+    track.durationMs = built.durationMs;
+    track.url = built.url;
+    track.ready = true;
+  }
+
+  /** currentTime → item 下标（二分；starts 升序）。 */
+  function trackIndexAt(seconds) {
+    const starts = track.starts;
+    if (!starts.length) return 0;
+    let lo = 0;
+    let hi = starts.length - 1;
+    while (lo < hi) {
+      const mid = Math.ceil((lo + hi) / 2);
+      if (starts[mid] <= seconds) lo = mid;
+      else hi = mid - 1;
+    }
+    return lo;
+  }
+
+  function waitTrackReady() {
+    return new Promise((resolve) => {
+      if (!trackEl || trackEl.readyState >= 2) return resolve();
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        trackEl.removeEventListener('canplay', finish);
+        trackEl.removeEventListener('loadedmetadata', finish);
+        resolve();
+      };
+      trackEl.addEventListener('canplay', finish);
+      trackEl.addEventListener('loadedmetadata', finish);
+      setTimeout(finish, 4000); // 兜底：个别内核不给事件也继续尝试播放
+    });
+  }
+
+  /** 跳到第 index 项；resumePlaying=false 时不改变播放/暂停意图。 */
+  function seekTrack(index, resumePlaying) {
+    const items = (player.manifest && player.manifest.items) || [];
+    if (!items.length) return;
+    const next = Math.max(0, Math.min(Math.floor(Number(index)), items.length - 1));
+    const at = track.starts[next] || 0;
+    try { trackEl.currentTime = at + 0.001; } catch (e) { /* 元数据未就绪时忽略 */ }
+    player.index = next;
+    player.item = items[next];
+    renderProgress(next, items.length);
+    saveResume(player.manifest, next);
+    if (resumePlaying !== false && !player.paused) {
+      trackEl.play().catch(() => { /* 保持暂停态 */ });
+    }
+  }
+
+  async function startTrack(runId, startIndex) {
+    setStatus('准备音频…');
+    const built = await assembleTrack(player.manifest, runId);
+    if (!alive(runId)) {
+      try { URL.revokeObjectURL(built.url); } catch (e) { /* ignore */ }
+      return;
+    }
+    applyTrack(built);
+    trackEl.src = built.url;
+    await waitTrackReady(runId);
+    if (!alive(runId)) return;
+
+    if (startIndex > 0) {
+      seekTrack(startIndex, false);
+    } else {
+      // 从头播放：必须留在 0，否则会跳过 lead_in 与开场白
+      const items = player.manifest.items || [];
+      player.index = 0;
+      player.item = items[0] || null;
+      renderProgress(0, items.length);
+      saveResume(player.manifest, 0);
+      try { trackEl.currentTime = 0; } catch (e) { /* 元数据未就绪时忽略 */ }
+    }
+    setReplayEnabled(true);
+    setStatus('正在听写');
+    updateMediaSession();
+    await trackEl.play();
+  }
+
+  /** 页面回到前台 / 定时校正：以 currentTime 为准（ended 在后台可能不派发）。 */
+  function syncTrackState() {
+    if (!usingTrack() || !player.running) return;
+    const nearEnd = track.durationMs > 0
+      && trackEl.currentTime >= track.durationMs / 1000 - 0.3;
+    if (trackEl.ended || nearEnd) {
+      finishPlayback();
+      return;
+    }
+    const items = player.manifest.items || [];
+    const index = trackIndexAt(trackEl.currentTime);
+    if (index !== player.index) {
+      player.index = index;
+      player.item = items[index] || null;
+      renderProgress(index, items.length);
+      saveResume(player.manifest, index);
+    }
+  }
+
+  /** 长按重掷后只替换一个 chunk，并平移后续偏移（见 playback-track.md §6.2）。 */
+  async function patchTrackItem(index) {
+    if (!usingTrack() || !player.manifest) return false;
+    const items = player.manifest.items || [];
+    const item = items[index];
+    if (!item) return false;
+
+    const wasPaused = player.paused;
+    state.patching = true;
+    try {
+      const pcm = await fetchClipPcm(item, player.runId);
+      const built = buildItemChunk(item, pcm, player.manifest.defaults || {}, timingGapMs());
+      track.chunks[index] = built.chunk;
+
+      let bytes = 0;
+      track.head.forEach((b) => { bytes += b.length; });
+      const starts = new Array(items.length);
+      for (let i = 0; i < track.chunks.length; i++) {
+        starts[i] = bytes / TRACK_BYTES_PER_MS / 1000;
+        track.chunks[i].forEach((b) => { bytes += b.length; });
+      }
+      if (track.tail) bytes += track.tail.length;
+
+      const parts = [wavHeader(bytes)];
+      parts.push.apply(parts, track.head);
+      track.chunks.forEach((chunk) => parts.push.apply(parts, chunk));
+      if (track.tail) parts.push(track.tail);
+
+      const url = URL.createObjectURL(new Blob(parts, { type: 'audio/wav' }));
+      revokeTrackUrl();
+      track.url = url;
+      track.bytes = bytes;
+      track.durationMs = bytes / TRACK_BYTES_PER_MS;
+      track.starts = starts;
+
+      trackEl.src = url;
+      await waitTrackReady(player.runId);
+      if (!player.running) return false;
+      seekTrack(index, false);
+      if (wasPaused) trackEl.pause();
+      else trackEl.play().catch(() => { /* ignore */ });
+      return true;
+    } finally {
+      state.patching = false;
+    }
+  }
+
+  /**
+   * 锁屏 / 通知栏的播放暂停由系统直接操作媒体元素，不经过 togglePause()；
+   * 监听元素自身的 play/pause 把状态同步回 UI 与断点续听。
+   * 自己调 togglePause 时先改 player.paused 再操作元素，因此这里会跳过。
+   */
+  function onTrackNativePlay() {
+    if (!player.running || !player.paused) return;
+    player.paused = false;
+    player.segStart = performance.now();
+    updatePauseUI();
+    updateMediaSession();
+  }
+
+  function onTrackNativePause() {
+    if (!player.running || player.paused) return;
+    player.activeMs += performance.now() - player.segStart;
+    player.paused = true;
+    saveCurrentResume();
+    updatePauseUI();
+    updateMediaSession();
+  }
+
+  function bindTrackEvents() {
+    if (!trackEl) return;
+    trackEl.addEventListener('play', onTrackNativePlay);
+    trackEl.addEventListener('pause', onTrackNativePause);
+    trackEl.addEventListener('timeupdate', () => {
+      if (!usingTrack() || !player.running || player.paused) return;
+      if (state.regenerating || state.patching) return;
+      syncTrackState();
+    });
+    trackEl.addEventListener('ended', () => {
+      if (usingTrack() && player.running) finishPlayback();
+    });
+    trackEl.addEventListener('error', () => {
+      if (!usingTrack() || !player.running) return;
+      trackBroken = true;
+      showAudioError();
+    });
+  }
+
+  /* ------------------------------------------------------- 诊断覆盖层（?diag=1） */
+
+  function setupDiag() {
+    if (new URLSearchParams(location.search).get('diag') !== '1') return;
+    const box = el('pre', { id: 'diag-panel' });
+    // 固定在右上角、pointer-events:none：不能挡住底部的暂停/重听按钮。
+    // 需要复制内容时截图即可（面板本身不接收点击）。
+    box.style.cssText = 'position:fixed;top:8px;right:8px;max-width:62vw;max-height:38vh;'
+      + 'overflow:hidden;background:rgba(0,0,0,.72);color:#fff;font:10px/1.4 ui-monospace,monospace;'
+      + 'padding:6px 8px;border-radius:8px;z-index:9999;white-space:pre-wrap;'
+      + 'pointer-events:none;-webkit-user-select:none;user-select:none';
+    document.body.appendChild(box);
+
+    let lastVisibility = document.visibilityState;
+    const snap = (tag) => {
+      const dur = Number.isFinite(trackEl.duration) ? Math.round(trackEl.duration * 1000) : -1;
+      box.textContent = [
+        '[' + tag + '] ' + new Date().toISOString(),
+        'vis=' + document.visibilityState + ' (was ' + lastVisibility + ')',
+        'ua=' + String(navigator.userAgent || '').slice(0, 90),
+        'wakeLock=' + ('wakeLock' in navigator)
+          + ' mediaSession=' + ('mediaSession' in navigator)
+          + ' audioSession=' + ('audioSession' in navigator),
+        'track=' + (trackEnabled ? 'on' : 'off')
+          + (trackBroken ? ' BROKEN' : '') + ' ready=' + track.ready,
+        'blobBytes=' + track.bytes + ' trackMs=' + Math.round(track.durationMs)
+          + ' audioMs=' + dur,
+        'lastError=' + (track.lastError || '-'),
+        't=' + (trackEl.currentTime || 0).toFixed(2)
+          + ' idx=' + player.index + ' paused=' + player.paused
+          + ' regen=' + state.regenerating + ' patch=' + state.patching,
+      ].join('\n');
+    };
+
+    snap('init');
+    document.addEventListener('visibilitychange', () => {
+      snap('vis');
+      lastVisibility = document.visibilityState;
+    });
+    setInterval(() => { if (!document.hidden) snap('tick'); }, 2000);
+  }
+
   function renderPlayerChrome(manifest, startIndex) {
     const items = manifest.items || [];
     const start = Math.max(0, Math.min(Number(startIndex) || 0, Math.max(0, items.length - 1)));
@@ -996,11 +1664,13 @@
     stopPlayback();
     player.manifest = manifest;
     state.marked = new Set();
+    state.lastExport = null;
     player.runId += 1;
     player.running = true;
     player.paused = false;
     player.index = start;
     player.item = null;
+    player.startedAt = new Date().toISOString();
     player.activeMs = 0;
     player.segStart = performance.now();
     player.replayRequested = false;
@@ -1021,10 +1691,25 @@
     });
 
     const runId = player.runId;
-    runTimeline(runId, start).catch((err) => {
-      console.error(err);
-      showAudioError();
-    });
+    if (canAssembleTrack()) {
+      startTrack(runId, start).catch((err) => {
+        if (!alive(runId)) return;
+        console.warn('整轨拼装失败，回退逐词播放', err);
+        track.lastError = String((err && err.message) || err);
+        cleanupTrack();
+        trackBroken = true;
+        toast('整轨播放不可用，改用逐词播放');
+        runTimeline(runId, start).catch((fallbackErr) => {
+          console.error(fallbackErr);
+          showAudioError();
+        });
+      });
+    } else {
+      runTimeline(runId, start).catch((err) => {
+        console.error(err);
+        showAudioError();
+      });
+    }
   }
 
   function stopPlayback() {
@@ -1039,15 +1724,18 @@
     player.item = null;
     player.replayRequested = false;
     try { audio.pause(); } catch (e) { /* ignore */ }
+    cleanupTrack();
     releaseWakeLock();
   }
 
   function finishPlayback() {
+    if (!player.running) return;
     clearResume();
     if (!player.paused) player.activeMs += performance.now() - player.segStart;
     player.running = false;
     player.paused = false;
     player.item = null;
+    cleanupTrack();
     releaseWakeLock();
     disarmGuard();
 
@@ -1061,17 +1749,24 @@
     if (!player.paused) {
       player.activeMs += performance.now() - player.segStart;
       player.paused = true;
-      try { audio.pause(); } catch (e) { /* ignore */ }
+      if (usingTrack()) {
+        try { trackEl.pause(); } catch (e) { /* ignore */ }
+      } else {
+        try { audio.pause(); } catch (e) { /* ignore */ }
+      }
       saveCurrentResume();
     } else {
       player.paused = false;
       player.segStart = performance.now();
-      if (player.clipFinish) {
+      if (usingTrack()) {
+        trackEl.play().catch(() => { /* ignore */ });
+      } else if (player.clipFinish) {
         const p = audio.play();
         if (p && typeof p.catch === 'function') p.catch(() => { /* ignore */ });
       }
     }
     updatePauseUI();
+    updateMediaSession();
   }
 
   function updatePauseUI() {
@@ -1084,6 +1779,11 @@
 
   function requestReplay() {
     if (!player.running || !player.item) return;
+    if (usingTrack()) {
+      seekTrack(player.index, true);
+      setStatus(player.paused ? '已暂停' : '正在听写');
+      return;
+    }
     player.replayRequested = true;
     if (player.clipFinish) player.clipFinish('replay');
   }
@@ -1101,6 +1801,18 @@
     if (!isFinite(index)) return;
     index = Math.max(0, Math.min(index, items.length - 1));
     if (index === player.index) return;
+
+    if (usingTrack()) {
+      const wasPaused = player.paused;
+      seekTrack(index, false);
+      if (wasPaused) {
+        try { trackEl.pause(); } catch (e) { /* ignore */ }
+        setStatus('已暂停');
+      } else {
+        setStatus('正在听写');
+      }
+      return;
+    }
 
     const wasPaused = player.paused;
     const elapsed = player.activeMs + (wasPaused ? 0 : performance.now() - player.segStart);
@@ -1263,7 +1975,7 @@
     ]);
     main.addEventListener('click', () => {
       unlockAudio();
-      startPlayback(data.manifest, data.index);
+      resumePlayback(data);
     });
 
     const dismiss = el('button', { class: 'resume-dismiss', type: 'button', text: '不继续' });
@@ -1283,6 +1995,72 @@
     clearResume();
     renderHome();
     toast('已清除上次进度');
+  }
+
+  /* ------------------------------------------- 进度校验（删除 / 重建课程） */
+
+  /** 断点续听对应的课时 id：static 用 lesson_id，server 从 base 提取。 */
+  function resumeLessonId(manifest) {
+    if (!manifest) return null;
+    if (STATIC) {
+      const id = String(manifest.lesson_id || '');
+      return id || null;
+    }
+    return lessonIdFromManifest(manifest);
+  }
+
+  function findLessonById(id) {
+    return (state.lessons || []).find((l) => String(l.id) === String(id)) || null;
+  }
+
+  /**
+   * 课时被删除 / 重建后，本地进度可能指向不存在的数据：
+   * - 课时不存在 → 清除进度，卡片不渲染；
+   * - static：重新发布会改变 content_hash → 清除进度（server 不需要：
+   *   续播时按当前课时新建会话，天然用新词表）。
+   * 只在课时列表加载成功时执行；离线时保留卡片。
+   */
+  function pruneStaleResume() {
+    const resume = readResume();
+    if (!resume) return;
+    const lessonId = resumeLessonId(resume.manifest);
+    if (!lessonId) return;
+    const lesson = findLessonById(lessonId);
+    if (!lesson) {
+      clearResume();
+      toast('原课时已删除，进度已清除');
+      return;
+    }
+    if (STATIC) {
+      const saved = String(resume.manifest.content_hash || '');
+      const current = String(lesson.content_hash || '');
+      if (saved && current && saved !== current) {
+        clearResume();
+        toast('课时已更新，进度已重置');
+      }
+    }
+  }
+
+  /**
+   * 「继续上次听写」：不再信任 localStorage 里的 manifest（课时可能已删除或
+   * 重建），server 模式按当前课时新建会话并按词序号跳转；static 模式
+   * manifest 即当前发布的数据（hash 已校验），直接续播。
+   */
+  async function resumePlayback(resume) {
+    const lessonId = resumeLessonId(resume.manifest);
+    if (!STATIC && lessonId) {
+      try {
+        const manifest = await API.createSession(lessonId);
+        const last = Math.max(0, manifest.items.length - 1);
+        const index = Math.max(0, Math.min(resume.index, last));
+        rememberLesson(lessonId);
+        startPlayback(manifest, index);
+      } catch (err) {
+        toast((err && err.message) || '没法继续，再试一次');
+      }
+      return;
+    }
+    startPlayback(resume.manifest, resume.index);
   }
 
   function deepLinkCard(manifest) {
@@ -1344,7 +2122,7 @@
     });
     card.appendChild(open);
 
-    if (reviewCount > 0) {
+    if (CAP.lessonReview && reviewCount > 0) {
       const reviewBtn = el('button', {
         class: 'card-review-btn',
         type: 'button',
@@ -1361,11 +2139,10 @@
   }
 
   function emptyState() {
-    return el('div', { class: 'empty' }, [
-      el('p', {
-        html: '还没有课时，先用 <code>dictation gen</code> 生成一课，刷新后就出现在这里。',
-      }),
-    ]);
+    const text = STATIC
+      ? '还没有发布的课时。'
+      : '还没有课时，先用 <code>dictation gen</code> 生成一课，刷新后就出现在这里。';
+    return el('div', { class: 'empty' }, [el('p', { html: text })]);
   }
 
   function homeError(err) {
@@ -1374,10 +2151,12 @@
       el('span', { text: '重试' }),
     ]);
     retry.addEventListener('click', () => loadHome());
+    const hint = (err && err.message)
+      || (STATIC ? '检查一下网络，或者这个链接已经失效。' : '服务可能没启动，或者网络断了。');
     return [
       el('div', { class: 'empty' }, [
         el('p', { html: '<strong>读不到课时列表。</strong>' }),
-        el('p', { text: (err && err.message) || '服务可能没启动，或者网络断了。' }),
+        el('p', { text: hint }),
       ]),
       retry,
     ];
@@ -1387,13 +2166,24 @@
     const frag = document.createDocumentFragment();
     const resume = readResume();
 
-    if (state.deepLink) frag.appendChild(deepLinkCard(state.deepLink));
-
-    state.reviewSubjects.forEach((entry) => {
-      if (entry.count > 0) {
-        frag.appendChild(reviewCard(entry.count, entry.subject, entry.oldest));
+    if (state.deepLink) {
+      // 课时被删除后，共享的会话深链就是"死课"：词能看、音频 404，不渲染
+      const lessonId = resumeLessonId(state.deepLink);
+      if (!lessonId || findLessonById(lessonId)) {
+        frag.appendChild(deepLinkCard(state.deepLink));
+      } else {
+        state.deepLink = null;
+        toast('这一课可能已下线');
       }
-    });
+    }
+
+    if (CAP.review) {
+      state.reviewSubjects.forEach((entry) => {
+        if (entry.count > 0) {
+          frag.appendChild(reviewCard(entry.count, entry.subject, entry.oldest));
+        }
+      });
+    }
     if (resume) frag.appendChild(resumeCard(resume));
 
     frag.appendChild(el('p', { class: 'section-label', text: '课时' }));
@@ -1411,10 +2201,20 @@
   }
 
   async function bootHome() {
-    const sessionId = new URLSearchParams(location.search).get('s');
-    if (sessionId) {
+    const params = new URLSearchParams(location.search);
+    if (CAP.sessionLink) {
+      const sessionId = params.get('s');
+      if (sessionId) {
+        try {
+          state.deepLink = await API.getSession(sessionId);
+        } catch (err) {
+          toast('这一课可能已下线');
+        }
+      }
+    } else if (params.get('l')) {
+      // 分享链接 ?l=<lesson_id>：直接把这一课挂到首页顶部
       try {
-        state.deepLink = await API.getSession(sessionId);
+        state.deepLink = await API.createSession(params.get('l'));
       } catch (err) {
         toast('这一课可能已下线');
       }
@@ -1440,6 +2240,7 @@
 
     if (lessonsRes.status === 'rejected') {
       const frag = document.createDocumentFragment();
+      if (state.deepLink) frag.appendChild(deepLinkCard(state.deepLink));
       const resume = readResume();
       if (resume) frag.appendChild(resumeCard(resume));
       homeError(lessonsRes.reason).forEach((node) => frag.appendChild(node));
@@ -1447,6 +2248,7 @@
       return;
     }
     state.lessons = (lessonsRes.value && lessonsRes.value.lessons) || [];
+    pruneStaleResume();
 
     // 课内复习：按 lesson_id 把 review_count 挂到课时卡片上；接口失败就当没有复习词
     const reviewByLesson = new Map();
@@ -1605,10 +2407,12 @@
 
     // 隐藏：长按词文本用当前音色重新合成（仅课时会话；复习 / 自定义会话静默忽略）
     const wordEl = el('p', { class: 'check-word', text: item.text });
-    const lessonId = lessonIdFromManifest(player.manifest);
-    if (lessonId) {
-      wordEl.classList.add('hold-target');
-      attachLongPress(wordEl, () => regenerateCheckWord(item, lessonId));
+    if (CAP.regenerate) {
+      const lessonId = lessonIdFromManifest(player.manifest);
+      if (lessonId) {
+        wordEl.classList.add('hold-target');
+        attachLongPress(wordEl, () => regenerateCheckWord(item, lessonId));
+      }
     }
 
     // 课时 session 里自动追加的错词带 review=true，标一个小标签区分（不占序号、不影响按钮）
@@ -1666,7 +2470,14 @@
     try {
       await regenerateWordAndWait(lessonId, item.text);
       state.clipVersions.set(item.text, Date.now());
-      toast('已重新生成，重听这个词即可（不满意可再长按一次）');
+      let patched = false;
+      if (usingTrack() && player.running) {
+        const index = (player.manifest.items || []).findIndex((it) => it.text === item.text);
+        if (index >= 0) patched = await patchTrackItem(index).catch(() => false);
+      }
+      toast(patched
+        ? '已重新生成，已跳回这个词'
+        : '已重新生成，重听这个词即可（不满意可再长按一次）');
     } catch (err) {
       toast((err && err.message) || '重新生成失败，稍后再试');
       if (window.console) console.warn('regenerate failed', err);
@@ -1689,7 +2500,14 @@
     try {
       await regenerateWordAndWait(lessonId, item.text);
       state.clipVersions.set(item.text, Date.now());
-      toast('已重新生成，重听这个词即可（不满意可再长按一次）');
+      let patched = false;
+      if (usingTrack() && player.running) {
+        const index = (player.manifest.items || []).findIndex((it) => it.text === item.text);
+        if (index >= 0) patched = await patchTrackItem(index).catch(() => false);
+      }
+      toast(patched
+        ? '已重新生成，已跳回这个词'
+        : '已重新生成，重听这个词即可（不满意可再长按一次）');
     } catch (err) {
       toast((err && err.message) || '重新生成失败，稍后再试');
       if (window.console) console.warn('regenerate failed', err);
@@ -1765,7 +2583,7 @@
     els.resultCorrect.textContent = String(correct);
     els.resultWrong.textContent = String(wrong);
     els.resultNote.textContent = wrong > 0
-      ? '错词已加入复习，下次会再听一遍。'
+      ? (STATIC ? '错词可以导出，回家导入后会加入复习。' : '错词已加入复习，下次会再听一遍。')
       : '一个都没错，写得很稳。';
 
     const chips = [];
@@ -1776,8 +2594,151 @@
     }
     setChildren(els.resultWords, chips);
 
+    // 导出：仅静态模式（server 端结果已入库，无需带回）
+    if (STATIC) {
+      state.lastExport = buildResultPayload();
+      els.btnExport.hidden = false;
+    } else {
+      state.lastExport = null;
+      els.btnExport.hidden = true;
+    }
+
     disarmGuard();
     showScreen('result');
+  }
+
+  /* ------------------------------------------------------- 结果导出（静态） */
+
+  function deviceLabel() {
+    const ua = navigator.userAgent || '';
+    if (/iPad/.test(ua) || (/Macintosh/.test(ua) && 'ontouchend' in document)) return 'iPad';
+    if (/iPhone/.test(ua)) return 'iPhone';
+    if (/Android/.test(ua)) return 'Android';
+    return '桌面浏览器';
+  }
+
+  /** docs/share-publish.md §9.1：dictation.result/v1，自包含，不依赖课时匹配。 */
+  function buildResultPayload() {
+    const manifest = player.manifest || {};
+    const items = (manifest.items || []).map((item, index) => ({
+      position: index + 1,
+      text: item.text,
+      lang: item.lang,
+      review: !!item.review,
+      correct: !state.marked.has(index),
+    }));
+    const wrong = items.filter((item) => !item.correct).length;
+    return {
+      schema: 'dictation.result/v1',
+      lesson: {
+        lesson_id: String(manifest.lesson_id || ''),
+        content_hash: String(manifest.content_hash || ''),
+        title: String(manifest.title || ''),
+        subject: String(manifest.subject || ''),
+        url: manifest.base ? manifest.base + '/lesson.json' : '',
+      },
+      session: {
+        kind: manifest.kind || 'lesson',
+        started_at: player.startedAt || '',
+        finished_at: new Date().toISOString(),
+        device: deviceLabel(),
+        student: '',
+      },
+      items: items,
+      summary: { total: items.length, correct: items.length - wrong, wrong: wrong },
+    };
+  }
+
+  function exportFilename(payload) {
+    const now = new Date();
+    const ymd = now.getFullYear()
+      + String(now.getMonth() + 1).padStart(2, '0')
+      + String(now.getDate()).padStart(2, '0');
+    const title = String((payload.lesson && payload.lesson.title) || '听写')
+      .replace(/[\\/:*?"<>|\s]+/g, '-');
+    return title + '-' + ymd + '.json';
+  }
+
+  function downloadBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = el('a', { href: url, download: filename });
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  }
+
+  function showExportText(text) {
+    const close = () => overlay.remove();
+    const copy = async () => {
+      let ok = false;
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(text);
+          ok = true;
+        }
+      } catch (err) { /* 走 execCommand 兜底 */ }
+      if (!ok) {
+        ta.focus();
+        ta.select();
+        try { ok = document.execCommand('copy'); } catch (err) { ok = false; }
+      }
+      toast(ok ? '已复制，去粘贴给家长' : '复制失败，长按文本手动复制');
+    };
+
+    const overlay = el('div', { class: 'modal modal-top' }, [
+      el('div', { class: 'modal-card' }, [
+        el('h2', { class: 'modal-title', text: '复制这份结果' }),
+        el('p', { class: 'modal-text', text: '全选复制后，通过聊天软件发给家长。' }),
+        (function () {
+          const ta = el('textarea', { class: 'export-text', readonly: 'readonly', 'aria-label': '听写结果 JSON' });
+          ta.value = text;
+          return ta;
+        })(),
+        el('div', { class: 'modal-actions' }, [
+          el('button', { class: 'btn btn-primary btn-block', type: 'button', onclick: copy }, [el('span', { text: '复制' })]),
+          el('button', { class: 'btn btn-ghost btn-block', type: 'button', onclick: close }, [el('span', { text: '关闭' })]),
+        ]),
+      ]),
+    ]);
+    overlay.addEventListener('click', (event) => {
+      if (event.target === overlay) close();
+    });
+    document.body.appendChild(overlay);
+    const ta = overlay.querySelector('textarea');
+  }
+
+  async function exportResult() {
+    const payload = state.lastExport;
+    if (!payload) return;
+    const filename = exportFilename(payload);
+    const blob = new Blob([JSON.stringify(payload, null, 1) + '\n'], { type: 'application/json' });
+    const file = new File([blob], filename, { type: 'application/json' });
+
+    // 1. 系统分享面板（iOS / Android）
+    try {
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        await navigator.share({ files: [file], title: payload.lesson.title });
+        return;
+      }
+    } catch (err) {
+      if (err && err.name === 'AbortError') return; // 用户取消
+      if (window.console) console.warn('share failed', err);
+    }
+
+    // 2. 微信内置浏览器等不支持下载 → 直接给文本
+    if (/MicroMessenger/i.test(navigator.userAgent || '')) {
+      showExportText(JSON.stringify(payload, null, 1) + '\n');
+      return;
+    }
+
+    // 3. 常规下载
+    try {
+      downloadBlob(blob, filename);
+      toast('已保存到下载');
+    } catch (err) {
+      showExportText(JSON.stringify(payload, null, 1) + '\n');
+    }
   }
 
   function skipCheck() {
@@ -1856,6 +2817,7 @@
     els.btnSubmit.addEventListener('click', submitCheck);
     els.btnSkip.addEventListener('click', skipCheck);
 
+    els.btnExport.addEventListener('click', exportResult);
     els.btnResultHome.addEventListener('click', goHome);
     els.btnErrorHome.addEventListener('click', goHome);
 
@@ -1869,6 +2831,12 @@
     preventTextSelection();
     attachLongPress(els.homeTitle, openTimingPanel);
     els.timingClose.addEventListener('click', closeTimingPanel);
+    els.timingImport.addEventListener('click', openImportModal);
+    els.importClose.addEventListener('click', closeImportModal);
+    els.importSubmit.addEventListener('click', submitImport);
+    els.importModal.addEventListener('click', (event) => {
+      if (event.target === els.importModal) closeImportModal();
+    });
     els.timingSave.addEventListener('click', submitTimingPanel);
     els.timingReset.addEventListener('click', resetTimingPanel);
     els.timingModal.addEventListener('click', (event) => {
@@ -1899,8 +2867,10 @@
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'hidden') {
         saveCurrentResume();
-        if (player.running && !player.paused) togglePause();
+        // 整轨模式不主动暂停：熄屏后由系统继续播放
+        if (player.running && !player.paused && !usingTrack()) togglePause();
       } else if (player.running && !player.paused) {
+        if (usingTrack()) syncTrackState();
         requestWakeLock();
       }
     });
@@ -1953,6 +2923,7 @@
       resultWrong: $('result-wrong'),
       resultNote: $('result-note'),
       resultWords: $('result-words'),
+      btnExport: $('btn-export'),
       btnResultHome: $('btn-result-home'),
 
       btnErrorHome: $('btn-error-home'),
@@ -1963,16 +2934,27 @@
       modalConfirm: $('modal-confirm'),
       modalCancel: $('modal-cancel'),
 
+      timingImport: $('timing-import'),
       timingModal: $('timing-modal'),
       timingGap: $('timing-gap'),
       timingClose: $('timing-close'),
       timingReset: $('timing-reset'),
       timingSave: $('timing-save'),
 
+      importModal: $('import-modal'),
+      importFile: $('import-file'),
+      importText: $('import-text'),
+      importStatus: $('import-status'),
+      importSubmit: $('import-submit'),
+      importClose: $('import-close'),
+
       toast: $('toast'),
     };
 
+    bindTrackEvents();
+    setupDiag();
     els['mock-badge'].hidden = !MOCK;
+    els.timingImport.hidden = !CAP.importResult;
     els['home-date'].textContent = todayLabel();
 
     bindEvents();

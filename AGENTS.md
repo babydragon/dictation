@@ -176,11 +176,20 @@ CLI（`lesson import` / `lesson gen`）保留为**运维与本地调试**路径�
   `grade`（1–6）/`term`（1/2）是可选的筛选/展示元数据。
 - 词的身份是 `(subject, text)`，不是全局 `text`；语文和英语的同形词互不影响。
 - 复习、积压、组卷都按科目隔离，一个 session 不混科目。
-- SQLite 用 `PRAGMA user_version` 管理 schema（当前 v4）：
+- SQLite 用 `PRAGMA user_version` 管理 schema（当前 v5）：
   - 启动时自动迁移；迁移前 `VACUUM INTO` 备份，保留最近 3 份；
   - 库版本高于程序 → 拒绝启动；
   - 迁移只追加、不修改；新增列必须有默认值或可空。
 - 详见 [`docs/review-scheduling.md`](docs/review-scheduling.md)。
+
+### D16. 熄屏播放：整轨引擎
+
+- 时间轴不能建在 JS 定时器上：iOS 熄屏挂起 JS，Android 静音段触发后台节流。
+- 默认把片段 + 静音**在客户端拼成一条 WAV**（`<audio id="track">` 连续播放），
+  节奏存在于样本里；熄屏/切后台不中断。
+- 保留分片引擎作回退（片段 404、非 24k/mono/s16、>32MB、`play()` 失败）；
+  `?track=0` 强制回退。详见 [`docs/playback-track.md`](docs/playback-track.md)。
+- 跨域分享时必须给 `clips/*` 配 CORS（播放器改为 `fetch` 片段）。
 
 ---
 
@@ -469,6 +478,8 @@ lessons/第5课/
   （不升级、不动 `due_at`/`lapses`）；答错照常重置 1 天、`lapses+1`。
   判断依据是词当前记录，与 session 类型无关。
 - 待复习 = `last_grade='again' OR due_at <= now`；错词当天即可复习。
+- 分享结果导入按**实际完成时刻**（`finished_at`）排期，不按导入时刻；
+  本机没有该词音频时记录照常入库，但不进复习池。
 - 组卷：本课新词 + `min(review_cap, max(3, 25%×新词数))` 个**同科目**待复习词，
   追加在本课之后、outro 之前；
   跳过本课已有词；不加语音提示。
@@ -495,6 +506,8 @@ axum 服务（SBC / 本机）
   ├─ GET  /api/jobs/{id}          轮询
   ├─ GET  /api/review/queue       待复习池（agent 挑词）
   ├─ POST /api/sessions/custom    临时复习会话（agent 给词表和顺序）
+  ├─ POST /api/results/import     导入分享版结果（幂等）
+  ├─ POST /api/lessons/{id}/publish 发布到 Cloudflare（F8，见 docs/share-publish.md）
   ├─ lessons / sessions / check / review
   └─ media / static PWA
         ↓（生成由服务进程执行，持有 TTS 密钥）

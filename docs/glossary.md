@@ -2,7 +2,7 @@
 
 > **本文件是本工程术语的唯一规范来源。**
 > 设计文档、接口契约、代码标识符、CLI/HTTP 输出、UI 文案都用这里的词。
-> 同一个概念只允许一个规范表述；旧称与近义词在 §7 明确标为「不要用」。
+> 同一个概念只允许一个规范表述；旧称与近义词在 §8 明确标为「不要用」。
 >
 > 使用规则：
 >
@@ -101,6 +101,19 @@
 | **路径根** | `config.toml` → `paths.base` | `lessons/`、`data/`、`cache/` 的父目录 | 数据目录（口语可） |
 | **数据库文件** | `paths.data` → `dictation.db` | SQLite；由 `serve` 独占写入 | 数据库（口语可） |
 | **schema 版本** | `PRAGMA user_version` | 当前 v4；库版本高于程序则拒绝启动 | 迁移号 |
+| **发布** | `dictation publish` / `POST /api/lessons/{id}/publish` | 把课时清单与片段增量上传到 R2（对外只读）；幂等，已最新则 `skipped` | 上传、导出、同步 |
+| **发布数据** | R2 `lessons/<id>/` | `lesson.json` + `clips/*.wav`；R2 是唯一真相源，本地不留账本 | 云端课时 |
+| **发布索引** | `lessons/index.json` | 已发布课时列表；**派生缓存**，可 `--reindex` 从 R2 重建 | 账本、清单 |
+| **发布内容哈希** | `content_hash` | 规范化 JSON 的 `sha256:`；决定重发是否跳过 | 版本号 |
+| **Pages 壳** | `dist/shell/`（`web/` + 生成的 `config.js`） | 前端静态资源，独立于发布通道 | 前端（口语可） |
+| **数据源** | `config.toml` → `publish.data_base` | 静态前端读取 R2 数据的根 URL | 对象存储地址 |
+| **分享链接** | `publish.pages_base/?l=<lesson_id>` | 发给家长的入口；`?s=` 是会话深链（仅 server 模式） | 链接（口语可） |
+| **口令** | `?k=`（未实现） | 对外访问控制；v1 只在 `dataUrl()` 留出口 | 密码、token |
+| **整轨** | `track`（客户端内存 Blob） | 播放时按 manifest 把片段+静音拼成的单条 WAV，只存在于浏览器 | 完整音轨、合并音频 |
+| **拼装** | `assemble` | 把片段与静音按时间轴拼成整轨（客户端） | 合成、合并（TTS 侧） |
+| **分片引擎** | `clip engine` | 逐片段播放 + 计时器的回退实现 | 旧播放器 |
+| **整轨引擎** | `track engine` | 播放整轨的默认实现；`?track=0` 可关闭 | 新播放器 |
+| **导入结果** | `dictation result import` / `POST /api/results/import` | 把分享版导出的 `dictation.result/v1` 入账；幂等，重复导入返回 `duplicate` | 同步、上传结果 |
 
 ## 5. 用户与角色
 
@@ -117,14 +130,20 @@
 |---|---|
 | `subject` | `chinese` / `english` |
 | `lang` | `zh` / `en` / `mixed` |
-| `sessions.kind` | `lesson` / `review`（计划中：`imported`） |
+| `sessions.kind` | `lesson` / `review` / `imported` |
 | `attempts.grade` | `good` / `again` |
-| `attempts.source` | `self`（计划中：`import`） |
+| `attempts.source` | `self` / `import` |
 | `review_state.last_grade` | `good` / `again` |
 | `job.status` | `queued` / `running` / `done` / `error` / `cancelled` |
+| 发布 `status` | `published` / `skipped` |
+| 发布错误 `stage` | `local` / `clips` / `commit` / `index` |
 | 照片批改 `verdict` | `correct` / `wrong` / `missing` / `unclear`（F6） |
 
-## 7. 易混词与旧称（不要用）
+## 7. 发布（F8）的补充说明
+
+见 [`share-publish.md`](share-publish.md)。发布与口令的规则细节只写在那里，本表只定义「是什么」。
+
+## 8. 易混词与旧称（不要用）
 
 | 不要用 | 用 | 原因 |
 |---|---|---|

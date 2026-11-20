@@ -5,7 +5,7 @@
 > `AGENTS.md`（除非设计本身变了）。
 >
 > 术语与命名见 [`docs/glossary.md`](docs/glossary.md)，本文件用词以词表为准。
-> 最后更新：2026-11-18
+> 最后更新：2026-11-19
 
 ---
 
@@ -35,8 +35,12 @@
 | 重复课时报告 | ✅ `lesson duplicates` / `GET /api/lessons/duplicates` |
 | 单词重新生成 | ✅ `POST /api/lessons/{id}/regenerate-word` + 检查页长按（删缓存样本、只花 1 次 TTS） |
 | 听写节奏（隐藏） | ✅ 长按首页标题设置词后等待（本地设置，静态发布同样可用） |
+| 分享发布 F8（前端） | 🚧 static 模式 + `?l=` 深链 + 本地判分 + 结果导出已实现；导入闭环未开始 |
+| 分享发布 F8（publish） | 🚧 `publish` CLI/HTTP + R2 SigV4 客户端已实现；`--shell/--status/--reindex/unpublish` 未开始 |
+| 分享结果导入（F8） | ✅ `result import` CLI/HTTP 幂等入账（schema v5）+ 家长入口；真实 R2 冒烟待做 |
+| 熄屏播放（整轨引擎 C1） | ✅ 客户端拼装整轨 + 分片引擎回退 + 重掷补丁 + `?diag=1`；待真机 T1/T2 |
 | 缓存清理 | ✅ `clean --unused/--older-than`，默认 dry-run |
-| 断点续听 | ✅ localStorage 保存会话 + 条目，7 天有效 |
+| 断点续听 | ✅ localStorage 保存会话 + 条目，7 天有效；删除/重建课时的进度校验（server 续播走新会话，static 校验 content_hash）|
 
 当前测试：`cargo test` **200 passed**（191 lib + 9 bin）；clippy / fmt 干净；
 `node --check web/app.js` 通过。
@@ -53,7 +57,10 @@
 3. **拍照批改**：`Grader` trait + 多模态模型 + 置信度 + 人工确认。
 4. **记忆曲线细化**：FSRS、按教材/单元限定范围（当前用课时范围表达）。
 5. **本地 TTS（可选）**：断网兜底，SBC 上选型与实测。
-6. **F8 外网分享**：Cloudflare Pages + R2，独立会话实施；要点见 §5 F8。
+6. **F8 外网分享**：Cloudflare Pages + R2。前端（static + 导出）、发布
+   （`publish`）、导入闭环（`results/import` + 家长入口）、熄屏整轨引擎均已完成；
+   剩 `--shell/--status/--reindex/unpublish`、skill 更新、真实 R2 冒烟与真机
+   T1/T2（熄屏）验证。契约见 `docs/share-publish.md`（需入库）。
 
 ### 发布 v0.2.0-rc.1（科目 + 复习组卷）
 
@@ -185,22 +192,23 @@
 - 状态：SBC 安装 + systemd 自启 + 手机访问 + 服务端生成已验收；
   本地 TTS 仍未做。
 
-### F8 外网分享（Cloudflare Pages + R2，计划中，未实现）
+### F8 外网分享（Cloudflare Pages + R2，进行中：前端完成）
 
 目标：课时发布到 CF，非家庭网络也能给孩子听写；结果导出后回家导入，形成复习闭环。
-详细契约见本地工作稿 `docs/share-publish.md`（未入库，独立会话实施时先读它）。
+详细契约见 `docs/share-publish.md`（**唯一契约源**，本节只是摘要）。
 
 **架构与边界**
 
 - 双通道：Pages 只放壳（`web/` + 生成的 `config.js` + `_headers`）；R2 只放数据。
   发布新课时不重新部署 Pages；R2 是唯一真相源，本地不留发布账本。
-- 只读发布，不做 R2 写接口、不做多租户；v1 不加访问控制（以后一条 WAF 规则即可）。
+- 只读发布，不做 R2 写接口、不做多租户；v1 不加访问控制（口令只留出口：
+  前端统一走 `dataUrl()` 生成 R2 URL，`base` 保持干净，见契约 §8.5/§11.5）。
 - 静态站不包含复习词（`review` 恒 false），复习仍靠本地 SQLite。
 
 **发布物**（`<dataBase>/`）
 
-- `lessons/index.json`：`{schema_version,updated_at,lessons[{id,title,item_count,total_ms,path,content_hash,published_at}]}`，派生缓存，可重建。
-- `lessons/<id>/lesson.json`：与 `SessionManifest` 同形；新增 `schema_version`/`lesson_id`/`content_hash`，省略 `session_id` 与 `base`；`full_track` 仅 `--with-full` 时出现。
+- `lessons/index.json`：`{schema_version,updated_at,lessons[{id,title,subject,grade,term,item_count,total_ms,path,content_hash,published_at}]}`，派生缓存，可重建；`dir` 不发布。
+- `lessons/<id>/lesson.json`：与 `SessionManifest` 同形；新增 `schema_version`/`lesson_id`/`content_hash`/`subject`/`grade`/`term`，省略 `session_id` 与 `base`；`full_track` 仅 `--with-full` 时出现。
 - `lessons/<id>/clips/*.wav`：沿用内容哈希命名；**不传 `full.wav`**（约 9.8MB/课）。
 - `<id>` = `sha256(目录名)` 前 12 位，与内容无关，重发只覆盖同一前缀。
 - `content_hash` = 规范化 JSON 的 sha256（键排序、无空白；排除 `generated_at`/`total_ms`/自身）。
@@ -224,19 +232,25 @@
 - `/etc/dictation/env`（0600）：`R2_ACCOUNT_ID`/`R2_ACCESS_KEY_ID`/`R2_SECRET_ACCESS_KEY`（可选 `R2_BUCKET`/`R2_DATA_BASE`）。
 - 沿用 D13b：`$CREDENTIALS_DIRECTORY` → 环境变量回退；agent 不接触凭证，只调 HTTP。
 
-**静态前端**
+**静态前端（✅ 已实现，浏览器实测）**
 
-- 注入 `config.js`：`DICTATION_MODE='static'`、`DICTATION_DATA_BASE=...`（不用 query 参数，避免刷新/加主屏丢失）。
-- 只替换 5 个调用：`lessons()`/`createSession()`/`reviewSummary()`（恒 0）/`createReview()`（不支持）/`check()`（本地判分）。
-- 深链 `?l=<lesson_id>` 直接进播放页；失效回落列表并提示“这一课可能已下线”。
-- 保留时间轴、暂停/重听、断点续听、检查页、结果页。
+- `web/config.js`（默认 `{mode:'server'}`）在 `app.js` 之前加载；发布时生成
+  `{mode:'static', dataBase:...}` 覆盖。缺失/非法一律按 server，不隐式降级。
+- `API` 拆成 `serverApi` / `staticApi`：static 只读 R2（`index.json` +
+  `lesson.json`，补 `session_id`/`base`），`check()` 本地判分；
+  review/深链/重掷入口在渲染阶段就不创建，**不发任何 `/api/*` 请求**（已实测）。
+- 能力门禁集中在 `CAP`（review / lessonReview / regenerate / sessionLink）。
+- 深链：static 用 `?l=<lesson_id>`，server 保留 `?s=<session_id>`；static 忽略 `s`。
+- 保留：时间轴、上一个/下一个、重听、断点续听、听写节奏（隐藏面板）。
 
 **结果回传**
 
-- 导出 `dictation.result/v1`（自包含 items + `content_hash` + `finished_at`）；移动端三级降级：`navigator.share` → `Blob` 下载 → 文本框复制。
-- `POST /api/results/import`：幂等键 = 规范化 `{content_hash,finished_at,student,items[position/text/correct]}` 的 sha256，忽略客户端 id；
-  已导入 → `duplicate`；时间基准用 `finished_at`（未来 >5 分钟钳制为 now）；单事务写 `sessions(kind=imported)` + `session_items` + `attempts(source=import)` + `review_state`。
-- CLI 等价：`dictation result import <file|-> --json`。
+- 导出 `dictation.result/v1`（✅ 已实现，含 `subject`；`navigator.share` → Blob 下载 → 文本框复制 三级降级；微信 UA 直接走文本）。
+- `POST /api/results/import`（未实现）：幂等键 = 规范化
+  `{content_hash,subject,finished_at,student,items[position/text/correct]}` 的 sha256，忽略客户端 id；
+  已导入 → `duplicate`；时间基准用 `finished_at`（未来 >5 分钟钳制为 now）；单事务写
+  `sessions(kind=imported)` + `session_items` + `attempts(source=import)` + `review_state`。
+- CLI 等价（未实现）：`dictation result import <file|-> --json`。
 
 **CLI（agent-first）**
 
@@ -547,6 +561,139 @@ dictation result import <file|-> [--json]
   `http-api.md` / `player.md` / `review-scheduling.md` / `README.md` / skill 顶部
   都指向词表。
 - 代码未动，因此没有跑 fmt/clippy/test。
+
+### 2026-11-19（F8 前端：静态模式 + 结果导出）
+
+- 契约：`docs/share-publish.md` 按当前实现对齐（科目进 `index.json`/`lesson.json`/
+  `content_hash`/`result/v1`；API 能力表 10 项；`?l=`/`?s=` 双深链优先级；
+  `dataUrl()` 唯一出口；口令决定「v1 不启用、只留出口」）。
+- 模式开关：新增 `web/config.js`（默认 `{mode:'server'}`），
+  `index.html` 在 `app.js` 前加载；缺失/非法一律按 server。
+- `API` 拆 `serverApi` / `staticApi`：static 只读 R2（`index.json` → 课时列表、
+  `lesson.json` → 补 `session_id`/`base`），`check()` 本地判分；
+  review/复习角标/长按重掷/`?s=` 入口经 `CAP` 在渲染阶段裁掉。
+- `dataUrl()`：静态数据源唯一出口，`base` 保持干净（不进断点续听快照）。
+- 深链：static `?l=<lesson_id>`；`?s=` 在 static 下忽略；列表拉取失败时
+  深链卡片仍显示。
+- 导出：结果页新增「导出结果」（仅 static），`dictation.result/v1` 全字段
+  （含 `subject`/`content_hash`/`url`）；三级降级 `navigator.share(files)` →
+  Blob 下载 → 文本框复制（微信 UA 直接文本）。
+- 浏览器实测（同源 fixture：壳 + R2 数据）：首页渲染科目标签、无复习入口；
+  完整听写 → 检查标错 → 本地判分 4/1；上一个/下一个跳转正常；
+  `?l=` 深链 + `?s=` 忽略；**服务端日志确认 0 次 `/api/*` 请求**；
+  导出下载文件名 `快速测试课-20261119.json`、文本降级内容与契约逐字段一致。
+- server 模式回归：`serve` 起本库，首页渲染与 `/api/*` 正常，导出按钮隐藏。
+- 验证：`node --check web/app.js` 通过；Rust 未改动（cargo test 仍 200）。
+
+### 2026-11-20（熄屏播放：整轨引擎 C1）
+
+- 根因确认（`docs/playback-track.md`）：wake lock 在局域网 HTTP 不存在；时间轴建在
+  JS 定时器上；`visibilitychange` 主动暂停。
+- 新增整轨引擎（`web/app.js`）：
+  - `assembleTrack()` 按 manifest 把片段 + 静音拼成一条 WAV（Blob），
+    `readWavPcm()` 遍历 RIFF 并校验 `24k/mono/s16`；静音复用零缓冲；
+    动态节奏沿用 `timingGapMs()` 的 −80ms 换算；
+  - 独立 `<audio id="track">`（与 `#audio` 分开，`unlockAudio` 双解锁）；
+  - 进度以 `currentTime` + `starts[]` 二分为准，`ended` 不派发时按「接近结尾」兜底；
+  - 暂停/继续、上一个/下一个、重听全部改为 `seek`；`visibilitychange=hidden`
+    在整轨模式**不暂停**；
+  - 回退：片段 404 / 格式不合规 / >32MB / `play()` 失败 / 无 Blob 能力 →
+    清理整轨并提示「改用逐词播放」；`?track=0` 强制分片引擎；
+  - 长按重掷：只重建该 item 的 chunk、重算后续 `starts[]`、换 Blob 后 seek 回原位；
+  - `?diag=1` 覆盖层：visibility 时间线、Blob 字节/时长、audio 时长、
+    `currentTime`、回退状态（钉钉无 devtools 时取证）；
+  - 锁屏/通知栏媒体卡片：`MediaSession.metadata`（标题 = 课时标题），按键交给系统。
+- 真机反馈修复（2026-11-20）：
+  - 从头播放时误 `seek(starts[0])` 跳过了 lead_in 与开场白 → 改为从 0 开始，仅续听 seek；
+  - `?diag=1` 面板遮挡底部按钮 → 移到右上、`pointer-events:none`；
+  - 锁屏/通知栏暂停绕过 `togglePause` → 监听 `track` 原生 `play/pause` 同步
+    `player.paused`/UI/断点/媒体状态（自己操作元素时先改状态，事件里跳过）。
+- 验证：20 词课 `trackMs=200409` vs `manifest.total_ms=200410`（差 1ms）、9.6MB；
+  暂停/继续、上一个/下一个、重听正常；静态 fixture 216KB/4.5s 播完、检查页正常；
+  `?track=0` 回退正常。**真机熄屏 T1/T2、钉钉/微信 WebView、重掷补丁待实测。**
+- 跨端契约：`share-publish.md` §11.2 CORS 改为 **JSON + `clips/*`**（播放器用
+  `fetch` 读片段）；R2 配置需同步，否则分享版点开始会失败。
+- 文档：`AGENTS.md` D16、`player.md` 双引擎、`glossary.md` 整轨/拼装/引擎、
+  `playback-track.md` 置为已实施、`TODO.md`。
+
+### 2026-11-19（F8：结果导入闭环）
+
+- schema **v5**：新增 `result_imports(import_key PRIMARY KEY, session_id, created_at)`
+  作为导入幂等键；迁移只加表，旧库自动升级。
+- 新增 `src/result_import.rs`：`dictation.result/v1` 解析/校验/幂等键。
+  - 校验：schema 精确匹配、subject ∈ `chinese|english`、items 1–200、
+    position 唯一且从 1 起、text 去空白后非空且 ≤200 字符、lang 缺省按文本推断；
+  - 幂等键 = 规范化 `{content_hash, subject, finished_at(Unix), student,
+    items[position,text,correct]}` 的 sha256，**忽略客户端 id**；
+  - `finished_at` 必须 RFC3339；未来 >5 分钟钳制为当前时刻。
+- `Db::import_result`（单事务）：`sessions.kind='imported'` +
+  `session_items` + `attempts(source='import')` + `review_state` +
+  `result_imports`；**时间基准是 `finished_at`**（不是导入时刻）。
+  - 同一 `subject + finished_at` 但内容不同 → 409（疑似改判后重复导出）；
+  - 重复导入 → `duplicate`，不重复写 attempts/lapses；
+  - 词按 `(subject, text)` 归属；音源解析优先级：本机 `words` → 本机课时清单
+    （`ClipIndex::scan`，同科目）→ 留空（历史可查但不进复习池）；
+  - 排期逻辑从 `check_session` 抽出 `schedule_after_grade`，两处共用。
+- HTTP：`POST /api/results/import`（鉴权优先、400/409/200）；CLI：
+  `dictation result import <file|-> [--json]`，输出与 HTTP 同形。
+- 前端（家长入口，孩子不可见）：长按首页标题 →「听写节奏」→「导入听写结果」，
+  支持选文件与粘贴 JSON；成功/重复/失败就地提示，并刷新首页复习入口。
+- 测试：+8 result_import 单测（含 ClipIndex）、+5 db 导入测试（幂等、按
+  finished_at 排期、无音频不进池、时间冲突、清单补音源）、+4 HTTP 测试。
+- 端到端（serve + 浏览器）：家长面板粘贴结果 →「已导入：1 对 / 1 错；待复习 1 个词」，
+  首页立即出现「错词复习 · 语文」与该课的「复习 1」；再次导入 →「之前已经导入过，
+  没有重复计分」；CLI `result import` 同样返回 imported/duplicate，`result show`
+  可见 `source=import`、`origin_lesson`。
+- 文档：`http-api.md`（端点 + 字段表 + 示例、v5 表）、`share-publish.md` §9、
+  `glossary.md`（imported/import 转正、导入结果）、`AGENTS.md`（v5 + 端点 +
+  导入排期基准）、`player.md`（断点校验，上一轮）。
+
+### 2026-11-19（断点续听：删除/重建课时的进度校验）
+
+- 问题：课时删除后「继续上次」卡片仍在（localStorage 不校验课时存在）；
+  重建后本地 manifest 可能是旧词表。删除保留 `sessions`，`?s=` 深链也能
+  对"死课"渲染卡片（音频 404 才暴露）。
+- 修复（`web/app.js`）：
+  - `pruneStaleResume()`：首页渲染（课时列表加载成功后）按 resume 的课时 id
+    校验——不存在 → `clearResume()` + toast「原课时已删除，进度已清除」；
+  - `resumePlayback()`：server 续播**不再重放本地 manifest**，改为对当前课时
+    新建会话（`POST /api/sessions`）并按保存的词序号跳转（越界夹取）——重建后
+    天然用新词表；static 校验 `content_hash` 与 `index.json` 一致，不一致 →
+    清除 + toast「课时已更新，进度已重置」；
+  - `?s=` 深链卡片渲染前校验课时仍存在，否则不渲染并提示下线。
+  - 离线（列表加载失败）不校验，保留卡片；复习/自定义会话（无课时定位）不校验。
+- 浏览器实测（static fixture + serve 真库）：
+  - 删除课时 → 卡片消失 + localStorage 已清（server 与 static 各验一次）；
+  - static 改 `content_hash` → 卡片消失 + 进度清除；
+  - hash 未变 → 卡片正常，续播词序号正确（static 直接续播、server 新会话 2/20）。
+- 文档：`player.md` 断点续听补校验规则；`share-publish.md` §8 同步。
+
+### 2026-11-19（F8 后端：publish）
+
+- 新增 `src/publish.rs`：
+  - `PublishSettings`（`[publish]` 段 + `R2_*` 环境变量，密钥走 `read_secret`，
+    未配置清单 `missing()`）；
+  - `ObjectStore` trait + `S3Store`（SigV4 自签名，新增纯 Rust `hmac` 依赖，
+    GET/HEAD/PUT）+ `MemoryStore`（测试）；SigV4 用 Python 独立实现对照出
+    已知答案向量（GET/PUT 各一条）——期间发现参考实现漏了 `AWS4` 前缀、
+    Rust 侧 HMAC 链误用同一实例 `update`，两处都已修正；
+  - 载荷构造 `build_plan`（lesson.json + 对象清单，缺片段直接报错不发布）、
+    `content_hash`（规范化 JSON sha256，排除 content_hash 自身）、
+    `merge_index`（未知条目保留、按 title 排序）；
+  - 状态机 `publish_lesson`（§5.1）：GET 远端 → hash 相同 skipped →
+    逐 clip HEAD/PUT → lesson.json（提交点）→ index.json merge；
+    错误带 `stage/uploaded/committed`（local/clips/commit/index）。
+- 配置：`config.toml` 新增 `[publish]`（`enabled/data_base/pages_base/bucket/
+  pages_project/shell_dir`），`AppConfig.publish` 贯通。
+- CLI：`dictation publish [课时] [--dry-run|--force|--with-full|--json]`；
+  省略课时 = 发布全部；未配置 → `{"error":…}` + exit 1（已实测）。
+- HTTP：`POST /api/lessons/{id}/publish`（同步、token 优先于 body、
+  503/404/400/502）；`docs/http-api.md` 补字段类型表与示例；鉴权清单同步。
+- 测试：+13（SigV4 已知答案 ×2、URI 编码、载荷形状、缺片段、index 合并、
+  首发跳过/force、远端孤儿保留、缺片段零写入、dry-run、HTTP 503/404/流程/
+  token/不发布私有文件）；`cargo test` 216 lib + 9 bin，fmt/clippy 干净。
+- 未实现（记录在 share-publish.md §15）：`publish.lock`、`--shell`、
+  `--status`、`--reindex`、`unpublish`、真实 R2 冒烟。
 
 ### 2026-11-19（接口示例规范）
 

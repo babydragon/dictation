@@ -98,10 +98,17 @@ CREATE TABLE IF NOT EXISTS review_state (
 
 CREATE INDEX IF NOT EXISTS idx_review_due ON review_state(due_at);
 CREATE INDEX IF NOT EXISTS idx_attempts_word ON attempts(word_id, created_at);
+
+-- 分享结果导入的幂等键（v5）：同一份结果只入账一次。
+CREATE TABLE IF NOT EXISTS result_imports (
+  import_key TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
 "#;
 
 /// Current schema version, stored in `PRAGMA user_version`.
-pub const SCHEMA_VERSION: i32 = 4;
+pub const SCHEMA_VERSION: i32 = 5;
 
 /// Shared review priority order: wrong last time → least recently practiced →
 /// `due_at` → word id. Every review selection query uses this so the criteria
@@ -197,6 +204,10 @@ fn migrate(conn: &mut Connection, path: Option<&Path>) -> Result<()> {
         if current == 3 {
             migrate_v3_to_v4(&tx)?;
             current = 4;
+        }
+        if current == 4 {
+            migrate_v4_to_v5(&tx)?;
+            current = 5;
         }
         if current != SCHEMA_VERSION {
             anyhow::bail!("缺少 v{current} → v{SCHEMA_VERSION} 的迁移");
@@ -341,6 +352,18 @@ fn migrate_v2_to_v3(tx: &Connection) -> Result<()> {
 
 /// v3 → v4: index only, no column changes. Review selection orders by "least
 /// recently practiced", which reads `MAX(attempts.created_at)` per word.
+/// v4 → v5: 分享结果导入的幂等表。
+fn migrate_v4_to_v5(tx: &Connection) -> Result<()> {
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS result_imports (
+           import_key TEXT PRIMARY KEY,
+           session_id TEXT NOT NULL,
+           created_at INTEGER NOT NULL
+         );",
+    )?;
+    Ok(())
+}
+
 fn migrate_v3_to_v4(tx: &Connection) -> Result<()> {
     tx.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_attempts_word ON attempts(word_id, created_at);",
@@ -1446,6 +1469,7 @@ impl Db {
                       THEN ?1 - r.due_at ELSE 0 END), 0)
              FROM review_state r
              JOIN words w ON w.id = r.word_id
+             WHERE w.clip_path IS NOT NULL AND w.clip_path <> ''
              GROUP BY w.subject
              ORDER BY w.subject",
         )?;
@@ -1666,61 +1690,7 @@ impl Db {
                 params![session_id, position as i64, word_id, grade, now],
             )?;
 
-            let previous: Option<(i64, i64, i64, String)> = tx
-                .query_row(
-                    "SELECT interval_days, lapses, due_at, last_grade
-                     FROM review_state WHERE word_id = ?1",
-                    [word_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                )
-                .optional()?;
-
-            // Early practice (not due and not a pending wrong word) is extra
-            // repetition, not evidence that the interval elapsed, so a correct
-            // answer must not advance the schedule. A wrong answer always
-            // counts — forgetting is forgetting. No record yet means this is
-            // the word's first attempt, which advances normally.
-            let normal_review = previous
-                .as_ref()
-                .map(|(_, _, due_at, last_grade)| last_grade == "again" || *due_at <= now)
-                .unwrap_or(true);
-
-            if !(correct && !normal_review) {
-                let (interval_days, lapses) = if correct {
-                    let next = match previous.as_ref() {
-                        None => 2,
-                        Some((current, _, _, _)) => next_interval(*current),
-                    };
-                    (
-                        next,
-                        previous
-                            .as_ref()
-                            .map(|(_, lapses, _, _)| *lapses)
-                            .unwrap_or(0),
-                    )
-                } else {
-                    (
-                        1,
-                        previous
-                            .as_ref()
-                            .map(|(_, lapses, _, _)| *lapses)
-                            .unwrap_or(0)
-                            + 1,
-                    )
-                };
-                let due_at = now + interval_days * 86_400;
-
-                tx.execute(
-                    "INSERT INTO review_state (word_id, due_at, interval_days, lapses, last_grade)
-                     VALUES (?1, ?2, ?3, ?4, ?5)
-                     ON CONFLICT(word_id) DO UPDATE SET
-                       due_at = excluded.due_at,
-                       interval_days = excluded.interval_days,
-                       lapses = excluded.lapses,
-                       last_grade = excluded.last_grade",
-                    params![word_id, due_at, interval_days, lapses, grade],
-                )?;
-            }
+            schedule_after_grade(&tx, word_id, correct, now)?;
 
             if correct {
                 correct_count += 1;
@@ -1747,6 +1717,283 @@ impl Db {
             due_count: due_count.max(0) as u32,
         })
     }
+
+    /// 导入一份 `dictation.result/v1`（见 `docs/share-publish.md` §9）。
+    ///
+    /// - 幂等：同一份内容只入账一次（`result_imports.import_key`）；
+    /// - 时间基准是 `parsed.finished_at`（旅途中的听写不会被推迟复习）；
+    /// - 词按 `(subject, text)` 归属；本机没有该词音频时片段留空，
+    ///   因此不会进入复习池（`has_clip` 过滤），但历史记录照常可查。
+    pub fn import_result(
+        &self,
+        parsed: &crate::result_import::ParsedImport,
+        clips: &crate::result_import::ClipIndex,
+    ) -> std::result::Result<ImportOutcome, crate::result_import::ImportError> {
+        use crate::result_import::ImportError;
+
+        let key = parsed.import_key();
+        let imported_at = now_secs();
+        let conn = self.conn().map_err(ImportError::Db)?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|err| ImportError::Db(err.into()))?;
+
+        if let Some(session_id) = tx
+            .query_row(
+                "SELECT session_id FROM result_imports WHERE import_key = ?1",
+                [&key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|err| ImportError::Db(err.into()))?
+        {
+            let (correct, wrong) = attempt_counts(&tx, &session_id).map_err(ImportError::Db)?;
+            return Ok(ImportOutcome {
+                status: ImportStatus::Duplicate,
+                session_id,
+                correct,
+                wrong,
+            });
+        }
+
+        // 同一科目、同一完成时刻但内容不同：多半是改过判定后重复导出。
+        let conflict: Option<String> = tx
+            .query_row(
+                "SELECT ri.session_id
+                   FROM result_imports ri
+                   JOIN sessions s ON s.id = ri.session_id
+                  WHERE s.subject = ?1 AND s.finished_at = ?2 AND ri.import_key <> ?3
+                  LIMIT 1",
+                params![parsed.subject, parsed.finished_at, key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| ImportError::Db(err.into()))?;
+        if conflict.is_some() {
+            return Err(ImportError::Conflict(
+                "同一时间的听写结果已存在但内容不同；确认是否重复导出后再导入".to_string(),
+            ));
+        }
+
+        // 只有本机确实存在的课时才写入 lesson_id，避免悬挂引用。
+        let lesson_id = match parsed.lesson_id.as_deref() {
+            Some(id) if lesson_exists(&tx, id).map_err(ImportError::Db)? => Some(id.to_string()),
+            _ => None,
+        };
+
+        let session_id = uuid::Uuid::new_v4().to_string();
+        tx.execute(
+            "INSERT INTO sessions
+               (id, kind, lesson_id, subject, grade, term, title, created_at, finished_at)
+             VALUES (?1, 'imported', ?2, ?3, NULL, NULL, ?4, ?5, ?5)",
+            params![
+                session_id,
+                lesson_id,
+                parsed.subject,
+                parsed.title,
+                parsed.finished_at
+            ],
+        )
+        .map_err(|err| ImportError::Db(err.into()))?;
+
+        let mut correct = 0_u32;
+        let mut wrong = 0_u32;
+        for item in &parsed.items {
+            let word_id = ensure_import_word(&tx, &parsed.subject, item, parsed.finished_at, clips)
+                .map_err(ImportError::Db)?;
+            let (clip_lesson, clip_path, duration_ms, gap_ms, repeat) =
+                word_clip_columns(&tx, word_id).map_err(ImportError::Db)?;
+            tx.execute(
+                "INSERT INTO session_items
+                   (session_id, position, text, lang, clip_lesson, clip_path,
+                    duration_ms, gap_ms, repeat, repeat_gap_ms, is_review)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1200, ?10)",
+                params![
+                    session_id,
+                    item.position as i64,
+                    item.text,
+                    item.lang,
+                    clip_lesson,
+                    clip_path,
+                    duration_ms as i64,
+                    gap_ms as i64,
+                    repeat as i64,
+                    i64::from(item.review),
+                ],
+            )
+            .map_err(|err| ImportError::Db(err.into()))?;
+
+            let grade = if item.correct { "good" } else { "again" };
+            tx.execute(
+                "INSERT INTO attempts (session_id, position, word_id, grade, source, created_at)
+                 VALUES (?1, ?2, ?3, ?4, 'import', ?5)",
+                params![
+                    session_id,
+                    item.position as i64,
+                    word_id,
+                    grade,
+                    parsed.finished_at
+                ],
+            )
+            .map_err(|err| ImportError::Db(err.into()))?;
+
+            schedule_after_grade(&tx, word_id, item.correct, parsed.finished_at)
+                .map_err(ImportError::Db)?;
+
+            if item.correct {
+                correct += 1;
+            } else {
+                wrong += 1;
+            }
+        }
+
+        tx.execute(
+            "INSERT INTO result_imports (import_key, session_id, created_at)
+             VALUES (?1, ?2, ?3)",
+            params![key, session_id, imported_at],
+        )
+        .map_err(|err| ImportError::Db(err.into()))?;
+        tx.commit().map_err(|err| ImportError::Db(err.into()))?;
+
+        Ok(ImportOutcome {
+            status: ImportStatus::Imported,
+            session_id,
+            correct,
+            wrong,
+        })
+    }
+}
+
+/// 导入结果的状态：首次入账 / 重复导入。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportStatus {
+    Imported,
+    Duplicate,
+}
+
+impl ImportStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ImportStatus::Imported => "imported",
+            ImportStatus::Duplicate => "duplicate",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ImportOutcome {
+    pub status: ImportStatus,
+    pub session_id: String,
+    pub correct: u32,
+    pub wrong: u32,
+}
+
+fn attempt_counts(conn: &Connection, session_id: &str) -> Result<(u32, u32)> {
+    let (correct, wrong): (i64, i64) = conn.query_row(
+        "SELECT COALESCE(SUM(grade = 'good'), 0), COALESCE(SUM(grade = 'again'), 0)
+           FROM attempts WHERE session_id = ?1",
+        [session_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok((correct.max(0) as u32, wrong.max(0) as u32))
+}
+
+fn lesson_exists(conn: &Connection, lesson_id: &str) -> Result<bool> {
+    let found: Option<i64> = conn
+        .query_row("SELECT 1 FROM lessons WHERE id = ?1", [lesson_id], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    Ok(found.is_some())
+}
+
+/// 导入的词：已存在就复用（保留本机音源），不存在则建一条无音源的记录。
+fn ensure_import_word(
+    conn: &Connection,
+    subject: &str,
+    item: &crate::result_import::ImportItem,
+    at: i64,
+    clips: &crate::result_import::ClipIndex,
+) -> Result<i64> {
+    if let Some(id) = conn
+        .query_row(
+            "SELECT id FROM words WHERE subject = ?1 AND text = ?2",
+            params![subject, item.text],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+    {
+        return Ok(id);
+    }
+    // 新词：优先用本机课时清单里的片段（导入方通常还没在本机做过这一课）
+    match clips.get(&item.text) {
+        Some(clip) => {
+            conn.execute(
+                "INSERT INTO words
+                   (subject, text, lang, clip_lesson, clip_path, duration_ms, gap_ms,
+                    repeat, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    subject,
+                    item.text,
+                    item.lang,
+                    clip.clip_lesson,
+                    clip.clip_path,
+                    clip.duration_ms as i64,
+                    clip.gap_ms as i64,
+                    clip.repeat as i64,
+                    at,
+                ],
+            )?;
+        }
+        None => {
+            conn.execute(
+                "INSERT INTO words
+                   (subject, text, lang, clip_lesson, clip_path, duration_ms, gap_ms,
+                    repeat, updated_at)
+                 VALUES (?1, ?2, ?3, NULL, NULL, NULL, NULL, NULL, ?4)",
+                params![subject, item.text, item.lang, at],
+            )?;
+        }
+    }
+    Ok(conn.last_insert_rowid())
+}
+
+/// 片段字段原始行：`clip_lesson, clip_path, duration_ms, gap_ms, repeat`。
+type WordClipRow = (
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+);
+
+/// 导入的会话沿用该词在本机的片段信息；没有音频则留空（不进复习池）。
+fn word_clip_columns(conn: &Connection, word_id: i64) -> Result<(String, String, u32, u32, u8)> {
+    let row: Option<WordClipRow> = conn
+        .query_row(
+            "SELECT clip_lesson, clip_path, duration_ms, gap_ms, repeat
+               FROM words WHERE id = ?1",
+            [word_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let (clip_lesson, clip_path, duration_ms, gap_ms, repeat) = row.unwrap_or_default();
+    Ok((
+        clip_lesson.unwrap_or_default(),
+        clip_path.unwrap_or_default(),
+        duration_ms.unwrap_or(0).max(0) as u32,
+        gap_ms.unwrap_or(0).max(0) as u32,
+        repeat.unwrap_or(1).clamp(1, 10) as u8,
+    ))
 }
 
 fn session_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionSummary> {
@@ -1799,6 +2046,66 @@ pub fn lang_str(lang: Lang) -> &'static str {
 }
 
 /// Next interval for a correct answer: 1→2→4→7→15→30, capped at 30.
+/// 按判分更新复习调度（`check_session` 与结果导入共用）。
+///
+/// `at` 是该次练习实际发生的时间：实时检查用 `now`，导入用 `finished_at`。
+/// Early practice（未到期且不是待纠正错词）答对不推进间隔；答错照常回退。
+fn schedule_after_grade(conn: &Connection, word_id: i64, correct: bool, at: i64) -> Result<()> {
+    let previous: Option<(i64, i64, i64, String)> = conn
+        .query_row(
+            "SELECT interval_days, lapses, due_at, last_grade
+             FROM review_state WHERE word_id = ?1",
+            [word_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+
+    let normal_review = previous
+        .as_ref()
+        .map(|(_, _, due_at, last_grade)| last_grade == "again" || *due_at <= at)
+        .unwrap_or(true);
+    if correct && !normal_review {
+        return Ok(());
+    }
+
+    let (interval_days, lapses) = if correct {
+        let next = match previous.as_ref() {
+            None => 2,
+            Some((current, _, _, _)) => next_interval(*current),
+        };
+        (
+            next,
+            previous
+                .as_ref()
+                .map(|(_, lapses, _, _)| *lapses)
+                .unwrap_or(0),
+        )
+    } else {
+        (
+            1,
+            previous
+                .as_ref()
+                .map(|(_, lapses, _, _)| *lapses)
+                .unwrap_or(0)
+                + 1,
+        )
+    };
+    let due_at = at + interval_days * 86_400;
+    let grade = if correct { "good" } else { "again" };
+
+    conn.execute(
+        "INSERT INTO review_state (word_id, due_at, interval_days, lapses, last_grade)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(word_id) DO UPDATE SET
+           due_at = excluded.due_at,
+           interval_days = excluded.interval_days,
+           lapses = excluded.lapses,
+           last_grade = excluded.last_grade",
+        params![word_id, due_at, interval_days, lapses, grade],
+    )?;
+    Ok(())
+}
+
 fn next_interval(current: i64) -> i64 {
     for interval in REVIEW_INTERVALS {
         if interval > current {
@@ -3246,5 +3553,173 @@ CREATE INDEX IF NOT EXISTS idx_review_due ON review_state(due_at);
                 "dictation.db.bak-v1-20260104T000000Z".to_string(),
             ]
         );
+    }
+
+    // ---- 分享结果导入（v5） ----
+
+    fn import_payload(finished_at: &str, wrong_first: bool) -> String {
+        format!(
+            r#"{{
+              "schema": "dictation.result/v1",
+              "lesson": {{ "lesson_id": "l1", "content_hash": "sha256:abc",
+                           "title": "第5课", "subject": "chinese" }},
+              "session": {{ "kind": "lesson", "started_at": "2026-11-19T10:00:00+08:00",
+                            "finished_at": "{finished_at}", "device": "iPad", "student": "" }},
+              "items": [
+                {{ "position": 1, "text": "摇晃", "lang": "zh", "review": false,
+                   "correct": {} }},
+                {{ "position": 2, "text": "粗壮", "lang": "zh", "review": false,
+                   "correct": true }}
+              ]
+            }}"#,
+            if wrong_first { "false" } else { "true" }
+        )
+    }
+
+    fn parse_import(json: &str) -> crate::result_import::ParsedImport {
+        crate::result_import::parse(json.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn import_result_is_idempotent() {
+        let db = Db::open_in_memory().unwrap();
+        let parsed = parse_import(&import_payload("2026-11-19T10:05:12+08:00", true));
+
+        let first = db
+            .import_result(&parsed, &crate::result_import::ClipIndex::default())
+            .unwrap();
+        assert_eq!(first.status, ImportStatus::Imported);
+        assert_eq!((first.correct, first.wrong), (1, 1));
+
+        let second = db
+            .import_result(&parsed, &crate::result_import::ClipIndex::default())
+            .unwrap();
+        assert_eq!(second.status, ImportStatus::Duplicate);
+        assert_eq!(second.session_id, first.session_id);
+        assert_eq!((second.correct, second.wrong), (1, 1));
+
+        let conn = db.conn().unwrap();
+        let sessions: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        let attempts: i64 = conn
+            .query_row("SELECT COUNT(*) FROM attempts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(sessions, 1, "重复导入不新建 session");
+        assert_eq!(attempts, 2, "重复导入不重复写 attempts");
+        let sources: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT DISTINCT source FROM attempts")
+                .unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(sources, vec!["import".to_string()]);
+    }
+
+    #[test]
+    fn import_schedules_from_finished_at_and_marks_words() {
+        let db = Db::open_in_memory().unwrap();
+        let parsed = parse_import(&import_payload("2026-11-19T10:05:12+08:00", true));
+        let outcome = db
+            .import_result(&parsed, &crate::result_import::ClipIndex::default())
+            .unwrap();
+
+        {
+            let conn = db.conn().unwrap();
+            let (due_at, interval, lapses, grade): (i64, i64, i64, String) = conn
+                .query_row(
+                    "SELECT r.due_at, r.interval_days, r.lapses, r.last_grade
+                       FROM review_state r JOIN words w ON w.id = r.word_id
+                      WHERE w.text = '摇晃'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(grade, "again");
+            assert_eq!(interval, 1);
+            assert_eq!(lapses, 1);
+            assert_eq!(due_at, parsed.finished_at + 86_400, "以完成时刻为基准");
+        }
+
+        let result = db.session_result(&outcome.session_id).unwrap().unwrap();
+        assert_eq!(result.summary.item_count, 2);
+        assert_eq!(result.summary.correct, 1);
+        assert_eq!(result.summary.wrong, 1);
+        assert_eq!(result.wrong_words.len(), 1);
+        assert_eq!(result.wrong_words[0].text, "摇晃");
+    }
+
+    #[test]
+    fn imported_word_without_local_audio_stays_out_of_review_pool() {
+        let db = Db::open_in_memory().unwrap();
+        let parsed = parse_import(&import_payload("2026-11-19T10:05:12+08:00", true));
+        db.import_result(&parsed, &crate::result_import::ClipIndex::default())
+            .unwrap();
+
+        let pool = db
+            .review_items_for_mix("chinese", 10, &[])
+            .unwrap_or_default();
+        assert!(pool.is_empty(), "没有本机片段的词不进复习池");
+        let summary = db.review_summary().unwrap();
+        assert_eq!(
+            summary.review_count, 0,
+            "待复习统计与复习池一致，只算能播的词"
+        );
+    }
+
+    #[test]
+    fn same_finished_at_with_different_verdict_conflicts() {
+        let db = Db::open_in_memory().unwrap();
+        let first = parse_import(&import_payload("2026-11-19T10:05:12+08:00", true));
+        db.import_result(&first, &crate::result_import::ClipIndex::default())
+            .unwrap();
+
+        let second = parse_import(&import_payload("2026-11-19T10:05:12+08:00", false));
+        let err = db
+            .import_result(&second, &crate::result_import::ClipIndex::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::result_import::ImportError::Conflict(_)
+        ));
+    }
+
+    #[test]
+    fn import_uses_clip_index_for_new_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let lesson = dir.path().join("第5课");
+        fs::create_dir_all(&lesson).unwrap();
+        fs::write(
+            lesson.join("manifest.json"),
+            r#"{
+              "version": 1, "title": "第5课", "subject": "chinese",
+              "generated_at": "2026-11-19T10:00:00+08:00",
+              "defaults": {"gap_ms": 6000, "repeat": 2, "repeat_gap_ms": 1200,
+                           "lead_in_ms": 3000, "intro_gap_ms": 1500},
+              "items": [
+                {"index": 1, "text": "摇晃", "lang": "zh",
+                 "clips": [{"path": "clips/01-a.wav", "duration_ms": 1000}],
+                 "repeat": 2, "repeat_gap_ms": 1200, "gap_ms": 6000},
+                {"index": 2, "text": "粗壮", "lang": "zh",
+                 "clips": [{"path": "clips/02-b.wav", "duration_ms": 900}],
+                 "repeat": 2, "repeat_gap_ms": 1200, "gap_ms": 6000}
+              ],
+              "total_ms": 20000
+            }"#,
+        )
+        .unwrap();
+
+        let db = Db::open_in_memory().unwrap();
+        let parsed = parse_import(&import_payload("2026-11-19T10:05:12+08:00", true));
+        let clips = crate::result_import::ClipIndex::scan(dir.path(), "chinese");
+        db.import_result(&parsed, &clips).unwrap();
+
+        let pool = db.review_items_for_mix("chinese", 10, &[]).unwrap();
+        assert_eq!(pool.len(), 1, "导入的词从课时清单补到了音源");
+        assert_eq!(pool[0].text, "摇晃");
+        assert_eq!(db.review_summary().unwrap().review_count, 1);
     }
 }

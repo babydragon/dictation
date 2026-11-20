@@ -80,22 +80,50 @@
 
 ## 播放器时间轴
 
+两个引擎，会话开始时优先「整轨」，失败自动回退；`?track=0` 可强制「分片」。
+施工说明见 [`playback-track.md`](playback-track.md)。
+
 ```
-sleep(lead_in)
-[intro] -> sleep(intro_gap)
-for item in items:
-  for r in 0..repeat:
-    play(item.clips[0])
-    if r < repeat-1: sleep(item.repeat_gap_ms)
-  sleep(item.gap_ms)
-[outro]
+lead_in
+→ [intro] → intro_gap
+→ item 0: clip × repeat（遍间 repeat_gap）→ gap
+→ item 1: ...
+→ [outro]
 done
 ```
 
-- 进度在每进入一个 item 时更新为 `index / total`；intro/outro 不占进度。
+### 整轨引擎（默认，C1）
+
+播放前把片段 + 静音在内存里拼成一条 WAV（`Blob`），交给独立的
+`<audio id="track">` 连续播放。节奏存在于音频样本里，不依赖 JS 定时器，
+因此熄屏 / 切 App 时不会被挂起。
+
+- 拼接用 manifest 的 `clips[0].path` 与 `duration_ms`；静音按毫秒精确写入。
+- 隐藏「听写节奏」的值沿用同一换算：插入静音 = 设定毫秒 − 80ms（片段自带
+  20ms 前导 + 60ms 尾音）。
+- 进度以 `trackEl.currentTime` 为准（`starts[]` 二分），不用计时器推算；
+  熄屏恢复后按 `currentTime` 校正，`ended` 不派发时用「接近结尾」兜底。
+- 暂停 / 继续：`trackEl.pause()` / `play()`；`visibilitychange=hidden` **不暂停**。
+- 上一个 / 下一个 / 重听：`seek(starts[i])`；重听会从该词起点走完（含 repeat 与 gap）。
+- 长按重掷：只重建该 item 的 chunk，重算后续 `starts[]`，换 Blob 后 seek 回原位。
+- 锁屏 / 通知栏媒体卡片：设置 `MediaSession.metadata`（标题 = 课时标题），
+  播放/暂停按键仍由系统默认媒体控制处理。
+- 回退条件：片段 404、WAV 非 `24k/mono/s16`、整轨 >32MB、`play()` 报错、
+  环境无 `Blob`/`createObjectURL`。回退时提示「改用逐词播放」，本会话不再尝试。
+
+### 分片引擎（回退）
+
+`sleep(lead_in)` → `[intro]` → 逐 item：`play(clip)` × repeat（遍间 sleep）→
+`sleep(gap)` → `[outro]`。
+
+- 进度在每进入一个 item 时更新；intro/outro 不占进度。
+- 暂停：暂停当前 audio；若在 sleep 中，睡眠循环暂停计时。
+- 重听：单独播当前 clip 一次后恢复，不改变进度。
+- `visibilitychange=hidden` 时自动暂停（旧行为，仅此引擎）。
+
+### 共用
+
 - 播放中不显示词。
-- 暂停：暂停当前 audio；若在 sleep 中，睡眠循环暂停计时；继续时恢复。
-- 重听当前词：暂停主流程，单独播当前 item 的 clip 一次，结束后恢复；不改变进度。
 - 再听一遍：从第一个 item 重新播放（同一 session_id，不重新创建 session）。
 - 播放失败（404/解码失败）：显示“音频加载失败”，提供返回首页。
 
@@ -104,8 +132,18 @@ done
 - `localStorage` 存 `{sessionId, manifest, index, savedAt}`；每个 item 开始、暂停、
   `pagehide`/`visibilitychange` 时更新。
 - 首页显示「继续上次听写」（标题 + `3 / 20` + 时间），7 天过期。
-- 从保存的 item 继续，跳过 lead-in/intro；完成、提交检查、清除、音频失败时删除。
+- 从保存的 item 继续：整轨引擎照常拼整条后 `seek(starts[i])`（不从头裁剪）；
+  分片引擎跳过 lead-in/intro 后从第 i 项开始；完成、提交检查、清除、音频失败时删除。
 - 「不继续」需二次确认。
+- **课时删除 / 重建时的进度校验**（首页渲染时执行，仅课时列表加载成功后）：
+  - 课时不存在（被删除）→ 清除进度 + toast「原课时已删除，进度已清除」，卡片不渲染；
+  - server 模式：**续播不重放本地 manifest**，而是对当前课时新建会话
+    （`POST /api/sessions`），按保存的词序号跳转（越界夹取）。因此重建后
+    自动使用新词表；混入的复习词可能与中断时不同，词序号语义不变；
+  - static 模式：manifest 即当前发布数据，校验 `content_hash` 与
+    `index.json` 一致，不一致 → 清除进度 + toast「课时已更新，进度已重置」；
+  - 离线（课时列表加载失败）时不校验，保留卡片；
+  - 复习/自定义会话（无法定位课时）不校验，维持旧行为。
 
 ## 检查页
 

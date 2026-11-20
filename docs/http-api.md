@@ -85,6 +85,15 @@ dictation serve \
 - v3 → v4：只加索引，不改表结构：
   `CREATE INDEX IF NOT EXISTS idx_attempts_word ON attempts(word_id, created_at)`，
   供「距上次练习最久」排序使用（见 `review-scheduling.md` §4.2）。
+- v4 → v5：新增 `result_imports`（分享结果导入的幂等键）：
+
+```sql
+CREATE TABLE result_imports (
+  import_key TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+```
 
 ```sql
 CREATE TABLE IF NOT EXISTS lessons (
@@ -493,6 +502,8 @@ agent 不持有 TTS 密钥、也不需要文件系统权限：导入与合成全
   - `POST /api/lessons/{id}/generate`
   - `POST /api/lessons/{id}/regenerate-word`
   - `POST /api/lessons/{id}/delete`
+  - `POST /api/lessons/{id}/publish`
+  - `POST /api/results/import`
   - `POST /api/lessons/{id}/generate/cancel`
 
 ### `POST /api/lessons`
@@ -612,6 +623,71 @@ body 全部可选：
   **同科目同文本**的片段；没有任何课还包含该词时才清空 clip（退出复习池）。
 - 拒绝删除 `lessons/` 之外的路径；先更新 DB 再删目录，DB 失败时文件和计划都还在，可重跑。
 
+### `POST /api/lessons/{id}/publish`
+
+把课时增量发布到 Cloudflare R2（F8，契约见 [`share-publish.md`](share-publish.md)）。
+同步返回（R2 操作秒级）。未配置 `config.toml [publish]` 时 `503`。
+受 `X-Dictation-Token` 保护（鉴权先于 body 解析）。
+
+body 全部可选（空 body = 默认值）：
+
+```json
+{ "force": false, "with_full": false, "dry_run": false }
+```
+
+| 字段 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `force` | bool | `false` | 远端 `content_hash` 相同也重新上传全部对象 |
+| `with_full` | bool | `false` | 额外上传 `full.mp3`（不传 `full.wav`） |
+| `dry_run` | bool | `false` | 只统计将要上传的对象，不写入 |
+
+- `{id}` 解析同 `generate`（目录名优先，其次 12 位课时 id）；不存在 → `404`。
+- 成功 `200`（首次发布）：
+
+```json
+{
+  "lesson_id": "049edc3427d6",
+  "title": "第5课 词语听写",
+  "status": "published",
+  "dry_run": false,
+  "uploaded": 22,
+  "skipped": 0,
+  "index_updated": true,
+  "url": "https://dictation.example.com/?l=049edc3427d6"
+}
+```
+
+- 内容未变时 `200`（幂等，不写任何对象）：
+
+```json
+{ "lesson_id": "049edc3427d6", "title": "第5课 词语听写", "status": "skipped",
+  "dry_run": false, "uploaded": 0, "skipped": 22, "index_updated": false,
+  "url": "https://dictation.example.com/?l=049edc3427d6" }
+```
+
+| 字段 | 类型 | 可空 | 说明 |
+|---|---|---|---|
+| `lesson_id` | string | 否 | 12 位课时 id |
+| `title` | string | 否 | 课时标题 |
+| `status` | string | 否 | `published` / `skipped` |
+| `dry_run` | bool | 否 | 本次是否为 dry-run |
+| `uploaded` | number | 否 | 本次 PUT 的对象数（dry-run = 将要上传数） |
+| `skipped` | number | 否 | 远端已存在而跳过的对象数 |
+| `index_updated` | bool | 否 | `lessons/index.json` 是否被重写（skipped 恒为 false） |
+| `url` | string | 是 | 配置了 `pages_base` 时才有该字段 |
+
+错误：
+
+- `503 {"error":"未配置发布目标（config.toml [publish]）"}`
+- `404 {"error":"课时不存在"}`
+- `400 {"error":"local: 片段缺失：… 不存在；先运行 dictation gen 重新生成","stage":"local","uploaded":0,"committed":false}`
+- `502 {"error":"clips: R2 返回 403：…","stage":"clips","uploaded":3,"committed":false}`
+  （`stage` ∈ `local|clips|commit|index`；`committed=true` 表示 `lesson.json` 已提交，
+  重跑是幂等安全的）
+
+CLI 等价：`dictation publish <课时> [--dry-run] [--force] [--with-full] [--json]`；
+省略课时 = 发布全部（`--json` 输出 `{results:[…],failures:[…]}`）。
+
 ### `GET /api/lessons/duplicates`
 
 按 `(subject, title)` 分组的重复课时，用于“重新导入后删旧的”这种清理。
@@ -620,6 +696,69 @@ body 全部可选：
 { "duplicates": [ { "subject": "chinese", "title": "第5课",
   "lessons": [{ "dir": "第5课-新", "id": "1a80eda4e5ef", "item_count": 2, "total_ms": 19952 }] } ] }
 ```
+
+### `POST /api/results/import`
+
+导入一份 `dictation.result/v1`（F8 闭环；格式见
+[`share-publish.md`](share-publish.md) §9.1）。幂等：同一份内容重复导入返回
+`duplicate`，不重复写 `attempts` / `review_state`。受 `X-Dictation-Token` 保护。
+
+请求体就是导出文件本身（示例截断）：
+
+```json
+{
+  "schema": "dictation.result/v1",
+  "lesson": { "lesson_id": "049edc3427d6", "content_hash": "sha256:9f2c…",
+              "title": "第5课", "subject": "chinese",
+              "url": "https://audio.example.com/lessons/049edc3427d6/lesson.json" },
+  "session": { "kind": "lesson", "started_at": "2026-11-19T10:00:00+08:00",
+               "finished_at": "2026-11-19T10:05:12+08:00",
+               "device": "iPad", "student": "" },
+  "items": [ { "position": 1, "text": "摇晃", "lang": "zh",
+               "review": false, "correct": false } ]
+}
+```
+
+| 字段 | 类型 | 必填 | 规则 |
+|---|---|---|---|
+| `schema` | string | 是 | 必须等于 `dictation.result/v1` |
+| `lesson.subject` | string | 是 | `chinese` / `english` |
+| `lesson.content_hash` | string | 否 | 用于提示旧版本；缺省视为空 |
+| `lesson.title` | string | 否 | 空则记「导入的听写」 |
+| `session.finished_at` | string | 是 | RFC3339；未来 >5 分钟钳制为当前时刻 |
+| `session.started_at` | string | 否 | RFC3339，仅校验 |
+| `items[].position` | number | 是 | 从 1 开始、唯一 |
+| `items[].text` | string | 是 | 去首尾空白后非空，≤200 字符 |
+| `items[].lang` | string | 否 | `zh`/`en`/`mixed`，缺省按文本推断 |
+| `items[].correct` | bool | 是 | — |
+
+- 成功 `200`（首次 / 重复）：
+
+```json
+{ "status": "imported", "session_id": "5b0d…", "correct": 19, "wrong": 1, "review_count": 3 }
+```
+
+```json
+{ "status": "duplicate", "session_id": "5b0d…", "correct": 19, "wrong": 1, "review_count": 3 }
+```
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `status` | string | `imported` / `duplicate` |
+| `session_id` | string | 新建（或已存在）的 session id |
+| `correct` / `wrong` | number | 本次结果的对错数 |
+| `review_count` | number | 导入后该库的待复习总数（与首页一致） |
+
+- 落库：`sessions.kind='imported'`、`attempts.source='import'`，时间基准是
+  `finished_at`（不是导入时刻）；词按 `(subject, text)` 归属。
+- 音源解析：本机已有该词 → 沿用；本机课时清单里有 → 用清单片段补上；
+  都没有（外来课时）→ 片段留空，历史可查但**不进复习池**（`has_clip` 过滤）。
+- 错误：
+  - `400 {"error":"结果 JSON 解析失败：…"}` / `不支持的格式` / `items 不能为空` 等
+  - `409 {"error":"同一时间的听写结果已存在但内容不同；确认是否重复导出后再导入"}`
+  - `401 {"error":"未授权"}`（设置了 `DICTATION_API_TOKEN` 时）
+
+CLI 等价：`dictation result import <file|-> [--json]`（输出同一结构）。
 
 ### `GET /api/jobs/{job_id}`
 

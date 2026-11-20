@@ -1242,6 +1242,23 @@ textarea {
   font-size: 17px;
 }
 
+/* 导出结果（静态模式）：只读 JSON 文本 */
+.export-text {
+  width: 100%;
+  min-height: 38vh;
+  padding: 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--paper-2);
+  color: var(--ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  resize: none;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
 .toast {
   position: fixed;
   left: 50%;
@@ -1303,4 +1320,31 @@ textarea {
     animation-iteration-count: 1 !important;
     transition-duration: 0.001ms !important;
   }
+}
+
+/* 导入结果（家长面板）：入口按钮与表单 */
+.import-entry {
+  margin-top: 14px;
+}
+
+.import-file {
+  width: 100%;
+  margin: 10px 0 12px;
+  padding: 10px;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--paper-2);
+  color: var(--ink-2);
+  font-size: 14px;
+}
+
+.import-text {
+  min-height: 22vh;
+}
+
+.import-status {
+  min-height: 1.4em;
+  margin: 10px 0 0;
+  color: var(--ink-2);
+  font-size: 14px;
 }

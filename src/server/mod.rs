@@ -1,6 +1,7 @@
 //! HTTP service: lesson list, sessions, review scheduling and media.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -27,6 +28,7 @@ use crate::db::{self, CheckError, CustomSessionError, Db, NewItem, SessionRecord
 use crate::lesson::import as lesson_import;
 use crate::manifest::{Manifest, ManifestClip, ManifestDefaults};
 use crate::model::{ProviderKind, Subject};
+use crate::publish;
 use crate::render::{self, RenderOptions};
 use crate::result_view;
 use crate::tts;
@@ -55,6 +57,23 @@ pub struct ServeOptions {
     pub cache_dir: PathBuf,
     pub host: String,
     pub port: u16,
+    /// F8 发布运行时；None = 未配置（发布端点 503）。
+    pub publish: Option<Arc<PublishState>>,
+}
+
+/// 发布的进程内状态：设置、对象存储客户端、串行锁。
+#[derive(Debug)]
+pub struct PublishState {
+    pub settings: publish::PublishSettings,
+    pub store: std::sync::Arc<dyn publish::ObjectStore>,
+    /// 发布串行化（契约 §5.4：单写者）。
+    pub serial: tokio::sync::Mutex<()>,
+}
+
+impl fmt::Debug for dyn publish::ObjectStore + '_ {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ObjectStore")
+    }
 }
 
 pub async fn serve(opts: ServeOptions) -> Result<()> {
@@ -132,6 +151,7 @@ pub async fn build_router(opts: ServeOptions) -> Result<Router> {
         jobs: Arc::new(Mutex::new(JobRegistry::default())),
         gen_permits: Arc::new(Semaphore::new(1)),
         api_token,
+        publish: opts.publish,
     };
     Ok(router(state))
 }
@@ -177,6 +197,7 @@ fn router(state: AppState) -> Router {
         .route("/api/lessons/{id}/generate", post(generate_lesson))
         .route("/api/lessons/{id}/regenerate-word", post(regenerate_word))
         .route("/api/lessons/{id}/delete", post(delete_lesson))
+        .route("/api/lessons/{id}/publish", post(publish_lesson_http))
         .route("/api/lessons/duplicates", get(duplicate_lessons))
         .route("/api/lessons/{id}/generate/cancel", post(cancel_generation))
         .route("/api/jobs/{id}", get(get_job))
@@ -186,6 +207,7 @@ fn router(state: AppState) -> Router {
         .route("/api/results", get(list_results))
         .route("/api/results/latest", get(latest_result))
         .route("/api/results/latest/wrong", get(latest_result_wrong))
+        .route("/api/results/import", post(import_result_http))
         .route("/api/results/{id}", get(result_detail))
         .route("/api/results/{id}/wrong", get(result_wrong))
         .route("/api/sessions", post(create_session))
@@ -210,6 +232,7 @@ struct AppState {
     jobs: Arc<Mutex<JobRegistry>>,
     gen_permits: Arc<Semaphore>,
     api_token: Option<Arc<str>>,
+    publish: Option<Arc<PublishState>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -756,6 +779,84 @@ fn map_delete_error(err: crate::lesson::delete::DeleteError) -> ApiError {
     match err {
         crate::lesson::delete::DeleteError::NotFound => ApiError::not_found("课时不存在"),
         crate::lesson::delete::DeleteError::Other(err) => ApiError::internal(err),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// F8 发布（docs/share-publish.md §5 / §10 / §11）
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default, Deserialize)]
+struct PublishRequestBody {
+    /// 远端 content_hash 相同也重新上传。
+    #[serde(default)]
+    force: bool,
+    /// 额外上传 `full.mp3`。
+    #[serde(default)]
+    with_full: bool,
+    /// 只统计将要上传的对象，不写入。
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// `POST /api/lessons/{id}/publish`：同步发布（R2 操作为秒级）。
+///
+/// `{id}` 支持目录名与 12 位课时 id（与 generate 一致）；未配置 `[publish]` 时 503。
+async fn publish_lesson_http(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    UrlPath(id): UrlPath<String>,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    // token 优先于 body 解析（同其它写端点）
+    authorize(&state, &headers)?;
+
+    let Some(publish) = state.publish.clone() else {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            publish::PublishSettings::unconfigured_error(),
+        ));
+    };
+
+    let body: PublishRequestBody = if body.iter().all(u8::is_ascii_whitespace) {
+        PublishRequestBody::default()
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|err| ApiError::bad_request(format!("请求体无效：{err}")))?
+    };
+
+    let options = publish::PublishOptions {
+        force: body.force,
+        with_full: body.with_full,
+        dry_run: body.dry_run,
+    };
+
+    let _serial = publish.serial.lock().await;
+    match publish::publish_lesson(
+        publish.store.as_ref(),
+        &publish.settings,
+        &state.lessons_dir,
+        &id,
+        options,
+        None,
+    )
+    .await
+    {
+        Ok(outcome) => Ok(Json(outcome.to_json())),
+        Err(err) => {
+            if err.stage == publish::Stage::Local && err.message.contains("课时不存在") {
+                return Err(ApiError::not_found("课时不存在"));
+            }
+            let status = match err.stage {
+                publish::Stage::Local => StatusCode::BAD_REQUEST,
+                _ => StatusCode::BAD_GATEWAY,
+            };
+            Err(ApiError::new(status, format!("{err}")).with_extra(json!({
+                "stage": err.stage.as_str(),
+                "uploaded": err.uploaded,
+                "committed": err.committed,
+            })))
+        }
     }
 }
 
@@ -2106,6 +2207,51 @@ async fn check_session(
     })))
 }
 
+fn map_import_error(err: crate::result_import::ImportError) -> ApiError {
+    use crate::result_import::ImportError;
+    match err {
+        ImportError::BadRequest(message) => ApiError::bad_request(message),
+        ImportError::Conflict(message) => ApiError::conflict(message),
+        ImportError::Db(err) => ApiError::internal(err),
+    }
+}
+
+/// `POST /api/results/import`：导入一份 `dictation.result/v1`（F8 闭环）。
+/// 幂等：同一份内容重复导入返回 `duplicate`，不会重复写 attempts / 复习状态。
+async fn import_result_http(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    // 写操作：token 优先于 body 解析
+    authorize(&state, &headers)?;
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Err(ApiError::bad_request("请求体无效：请求体为空"));
+    }
+
+    let parsed = crate::result_import::parse(&body).map_err(map_import_error)?;
+    let lessons_dir = state.lessons_dir.clone();
+    let db = state.db.clone();
+    let outcome = run_db(db, move |db| {
+        // 导入时按课时清单补音源：新课时还没在家做过也能进复习池
+        let clips = crate::result_import::ClipIndex::scan(&lessons_dir, &parsed.subject);
+        db.import_result(&parsed, &clips).map_err(map_import_error)
+    })
+    .await?;
+    let review = run_db(state.db.clone(), move |db| {
+        db.review_summary().map_err(ApiError::internal)
+    })
+    .await?;
+
+    Ok(Json(json!({
+        "status": outcome.status.as_str(),
+        "session_id": outcome.session_id,
+        "correct": outcome.correct,
+        "wrong": outcome.wrong,
+        "review_count": review.review_count,
+    })))
+}
+
 async fn media(
     State(state): State<AppState>,
     UrlPath((lesson_id, rel)): UrlPath<(String, String)>,
@@ -2418,6 +2564,7 @@ mod tests {
             cache_dir: root.join("cache"),
             host: "127.0.0.1".to_string(),
             port: 0,
+            publish: None,
         }
     }
 
@@ -2433,7 +2580,191 @@ mod tests {
             jobs: Arc::new(Mutex::new(JobRegistry::default())),
             gen_permits: Arc::new(Semaphore::new(1)),
             api_token: token.map(Arc::from),
+            publish: None,
         }
+    }
+
+    fn test_state_with_publish(
+        opts: &ServeOptions,
+        store: std::sync::Arc<dyn crate::publish::ObjectStore>,
+        token: Option<&str>,
+    ) -> AppState {
+        fs::create_dir_all(&opts.lessons_dir).unwrap();
+        let db = Db::open(&opts.data_path).unwrap();
+        let settings = crate::publish::PublishSettings {
+            enabled: true,
+            data_base: Some("https://audio.example.com".to_string()),
+            pages_base: Some("https://dictation.example.com".to_string()),
+            ..crate::publish::PublishSettings::default()
+        };
+        AppState {
+            db: Arc::new(db),
+            lessons_dir: opts.lessons_dir.clone(),
+            web_dir: opts.web_dir.clone(),
+            cache_dir: opts.cache_dir.clone(),
+            tts: None,
+            jobs: Arc::new(Mutex::new(JobRegistry::default())),
+            gen_permits: Arc::new(Semaphore::new(1)),
+            api_token: token.map(Arc::from),
+            publish: Some(Arc::new(PublishState {
+                settings,
+                store,
+                serial: tokio::sync::Mutex::new(()),
+            })),
+        }
+    }
+
+    /// 带清单与两个片段的临时课时（发布端点用）。
+    fn fixture_publishable_lesson(lessons_dir: &Path) -> String {
+        let dir = lessons_dir.join("测试课");
+        fs::create_dir_all(dir.join("clips")).unwrap();
+        fs::write(dir.join("clips/w0.wav"), b"RIFF").unwrap();
+        fs::write(dir.join("clips/w1.wav"), b"RIFF").unwrap();
+        fs::write(
+            dir.join("manifest.json"),
+            r#"{
+                "version": 1,
+                "title": "测试课",
+                "subject": "chinese",
+                "review_cap": 8,
+                "generated_at": "2026-11-19T10:00:00+08:00",
+                "defaults": {"gap_ms": 6000, "repeat": 1, "repeat_gap_ms": 1200,
+                             "lead_in_ms": 3000, "intro_gap_ms": 1500},
+                "items": [
+                    {"index": 1, "text": "苹果", "lang": "zh",
+                     "clips": [{"path": "clips/w0.wav", "duration_ms": 300}],
+                     "repeat": 1, "repeat_gap_ms": 1200, "gap_ms": 6000},
+                    {"index": 2, "text": "香蕉", "lang": "zh",
+                     "clips": [{"path": "clips/w1.wav", "duration_ms": 300}],
+                     "repeat": 1, "repeat_gap_ms": 1200, "gap_ms": 6000}
+                ],
+                "total_ms": 8000
+            }"#,
+        )
+        .unwrap();
+        crate::db::lesson_id("测试课")
+    }
+
+    #[tokio::test]
+    async fn publish_unconfigured_returns_503() {
+        let temp = tempfile::tempdir().unwrap();
+        let opts = test_opts(&temp);
+        let app = router(test_state(&opts, None, None));
+        let res = post(&app, "/api/lessons/nope/publish", json!({})).await;
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_json(res).await;
+        assert!(body["error"].as_str().unwrap().contains("未配置发布目标"));
+    }
+
+    #[tokio::test]
+    async fn publish_unknown_lesson_returns_404() {
+        let temp = tempfile::tempdir().unwrap();
+        let opts = test_opts(&temp);
+        let store = Arc::new(crate::publish::MemoryStore::default());
+        let app = router(test_state_with_publish(&opts, store, None));
+        let res = post(&app, "/api/lessons/nope/publish", json!({})).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn publish_uploads_and_then_skips() {
+        let temp = tempfile::tempdir().unwrap();
+        let opts = test_opts(&temp);
+        let id = fixture_publishable_lesson(&opts.lessons_dir);
+        let store = Arc::new(crate::publish::MemoryStore::default());
+        let app = router(test_state_with_publish(&opts, store.clone(), None));
+
+        let res = post(
+            &app,
+            format!("/api/lessons/{id}/publish").as_str(),
+            json!({}),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        assert_eq!(body["status"], "published");
+        assert_eq!(body["uploaded"], 2);
+        assert_eq!(body["skipped"], 0);
+        assert_eq!(body["index_updated"], true);
+        assert_eq!(
+            body["url"].as_str().unwrap(),
+            format!("https://dictation.example.com/?l={id}")
+        );
+        assert_eq!(store.object_count(), 2 + 1 + 1);
+
+        let res = post(
+            &app,
+            format!("/api/lessons/{id}/publish").as_str(),
+            json!({}),
+        )
+        .await;
+        let body = body_json(res).await;
+        assert_eq!(body["status"], "skipped");
+        assert_eq!(body["uploaded"], 0);
+        assert_eq!(body["skipped"], 2);
+    }
+
+    #[tokio::test]
+    async fn publish_requires_token_before_body() {
+        let temp = tempfile::tempdir().unwrap();
+        let opts = test_opts(&temp);
+        fixture_publishable_lesson(&opts.lessons_dir);
+        let store = Arc::new(crate::publish::MemoryStore::default());
+        let app = router(test_state_with_publish(&opts, store, Some("scret")));
+
+        // token 缺失 → 401，即使 body 非法
+        let res = app
+            .clone()
+            .oneshot(raw_req(
+                Method::POST,
+                "/api/lessons/测试课/publish",
+                Some("application/json"),
+                "not-json",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/lessons/测试课/publish")
+                    .header("x-dictation-token", "scret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"dry_run":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        assert_eq!(body["dry_run"], true);
+        assert_eq!(body["uploaded"], 2);
+        assert_eq!(body["skipped"], 0, "dry-run 不写入，只统计");
+    }
+
+    #[tokio::test]
+    async fn publish_endpoint_never_touches_private_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let opts = test_opts(&temp);
+        let id = fixture_publishable_lesson(&opts.lessons_dir);
+        fs::write(opts.lessons_dir.join("测试课").join("secret.txt"), b"nope").unwrap();
+        let store = Arc::new(crate::publish::MemoryStore::default());
+        let app = router(test_state_with_publish(&opts, store.clone(), None));
+        let res = post(
+            &app,
+            format!("/api/lessons/{id}/publish").as_str(),
+            json!({}),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let leaked = ["secret.txt", "manifest.json"]
+            .iter()
+            .any(|name| store.has(&format!("lessons/{id}/{name}")));
+        assert!(!leaked, "只发布 clips/ 与 lesson.json");
+        let id_key = crate::db::lesson_id("测试课");
+        assert!(store.has(&format!("lessons/{id_key}/lesson.json")));
     }
 
     fn mock_config(cache_dir: &Path) -> Arc<Config> {
@@ -4484,5 +4815,148 @@ mod tests {
         assert_eq!(json_type(&word["attempts"]), "number");
         assert_eq!(json_type(&word["due_at"]), "null", "未学过的词是 null");
         assert_keys(&word["sources"][0], &["id", "dir"]);
+    }
+
+    // ---- 分享结果导入（F8） ----
+
+    fn import_body(finished_at: &str, wrong_first: bool) -> String {
+        format!(
+            r#"{{
+              "schema": "dictation.result/v1",
+              "lesson": {{ "lesson_id": "aaa", "content_hash": "sha256:x",
+                           "title": "第5课", "subject": "chinese" }},
+              "session": {{ "kind": "lesson", "started_at": "2026-11-19T10:00:00+08:00",
+                            "finished_at": "{finished_at}", "device": "iPad", "student": "" }},
+              "items": [
+                {{ "position": 1, "text": "摇晃", "lang": "zh", "review": false, "correct": {} }},
+                {{ "position": 2, "text": "粗壮", "lang": "zh", "review": false, "correct": true }}
+              ]
+            }}"#,
+            if wrong_first { "false" } else { "true" }
+        )
+    }
+
+    #[tokio::test]
+    async fn import_endpoint_is_idempotent_and_reports_review_count() {
+        let temp = tempfile::tempdir().unwrap();
+        let opts = test_opts(&temp);
+        let app = router(test_state(&opts, None, None));
+
+        let res = app
+            .clone()
+            .oneshot(raw_req(
+                Method::POST,
+                "/api/results/import",
+                Some("application/json"),
+                &import_body("2026-11-19T10:05:12+08:00", true),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        assert_eq!(body["status"], "imported");
+        assert_eq!(body["correct"], 1);
+        assert_eq!(body["wrong"], 1);
+        assert_eq!(json_type(&body["session_id"]), "string");
+        assert_eq!(json_type(&body["review_count"]), "number");
+        assert_eq!(
+            body["review_count"], 0,
+            "导入词没有本机音频，不进待复习统计"
+        );
+
+        let res = app
+            .oneshot(raw_req(
+                Method::POST,
+                "/api/results/import",
+                Some("application/json"),
+                &import_body("2026-11-19T10:05:12+08:00", true),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        assert_eq!(body["status"], "duplicate");
+    }
+
+    #[tokio::test]
+    async fn import_endpoint_rejects_bad_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let opts = test_opts(&temp);
+        let app = router(test_state(&opts, None, None));
+        let res = app
+            .oneshot(raw_req(
+                Method::POST,
+                "/api/results/import",
+                Some("application/json"),
+                r#"{"schema":"nope","lesson":{},"session":{},"items":[]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(res).await;
+        assert_eq!(json_type(&body["error"]), "string");
+    }
+
+    #[tokio::test]
+    async fn import_endpoint_requires_token_before_body() {
+        let temp = tempfile::tempdir().unwrap();
+        let opts = test_opts(&temp);
+        let app = router(test_state(&opts, None, Some("scret")));
+
+        let res = app
+            .clone()
+            .oneshot(raw_req(
+                Method::POST,
+                "/api/results/import",
+                Some("application/json"),
+                "not-json",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/results/import")
+                    .header("x-dictation-token", "scret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(import_body("2026-11-19T10:05:12+08:00", true)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn import_endpoint_conflicts_on_edited_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let opts = test_opts(&temp);
+        let app = router(test_state(&opts, None, None));
+
+        let res = app
+            .clone()
+            .oneshot(raw_req(
+                Method::POST,
+                "/api/results/import",
+                Some("application/json"),
+                &import_body("2026-11-19T10:05:12+08:00", true),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = app
+            .oneshot(raw_req(
+                Method::POST,
+                "/api/results/import",
+                Some("application/json"),
+                &import_body("2026-11-19T10:05:12+08:00", false),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
     }
 }

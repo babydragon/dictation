@@ -28,6 +28,8 @@ pub struct AppConfig {
     pub web_dir: PathBuf,
     pub host: String,
     pub port: u16,
+    /// `[publish]` 段（F8 外网分享）；密钥只走环境变量。
+    pub publish: crate::publish::PublishSection,
     source: Option<PathBuf>,
 }
 
@@ -37,6 +39,8 @@ struct FileConfig {
     paths: PathsSection,
     #[serde(default)]
     server: ServerSection,
+    #[serde(default)]
+    publish: crate::publish::PublishSection,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -137,6 +141,7 @@ impl AppConfig {
             web_dir,
             host,
             port,
+            publish: file.publish,
             source,
         }
     }

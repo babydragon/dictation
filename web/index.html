@@ -126,6 +126,7 @@
       <p class="muted" id="result-note"></p>
       <div class="chips" id="result-words"></div>
       <div class="stack">
+        <button class="btn btn-secondary btn-xl" id="btn-export" type="button" hidden>导出结果</button>
         <button class="btn btn-primary btn-xl" id="btn-result-home" type="button">返回首页</button>
       </div>
     </div>
@@ -181,11 +182,34 @@
       <button class="btn btn-ghost" id="timing-reset" type="button">恢复默认</button>
       <button class="btn btn-primary" id="timing-save" type="button">保存</button>
     </div>
+    <button class="btn btn-ghost btn-block import-entry" id="timing-import" type="button">导入听写结果</button>
+  </div>
+</div>
+
+<!-- 导入结果（家长用：长按标题 → 听写节奏 → 导入听写结果） -->
+<div class="modal modal-top" id="import-modal" hidden>
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="import-title">
+    <div class="timing-head">
+      <h2 class="modal-title" id="import-title">导入听写结果</h2>
+      <button class="timing-close" id="import-close" type="button" aria-label="关闭">
+        <span aria-hidden="true">×</span>
+      </button>
+    </div>
+    <p class="modal-text">把孩子带回来的 JSON 文件选进来，或直接粘贴内容。</p>
+    <input class="import-file" id="import-file" type="file" accept=".json,application/json" />
+    <textarea class="export-text import-text" id="import-text"
+      aria-label="粘贴听写结果 JSON" placeholder="或在这里粘贴结果 JSON"></textarea>
+    <p class="import-status" id="import-status" role="status" aria-live="polite"></p>
+    <div class="modal-actions">
+      <button class="btn btn-primary btn-block" id="import-submit" type="button">导入</button>
+    </div>
   </div>
 </div>
 
 <audio id="audio" preload="auto" playsinline></audio>
+<audio id="track" preload="auto" playsinline></audio>
 
+<script src="config.js"></script>
 <script src="app.js" defer></script>
 </body>
 </html>

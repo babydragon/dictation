@@ -112,6 +112,23 @@ enum Command {
         #[command(subcommand)]
         command: ResultCommand,
     },
+    /// 发布课时到 Cloudflare（F8：Pages 壳 + R2 数据）
+    Publish {
+        /// 课时目录名或 12 位 id；省略则发布全部课时
+        lesson: Option<String>,
+        /// 只统计将要上传的对象，不写入
+        #[arg(long)]
+        dry_run: bool,
+        /// 远端内容相同也重新上传
+        #[arg(long)]
+        force: bool,
+        /// 额外上传 full.mp3
+        #[arg(long)]
+        with_full: bool,
+        /// 输出 JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// 清理片段缓存（默认 dry-run，需 --apply 才删除）
     Clean {
         /// 只清理没有被任何课时引用的条目
@@ -150,6 +167,14 @@ enum ResultCommand {
         /// 取最近一个已提交检查的 session
         #[arg(long)]
         latest: bool,
+        /// 输出 JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// 导入分享结果（dictation.result/v1）
+    Import {
+        /// 结果文件路径，或 - 表示从 stdin 读取
+        file: String,
         /// 输出 JSON
         #[arg(long)]
         json: bool,
@@ -314,6 +339,7 @@ async fn main() -> Result<()> {
                 cache_dir: app.cache_dir.clone(),
                 host: host.unwrap_or_else(|| app.host.clone()),
                 port: port.unwrap_or(app.port),
+                publish: build_publish_state(&app),
             };
             dictation::server::serve(options).await
         }
@@ -434,6 +460,9 @@ async fn main() -> Result<()> {
                 json,
                 cmd_result_show(&app, session_id.as_deref(), latest, json),
             ),
+            ResultCommand::Import { file, json } => {
+                with_json_errors(json, cmd_result_import(&app, &file, json))
+            }
             ResultCommand::Wrong {
                 session_id,
                 latest,
@@ -451,6 +480,16 @@ async fn main() -> Result<()> {
         } => with_json_errors(
             json,
             cmd_clean(&app, unused, older_than.as_deref(), apply, json),
+        ),
+        Command::Publish {
+            lesson,
+            dry_run,
+            force,
+            with_full,
+            json,
+        } => with_json_errors(
+            json,
+            cmd_publish(&app, lesson.as_deref(), dry_run, force, with_full, json).await,
         ),
     }
 }
@@ -1056,6 +1095,56 @@ fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
 }
 
+/// `dictation result import`：与 `POST /api/results/import` 共用解析与落库。
+fn cmd_result_import(app: &AppConfig, file: &str, json_output: bool) -> Result<()> {
+    use std::io::Read;
+
+    let bytes = if file == "-" {
+        let mut buf = Vec::new();
+        std::io::stdin()
+            .read_to_end(&mut buf)
+            .context("读取 stdin 失败")?;
+        buf
+    } else {
+        std::fs::read(file).with_context(|| format!("读取结果文件失败: {file}"))?
+    };
+
+    let parsed = dictation::result_import::parse(&bytes).map_err(|err| anyhow::anyhow!("{err}"))?;
+    let db = open_result_db(app)?;
+    let clips = dictation::result_import::ClipIndex::scan(&app.lessons_dir, &parsed.subject);
+    let outcome = db
+        .import_result(&parsed, &clips)
+        .map_err(|err| anyhow::anyhow!("{err}"))?;
+    let summary = db.review_summary()?;
+
+    if json_output {
+        println!(
+            "{}",
+            json!({
+                "status": outcome.status.as_str(),
+                "session_id": outcome.session_id,
+                "correct": outcome.correct,
+                "wrong": outcome.wrong,
+                "review_count": summary.review_count,
+            })
+        );
+    } else if outcome.status == dictation::db::ImportStatus::Duplicate {
+        println!(
+            "这份结果之前已经导入过（session {}）：{} 对 / {} 错",
+            outcome.session_id, outcome.correct, outcome.wrong
+        );
+    } else {
+        println!(
+            "已导入「{}」：{} 对 / {} 错（session {}）",
+            parsed.title, outcome.correct, outcome.wrong, outcome.session_id
+        );
+        if summary.review_count > 0 {
+            println!("待复习：{} 个词", summary.review_count);
+        }
+    }
+    Ok(())
+}
+
 fn open_result_db(app: &AppConfig) -> Result<Db> {
     let path = app.db_path();
     if !path.is_file() {
@@ -1362,6 +1451,126 @@ fn cmd_clean(
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// F8 发布运行时：`serve` 与 `publish` 共用；未配置返回 None（端点 503）。
+fn build_publish_state(app: &AppConfig) -> Option<std::sync::Arc<dictation::server::PublishState>> {
+    let settings = dictation::publish::PublishSettings::from_config(&app.publish);
+    if !settings.is_configured() {
+        return None;
+    }
+    match dictation::publish::S3Store::new(&settings) {
+        Ok(store) => Some(std::sync::Arc::new(dictation::server::PublishState {
+            settings,
+            store: std::sync::Arc::new(store),
+            serial: tokio::sync::Mutex::new(()),
+        })),
+        Err(err) => {
+            eprintln!("警告：发布功能初始化失败，发布端点将返回 503：{err:#}");
+            None
+        }
+    }
+}
+
+/// `dictation publish`：CLI 与 `POST /api/lessons/{id}/publish` 共用状态机
+/// （契约 §5 / §10）。单写者：本进程串行即可。
+async fn cmd_publish(
+    app: &AppConfig,
+    lesson: Option<&str>,
+    dry_run: bool,
+    force: bool,
+    with_full: bool,
+    json_output: bool,
+) -> Result<()> {
+    let settings = dictation::publish::PublishSettings::from_config(&app.publish);
+    if !settings.is_configured() {
+        let missing = settings.missing().join("、");
+        bail!("未配置发布目标（config.toml [publish]）：缺少 {missing}");
+    }
+    let store = dictation::publish::S3Store::new(&settings)?;
+    let options = dictation::publish::PublishOptions {
+        force,
+        with_full,
+        dry_run,
+    };
+    let targets: Vec<String> = match lesson {
+        Some(target) => vec![target.trim().to_string()],
+        None => lesson::list::scan(&app.lessons_dir)?
+            .into_iter()
+            .map(|entry| entry.dir)
+            .collect(),
+    };
+    if targets.is_empty() {
+        bail!("没有可发布的课时");
+    }
+
+    let mut outcomes = Vec::new();
+    let mut failures = Vec::new();
+    for target in &targets {
+        match dictation::publish::publish_lesson(
+            &store,
+            &settings,
+            &app.lessons_dir,
+            target,
+            options,
+            None,
+        )
+        .await
+        {
+            Ok(outcome) => outcomes.push(outcome),
+            Err(err) => failures.push((target.clone(), err)),
+        }
+    }
+
+    if json_output {
+        let single = outcomes.len() == 1 && failures.is_empty();
+        let value = if single {
+            outcomes[0].to_json()
+        } else {
+            json!({
+                "results": outcomes.iter().map(|o| o.to_json()).collect::<Vec<_>>(),
+                "failures": failures
+                    .iter()
+                    .map(|(target, err)| {
+                        json!({
+                            "lesson": target,
+                            "stage": err.stage.as_str(),
+                            "error": err.message,
+                            "uploaded": err.uploaded,
+                            "committed": err.committed,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            })
+        };
+        println!("{value}");
+    } else {
+        for outcome in &outcomes {
+            let verb = if outcome.dry_run {
+                "计划发布"
+            } else if outcome.status == dictation::publish::PublishStatus::Skipped {
+                "已是最新"
+            } else {
+                "已发布"
+            };
+            println!(
+                "{verb} {}（{}）：上传 {} 个对象、跳过 {} 个",
+                outcome.title, outcome.lesson_id, outcome.uploaded, outcome.skipped
+            );
+            if let Some(url) = &outcome.url {
+                println!("分享链接：{url}");
+            }
+        }
+        for (target, err) in &failures {
+            eprintln!("发布失败 {target}（{stage}）：{err}", stage = err.stage);
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!("{} 个课时发布失败", failures.len());
+    }
 }
 
 fn count_clips(dir: &Path) -> usize {
