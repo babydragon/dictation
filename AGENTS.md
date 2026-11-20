@@ -189,7 +189,9 @@ CLI（`lesson import` / `lesson gen`）保留为**运维与本地调试**路径�
   节奏存在于样本里；熄屏/切后台不中断。
 - 保留分片引擎作回退（片段 404、非 24k/mono/s16、>32MB、`play()` 失败）；
   `?track=0` 强制回退。详见 [`docs/playback-track.md`](docs/playback-track.md)。
-- 跨域分享时必须给 `clips/*` 配 CORS（播放器改为 `fetch` 片段）。
+- 分享站用 **B 方案**：R2 桶保持私有，Pages Function 通过 binding 以同源
+  `/data/*` 提供数据（无 CORS、无第二个公网域名）；`publish --shell` 生成
+  Pages 工程（静态壳 + Function + `wrangler.jsonc`）。
 
 ---
 

@@ -1348,3 +1348,8 @@ textarea {
   color: var(--ink-2);
   font-size: 14px;
 }
+
+/* 通用：hidden 属性必须压过 .btn / .btn-block 等 display 声明 */
+[hidden] {
+  display: none !important;
+}

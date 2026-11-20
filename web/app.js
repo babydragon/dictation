@@ -38,7 +38,12 @@
   function dataUrl(path) {
     if (!CONFIG.dataBase) return path;
     const base = CONFIG.dataBase.replace(/\/+$/, '') + '/';
-    return new URL(path, base).href;
+    try {
+      // 允许 dataBase 写成同源相对路径（如 "/data"）
+      return new URL(path, new URL(base, location.href)).href;
+    } catch (e) {
+      return base + path;
+    }
   }
 
   /** 静态模式没有的入口，一律不渲染，而不是点了才报错。 */
@@ -471,7 +476,14 @@
 
   const staticApi = {
     async lessons() {
-      const index = await fetchJson(dataUrl('lessons/index.json'));
+      let index;
+      try {
+        index = await fetchJson(dataUrl('lessons/index.json'));
+      } catch (err) {
+        // 新发布站还没有任何课时：索引 404 视为空列表，而不是报错
+        if (err && err.status === 404) return { lessons: [] };
+        throw err;
+      }
       const lessons = Array.isArray(index && index.lessons) ? index.lessons : [];
       return { lessons: lessons };
     },

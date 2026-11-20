@@ -427,6 +427,194 @@ impl ObjectStore for S3Store {
 }
 
 // ---------------------------------------------------------------------------
+// Pages 壳（B 方案：静态资源 + R2 代理 Function）
+// ---------------------------------------------------------------------------
+
+/// `publish --shell` 的产物信息。
+#[derive(Debug, Clone)]
+pub struct ShellOutcome {
+    pub dir: PathBuf,
+    pub files: usize,
+    pub data_base: String,
+    pub bucket: String,
+}
+
+const PAGES_FUNCTION: &str = r#"// 同源代理 R2：/data/* -> 桶内 lessons/*
+// 由 `dictation publish --shell` 生成；binding 见根目录 wrangler.jsonc。
+const TYPES = {
+  json: 'application/json; charset=utf-8',
+  wav: 'audio/wav',
+  mp3: 'audio/mpeg',
+};
+
+export async function onRequest({ request, env, params }) {
+  if (request.method !== 'GET' && request.method !== 'HEAD') {
+    return new Response('method not allowed', { status: 405 });
+  }
+  // /data/lessons/index.json -> 桶内 lessons/index.json
+  const key = (params.path || []).join('/');
+  if (!key.startsWith('lessons/') || key.includes('..')) {
+    return new Response('not found', { status: 404 });
+  }
+
+  const object = await env.BUCKET.get(key);
+  if (!object) {
+    return new Response('not found', { status: 404 });
+  }
+
+  const ext = key.split('.').pop();
+  const headers = {
+    'content-type': TYPES[ext] || 'application/octet-stream',
+    'cache-control': key.includes('/clips/')
+      ? 'public, max-age=31536000, immutable'
+      : 'no-cache',
+    'x-content-type-options': 'nosniff',
+  };
+  if (request.method === 'HEAD') {
+    return new Response(null, { headers });
+  }
+  return new Response(object.body, { headers });
+}
+"#;
+
+const PAGES_HEADERS: &str = "/*\n  Referrer-Policy: no-referrer\n\n/\n  Cache-Control: no-cache\n\n/index.html\n  Cache-Control: no-cache\n\n/app.js\n  Cache-Control: no-cache\n\n/config.js\n  Cache-Control: no-cache\n\n/style.css\n  Cache-Control: no-cache\n\n/manifest.webmanifest\n  Cache-Control: no-cache\n";
+
+fn copy_tree(src: &Path, dst: &Path) -> Result<usize> {
+    fs::create_dir_all(dst)?;
+    let mut copied = 0;
+    for entry in fs::read_dir(src).with_context(|| format!("读取目录失败: {}", src.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let target = dst.join(entry.file_name());
+        if path.is_dir() {
+            copied += copy_tree(&path, &target)?;
+        } else {
+            fs::copy(&path, &target).with_context(|| {
+                format!("复制文件失败: {} -> {}", path.display(), target.display())
+            })?;
+            copied += 1;
+        }
+    }
+    Ok(copied)
+}
+
+fn today_utc() -> String {
+    let date = OffsetDateTime::now_utc().date();
+    format!(
+        "{:04}-{:02}-{:02}",
+        date.year(),
+        u8::from(date.month()),
+        date.day()
+    )
+}
+
+/// 生成 Cloudflare Pages 工程（B 方案：私有桶 + 同源 Function）。
+///
+/// 产物：
+/// ```text
+/// <out_dir>/
+/// ├── wrangler.jsonc          name / pages_build_output_dir / R2 binding
+/// ├── functions/data/[[path]].js
+/// └── public/                 静态壳（web/ + config.js + _headers）
+/// ```
+/// 只清理 `public/` 与 `functions/`（本命令自己的产物），不动目录里的其他文件。
+pub fn write_shell(
+    settings: &PublishSettings,
+    web_dir: &Path,
+    out_dir: &Path,
+    dry_run: bool,
+) -> Result<ShellOutcome> {
+    let bucket = settings
+        .bucket
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .context("缺少 [publish].bucket；B 方案的 Pages Function 需要绑定桶名")?;
+    let data_base = settings
+        .data_base
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            settings
+                .pages_base
+                .as_ref()
+                .map(|base| format!("{}/data", base.trim_end_matches('/')))
+        })
+        .context("缺少 [publish].data_base 或 pages_base")?;
+    let project = settings
+        .pages_project
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("dictation");
+
+    if !web_dir.is_dir() {
+        bail!("前端目录不存在: {}", web_dir.display());
+    }
+
+    let public_dir = out_dir.join("public");
+    let functions_dir = out_dir.join("functions/data");
+    let function_file = functions_dir.join("[[path]].js");
+    let wrangler_file = out_dir.join("wrangler.jsonc");
+
+    let config_js = format!(
+        "// 由 dictation publish --shell 生成：静态壳 + 同源 R2 代理\nwindow.DICTATION_CONFIG = {{ mode: 'static', dataBase: '{}' }};\n",
+        data_base.trim_end_matches('/')
+    );
+    let wrangler = format!(
+        r#"{{
+  "$schema": "https://unpkg.com/wrangler/config-schema.json",
+  "name": "{project}",
+  "pages_build_output_dir": "./public",
+  "compatibility_date": "{date}",
+  "r2_buckets": [
+    {{ "binding": "BUCKET", "bucket_name": "{bucket}" }}
+  ]
+}}
+"#,
+        project = project,
+        date = today_utc(),
+        bucket = bucket,
+    );
+
+    if dry_run {
+        return Ok(ShellOutcome {
+            dir: out_dir.to_path_buf(),
+            files: 0,
+            data_base,
+            bucket: bucket.to_string(),
+        });
+    }
+
+    // 只重建自己的产物目录，避免旧文件残留（例如已删除的前端资源）
+    for dir in [&public_dir, out_dir.join("functions").as_path()] {
+        if dir.exists() {
+            fs::remove_dir_all(dir)
+                .with_context(|| format!("清理旧产物失败: {}", dir.display()))?;
+        }
+    }
+
+    let mut files = copy_tree(web_dir, &public_dir)?;
+    // web/config.js 是 server 模式默认值，必须覆盖
+    fs::write(public_dir.join("config.js"), config_js).context("写入 public/config.js 失败")?;
+    files += 1;
+    fs::write(public_dir.join("_headers"), PAGES_HEADERS).context("写入 public/_headers 失败")?;
+    files += 1;
+
+    fs::create_dir_all(&functions_dir)?;
+    fs::write(&function_file, PAGES_FUNCTION).context("写入 Pages Function 失败")?;
+    files += 1;
+    fs::write(&wrangler_file, wrangler).context("写入 wrangler.jsonc 失败")?;
+    files += 1;
+
+    Ok(ShellOutcome {
+        dir: out_dir.to_path_buf(),
+        files,
+        data_base,
+        bucket: bucket.to_string(),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // 数据构造
 // ---------------------------------------------------------------------------
 
@@ -1366,5 +1554,87 @@ mod tests {
         assert!(json.get("url").is_none());
         assert_eq!(json["uploaded"], 3);
         assert_eq!(json["status"], "published");
+    }
+
+    // ---- Pages 壳生成（B 方案） ----
+
+    fn shell_web() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("index.html"), "<!doctype html>").unwrap();
+        fs::write(dir.path().join("app.js"), "// app").unwrap();
+        fs::write(
+            dir.path().join("config.js"),
+            "window.DICTATION_CONFIG = { mode: 'server' };\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn shell_generates_pages_project_with_binding() {
+        let web = shell_web();
+        let out = tempfile::tempdir().unwrap();
+        let mut settings = sample_settings();
+        settings.bucket = Some("dictation".to_string());
+        settings.pages_base = Some("https://dictation.example.com".to_string());
+        settings.data_base = None;
+        settings.pages_project = Some("dictation".to_string());
+
+        let outcome = write_shell(&settings, web.path(), out.path(), false).unwrap();
+        assert_eq!(outcome.data_base, "https://dictation.example.com/data");
+        assert_eq!(outcome.bucket, "dictation");
+
+        let config = fs::read_to_string(out.path().join("public/config.js")).unwrap();
+        assert!(config.contains("mode: 'static'"));
+        assert!(config.contains("https://dictation.example.com/data"));
+
+        let wrangler = fs::read_to_string(out.path().join("wrangler.jsonc")).unwrap();
+        assert!(wrangler.contains("\"binding\": \"BUCKET\""));
+        assert!(wrangler.contains("\"bucket_name\": \"dictation\""));
+        assert!(wrangler.contains("\"pages_build_output_dir\": \"./public\""));
+
+        let function = fs::read_to_string(out.path().join("functions/data/[[path]].js")).unwrap();
+        assert!(function.contains("env.BUCKET.get(key)"));
+        assert!(function.contains("key.startsWith('lessons/')"));
+        assert!(function.contains("immutable"));
+
+        assert!(out.path().join("public/_headers").is_file());
+        assert!(out.path().join("public/index.html").is_file());
+    }
+
+    #[test]
+    fn shell_dry_run_writes_nothing() {
+        let web = shell_web();
+        let out = tempfile::tempdir().unwrap();
+        let settings = sample_settings();
+        let outcome = write_shell(&settings, web.path(), out.path(), true).unwrap();
+        assert_eq!(outcome.files, 0);
+        assert!(!out.path().join("public").exists());
+        assert!(!out.path().join("wrangler.jsonc").exists());
+    }
+
+    #[test]
+    fn shell_rebuild_removes_stale_assets() {
+        let web = shell_web();
+        let out = tempfile::tempdir().unwrap();
+        let settings = sample_settings();
+        write_shell(&settings, web.path(), out.path(), false).unwrap();
+        fs::write(out.path().join("public/removed.js"), "old").unwrap();
+
+        write_shell(&settings, web.path(), out.path(), false).unwrap();
+        assert!(
+            !out.path().join("public/removed.js").exists(),
+            "重新生成时清理旧产物"
+        );
+    }
+
+    #[test]
+    fn shell_requires_bucket() {
+        let web = shell_web();
+        let out = tempfile::tempdir().unwrap();
+        let mut settings = sample_settings();
+        settings.bucket = None;
+        let err = write_shell(&settings, web.path(), out.path(), false).unwrap_err();
+        assert!(err.to_string().contains("bucket"));
     }
 }

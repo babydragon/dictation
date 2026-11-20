@@ -125,6 +125,9 @@ enum Command {
         /// 额外上传 full.mp3
         #[arg(long)]
         with_full: bool,
+        /// 生成 Pages 工程（静态壳 + R2 代理 Function），不发布课时
+        #[arg(long)]
+        shell: bool,
         /// 输出 JSON
         #[arg(long)]
         json: bool,
@@ -486,10 +489,20 @@ async fn main() -> Result<()> {
             dry_run,
             force,
             with_full,
+            shell,
             json,
         } => with_json_errors(
             json,
-            cmd_publish(&app, lesson.as_deref(), dry_run, force, with_full, json).await,
+            cmd_publish(
+                &app,
+                lesson.as_deref(),
+                dry_run,
+                force,
+                with_full,
+                shell,
+                json,
+            )
+            .await,
         ),
     }
 }
@@ -1480,9 +1493,58 @@ async fn cmd_publish(
     dry_run: bool,
     force: bool,
     with_full: bool,
+    shell: bool,
     json_output: bool,
 ) -> Result<()> {
     let settings = dictation::publish::PublishSettings::from_config(&app.publish);
+
+    if shell {
+        if lesson.is_some() {
+            bail!("--shell 只生成 Pages 工程，不能同时指定课时");
+        }
+        let out = settings
+            .shell_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("dist/pages"));
+        let outcome = dictation::publish::write_shell(&settings, &app.web_dir, &out, dry_run)?;
+        if json_output {
+            println!(
+                "{}",
+                json!({
+                    "dir": outcome.dir.to_string_lossy(),
+                    "files": outcome.files,
+                    "data_base": outcome.data_base,
+                    "bucket": outcome.bucket,
+                    "dry_run": dry_run,
+                })
+            );
+        } else {
+            println!(
+                "{}{}：{}（{} 个文件）",
+                if dry_run {
+                    "将生成 "
+                } else {
+                    "Pages 工程已生成 "
+                },
+                outcome.dir.display(),
+                if dry_run {
+                    "dry-run，未写入"
+                } else {
+                    "可用于部署"
+                },
+                outcome.files
+            );
+            println!("dataBase：{}", outcome.data_base);
+            println!("bucket  ：{}（binding BUCKET）", outcome.bucket);
+            if !dry_run {
+                println!(
+                    "部署：cd {} && npx wrangler pages deploy",
+                    outcome.dir.display()
+                );
+            }
+        }
+        return Ok(());
+    }
     if !settings.is_configured() {
         let missing = settings.missing().join("、");
         bail!("未配置发布目标（config.toml [publish]）：缺少 {missing}");

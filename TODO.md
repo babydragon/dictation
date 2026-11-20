@@ -36,7 +36,7 @@
 | 单词重新生成 | ✅ `POST /api/lessons/{id}/regenerate-word` + 检查页长按（删缓存样本、只花 1 次 TTS） |
 | 听写节奏（隐藏） | ✅ 长按首页标题设置词后等待（本地设置，静态发布同样可用） |
 | 分享发布 F8（前端） | 🚧 static 模式 + `?l=` 深链 + 本地判分 + 结果导出已实现；导入闭环未开始 |
-| 分享发布 F8（publish） | 🚧 `publish` CLI/HTTP + R2 SigV4 客户端已实现；`--shell/--status/--reindex/unpublish` 未开始 |
+| 分享发布 F8（publish） | 🚧 `publish` CLI/HTTP + `--shell`（B 方案 Pages 工程）已实现；`--status/--reindex/unpublish` 未开始 |
 | 分享结果导入（F8） | ✅ `result import` CLI/HTTP 幂等入账（schema v5）+ 家长入口；真实 R2 冒烟待做 |
 | 熄屏播放（整轨引擎 C1） | ✅ 客户端拼装整轨 + 分片引擎回退 + 重掷补丁 + `?diag=1`；待真机 T1/T2 |
 | 缓存清理 | ✅ `clean --unused/--older-than`，默认 dry-run |
@@ -584,6 +584,41 @@ dictation result import <file|-> [--json]
   导出下载文件名 `快速测试课-20261119.json`、文本降级内容与契约逐字段一致。
 - server 模式回归：`serve` 起本库，首页渲染与 `/api/*` 正常，导出按钮隐藏。
 - 验证：`node --check web/app.js` 通过；Rust 未改动（cargo test 仍 200）。
+
+### 2026-11-20（B 方案：Pages Function 代理私有桶）
+
+- 采用 B：R2 不绑公网域名、保持私有；Pages Function 通过 binding 读桶，
+  以同源 `/data/*` 提供 JSON 与片段（无 CORS、只有一个公网域名）。
+- 修正 Function 的 key 映射：`/data/lessons/...` 直接对应桶内 `lessons/...`
+  （不能重复加 `lessons/` 前缀），并限定只读 `lessons/` 下的 key。
+- `dictation publish --shell`：生成 `<shell_dir>`（默认 `dist/pages`）：
+  `wrangler.jsonc`（binding `BUCKET`）、`functions/data/[[path]].js`、
+  `public/`（静态壳 + 生成的 `config.js` + `_headers`）；重建时只清理
+  `public/` 与 `functions/`；支持 `--dry-run`/`--json`。不需要 R2 密钥。
+- `dataBase` 默认取 `pages_base + /data`；前端 `dataUrl()` 支持同源相对路径。
+- 验证：生成工程结构/内容断言（4 个单测）；`cargo test` 236 lib + 9 bin、
+  fmt/clippy 干净、`node --check` 通过。
+- 文档：`share-publish.md`（架构/布局/§11 全部改为 B、§10 `--shell`）、
+  `AGENTS.md` D16、`TODO.md`。
+- Cloudflare 侧（2026-11-20）：建私有桶 `dictation`、Pages 项目 `dictation`、
+  域名 `dictation.zimo.life`（CNAME 手工补，API 无 DNS 写权限）；`wrangler login`
+  后部署壳，空桶下首页显示「还没有发布的课时」，Function 返回干净的 404
+  （binding 生效）。
+- 真机反馈修复：`.btn { display:inline-flex }` 覆盖了 `hidden` 属性，导致静态版
+  仍显示「导入听写结果」→ 全局 `[hidden]{display:none!important}`；静态壳空索引
+  404 视为空列表；`_headers` 对 shell 资源显式 `no-cache`。
+- rc.8：版本升到 0.3.0-rc.8，回归（fmt/clippy/test/node/install.sh）通过。
+
+### 2026-11-20（agent 发布 skill + rc.7 发布）
+
+- `skills/dictation-prep/SKILL.md` 补「发布到分享站」：`POST /api/lessons/{id}/publish`、
+  `dry_run`/`force`、成功/幂等响应、503/404/400/502 的处理约定；明确 agent 只调
+  HTTP、Pages 壳部署是家长的一次性运维步骤。
+- 实测端点连通：未配置 `[publish]` 时返回 `503 {"error":"未配置发布目标（config.toml [publish]）"}`。
+- rc.7 打包：本地 fmt/clippy/test 通过后提交并推 `main` + tag `v0.3.0-rc.7`，
+  GitHub Actions 成功产出 x86_64 / riscv64 资产与 `install.sh`、`SHA256SUMS`。
+- 真机验收（家长）：Android Chrome / 微信 / 钉钉 WebView 熄屏均连续播放；
+  iPhone 通过；锁屏暂停与页面状态同步已修。
 
 ### 2026-11-20（熄屏播放：整轨引擎 C1）
 

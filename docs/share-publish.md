@@ -31,14 +31,20 @@ WAF 规则 + 前端拼 URL，不改架构（见 §11）。
 ```
 ① 壳（一次性 / 改前端时）
    web/  ──dictation publish --shell──▶  Pages 项目（dictation.example.com）
+                                          public/            静态资源
+                                          functions/data/*   R2 代理（私有桶）
+                                          wrangler.jsonc     R2 binding
 
 ② 数据（每课一次，与 ① 无关）
    lessons/<id>/manifest.json + clips/
-        └──dictation publish <课时>──▶  R2 桶（audio.example.com）
+        └──dictation publish <课时>──▶  R2 桶（私有，无公网域名）
                                          lessons/index.json
                                          lessons/<id>/lesson.json
                                          lessons/<id>/clips/*.wav
 ```
+
+**B 方案（已采用）**：R2 桶不暴露公网域名，Pages Function 通过 binding
+读桶、以同源 `/data/*` 提供数据。没有 CORS，也没有第二个可寻址域名。
 
 - 两条通道互不触发。发布新课时**不重新部署 Pages**。
 - 静态模式下前端只有一套代码，通过 `config.js` 的 `mode` 切换数据源（§8）。
@@ -49,22 +55,29 @@ WAF 规则 + 前端拼 URL，不改架构（见 §11）。
 
 ## 3. 发布物布局
 
-### 3.1 Pages（壳）
+### 3.1 Pages（壳 + R2 代理）
 
-`dist/shell/`，由 `web/` 原样复制并附加 `config.js`：
+`dictation publish --shell` 生成一个 Pages 工程目录（默认 `dist/pages`）：
 
 ```
-dist/shell/
-├── index.html
-├── style.css
-├── app.js
-├── manifest.webmanifest
-├── config.js          # 生成：{ "mode": "static", "dataBase": "https://audio.example.com/" }
-└── _headers           # Referrer-Policy / 缓存策略（§11.4）
+dist/pages/
+├── wrangler.jsonc              # name / pages_build_output_dir / R2 binding
+├── functions/
+│   └── data/[[path]].js        # /data/* -> 私有桶 lessons/*
+└── public/                     # 静态壳
+    ├── index.html
+    ├── style.css
+    ├── app.js
+    ├── manifest.webmanifest
+    ├── config.js               # { mode:'static', dataBase:'https://<pages>/data' }
+    └── _headers
 ```
 
-部署：`wrangler pages deploy dist/shell --project-name dictation`
-（或用户的 Git 集成；两者等价，均只涉及壳）。
+部署：`cd dist/pages && npx wrangler pages deploy`。
+
+- 壳与数据仍然分离：发布课时只写 R2，**不重新部署 Pages**。
+- 只有改前端 / 改 `config.js` / 改 Function 或 binding 时才需要重新部署。
+- `dataBase` 默认取 `pages_base + /data`；也可在 `[publish].data_base` 显式指定。
 
 ### 3.2 R2（数据）
 
@@ -419,6 +432,8 @@ function dataUrl(path) {
 
 - `lessons()`、`createSession()`、`mediaUrl()`/`clipSrc()` 都必须经过它；
   不得在别处手拼 `dataBase + path`。
+- `dataBase` 可以是同源相对路径（`/data`），B 方案的 Function 代理默认用它；
+  绝对 URL 与相对路径都支持。
 - `base`（顶层与 item）保持干净，不带查询参数——它会被写进 localStorage 的
   断点续听快照；带参数会导致口令轮换后旧进度全部失效。
 - 以后加口令时只改这一个函数（追加 `?k=`）并新增口令页，数据格式与发布流程
@@ -521,7 +536,8 @@ dictation result import <file|-> --json
 ```bash
 dictation publish <课时> [--dry-run] [--force] [--with-full] [--json]
 dictation publish [--json]              # 省略课时 = 发布全部课时
-dictation result import <file|-> [--json]   # 未实现（结果回传阶段）
+dictation publish --shell [--dry-run] [--json]   # 生成 Pages 工程（不需要 R2 密钥）
+dictation result import <file|-> [--json]
 ```
 
 - `<课时>` 解析顺序与 `generate` 一致：目录名优先，其次 12 位 id。
@@ -541,10 +557,18 @@ dictation result import <file|-> [--json]   # 未实现（结果回传阶段）
 - 发布全部或部分失败时输出 `{ "results": [...], "failures": [{ "lesson", "stage", "error", "uploaded", "committed" }] }`，退出码 1。
 - `url` 由 `config.toml` 的 `pages_base` 拼接；未配置则无该字段。
 
+`--shell` 输出（默认 `dist/pages`）：
+
+```
+Pages 工程已生成 dist/pages（9 个文件）
+dataBase：https://dictation.example.com/data
+bucket  ：dictation（binding BUCKET）
+部署：cd dist/pages && npx wrangler pages deploy
+```
+
 未实现（后续阶段）：
 
 ```bash
-dictation publish --shell      # 生成 dist/shell/（web/ + config.js + _headers）
 dictation publish --status     # 校验 index 与对象一致性（missing/orphan）
 dictation publish --reindex    # 从 R2 重建 index.json
 dictation unpublish <课时> [--purge] [--apply]
@@ -554,29 +578,45 @@ dictation unpublish <课时> [--purge] [--apply]
 
 ## 11. Cloudflare 侧配置
 
-### 11.1 自定义域
+### 11.1 域名
 
-- Pages 项目：`dictation.example.com`（Git 集成或 `wrangler pages deploy`）。
-- R2 桶：`audio.example.com`（R2 → Settings → Custom Domains）。
-- **关闭 `r2.dev` 公开开发域名**（限速、且 WAF/缓存规则不生效）。
+- Pages 项目：`dictation.example.com`（Direct Upload + 自定义域）。
+- R2 桶：**不绑自定义域**，保持私有；`r2.dev` 保持关闭。
+- 公开可寻址的只有 Pages 一个域名。
 
-### 11.2 CORS（JSON **与片段**都要）
+### 11.2 R2 binding（`wrangler.jsonc`）
 
-整轨引擎（`playback-track.md`）用 `fetch()` 读每个 `clips/*.wav` 再在内存里拼，
-所以片段也必须返回跨域头——不只是 `lesson.json`。漏了这条的症状：
-本地一切正常，发布后首页/课时都能进，**点「开始」直接失败**。
+Pages Function 通过 binding 读私有桶，配置由 `--shell` 生成：
 
-```json
-[
-  {
-    "AllowedOrigins": ["https://dictation.example.com"],
-    "AllowedMethods": ["GET", "HEAD"],
-    "MaxAgeSeconds": 3600
-  }
-]
+```jsonc
+{
+  "name": "dictation",
+  "pages_build_output_dir": "./public",
+  "compatibility_date": "2026-11-20",
+  "r2_buckets": [
+    { "binding": "BUCKET", "bucket_name": "dictation" }
+  ]
+}
 ```
 
-`fetch` 不带自定义请求头，`?v=` 只是 query，不需要额外 `AllowedHeaders`。
+Function 侧只做 key 映射与缓存头（不鉴权、不列目录）：
+
+```js
+// /data/lessons/index.json -> 桶内 lessons/index.json（不重复加前缀）
+const key = (params.path || []).join('/');
+if (!key.startsWith('lessons/')) return new Response('not found', { status: 404 });
+const object = await env.BUCKET.get(key);
+return new Response(object.body, { headers });
+```
+
+因为同源，**不需要 CORS**。若改回 A 方案（公开桶），才需要给 `clips/*` 配 CORS。
+
+### 11.2.1 额度
+
+- Pages 静态资源不消耗 Workers 请求；
+- 只有 `/data/*` 每次请求 = 1 次 Function 调用；Free **10 万/天**；
+- 一课 40 词 ≈ 43 次请求（42 片段 + `lesson.json`）；
+- 40 人每天各听一次 ≈ 1.8k/天（1.8%）。
 
 ### 11.3 缓存
 
@@ -651,15 +691,15 @@ dictation unpublish <课时> [--purge] [--apply]
 
 `skills/dictation-prep/SKILL.md` 目前只覆盖“导入 → 生成”。发布上线后必须补：
 
-- [ ] 流程改为 **导入（必带 `subject`）→ 生成 → 轮询 job → 发布 → 返回分享链接**；
-- [ ] 明确 agent **不执行 CLI、不接触 R2 凭证、不读写任何路径**，只调
+- [x] 流程改为 **导入（必带 `subject`）→ 生成 → 轮询 job → 发布 → 返回分享链接**；
+- [x] 明确 agent **不执行 CLI、不接触 R2 凭证、不读写任何路径**，只调
       `POST /api/lessons`、`POST /api/lessons/{id}/generate`、
       `GET /api/jobs/{id}`、`POST /api/lessons/{id}/publish`；
-- [ ] 失败分支：`503`（未配置发布目标）时提示家长在 `config.toml` 补
+- [x] 失败分支：`503`（未配置发布目标）时提示家长在 `config.toml` 补
       `[publish]`，不要重试；`404` 时提示先导入/生成；
-- [ ] 幂等说明：重复发布返回 `skipped`，不要当作错误；
-- [ ] 输出给家长的内容：课时标题 + 分享链接（`?l=<id>`）+ 是否含整轨；
-- [ ] 明确“发布不改变本地文件、不重新合成、不消耗 TTS 额度”。
+- [x] 幂等说明：重复发布返回 `skipped`，不要当作错误；
+- [x] 输出给家长的内容：课时标题 + 分享链接（`?l=<id>`）+ 是否含整轨；
+- [x] 明确“发布不改变本地文件、不重新合成、不消耗 TTS 额度”。
 
 同步检查：
 
@@ -702,15 +742,15 @@ dictation unpublish <课时> [--purge] [--apply]
 
 ## 15. 待定（实施时确认）
 
-已实现（2026-11-19）：`[publish]` 配置 + R2 S3 客户端（SigV4 自签名，`hmac` 纯 Rust）、
+已实现：`[publish]` 配置 + R2 S3 客户端（SigV4 自签名，`hmac` 纯 Rust）、
 `dictation publish`（单课/全部/dry-run/force/with-full/json）、
+`publish --shell`（B 方案 Pages 工程：静态壳 + R2 代理 Function + binding）、
 `POST /api/lessons/{id}/publish`（同步、鉴权、503/404/400/502 带 stage）。
 
 仍待实施 / 待定：
 
 1. `publish.lock`：跨进程（CLI 与 `serve` 同时发布）互斥；当前仅 HTTP 端进程内串行。
-2. `publish --shell`：生成 `dist/shell/`（`web/` + `config.js` + `_headers`）；
-   实际部署用 `wrangler pages deploy` 还是 Cloudflare API 待定。
+2. 实际部署 Pages 仍用 `wrangler pages deploy`（`--shell` 只生成工程，不联网）。
 3. `publish --status` / `--reindex`（LIST 分页）、`unpublish`（index 摘除 + `--purge`）。
 4. R2 凭证是否复用 `/etc/dictation/env`（倾向是，已按 `read_secret` 实现），
    systemd 下是否用 `LoadCredential` 注入。

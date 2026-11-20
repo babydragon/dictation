@@ -1,6 +1,6 @@
 ---
 name: dictation-prep
-description: 把老师消息、课本照片、杂乱词表整理成 dictation 项目可用的课时，并通过 dictation 服务的 HTTP API 导入词表、触发音频生成；也可查询听写结果、提取错词做记忆分析、清理 TTS 缓存。用于“准备听写”“整理词表”“生成听写音频”“分析错词”“看听写结果”“清理缓存”等场景。
+description: 把老师消息、课本照片、杂乱词表整理成 dictation 项目可用的课时，并通过 dictation 服务的 HTTP API 导入词表、触发音频生成、发布到分享站；也可查询听写结果、提取错词做记忆分析、清理 TTS 缓存。用于“准备听写”“整理词表”“生成听写音频”“发布课时”“分享给同学”“分析错词”“看听写结果”“清理缓存”等场景。
 ---
 
 # 听写词表准备（HTTP API 版）
@@ -27,7 +27,7 @@ description: 把老师消息、课本照片、杂乱词表整理成 dictation �
 
 ## 输出方式
 
-三步：导入 → 生成 → 轮询。
+四步：导入 → 生成 → 轮询 → （可选）发布到分享站。
 
 ```bash
 API="${DICTATION_API_URL:-http://127.0.0.1:8080}"
@@ -44,6 +44,10 @@ curl -sS -X POST "$API/api/lessons/第5课/generate" "${AUTH[@]}" \
 
 # 3. 轮询：queued → running → done/error
 curl -sS "$API/api/jobs/<job_id>"
+
+# 4. 可选：发布到 Cloudflare（家长要求分享时）
+curl -sS -X POST "$API/api/lessons/第5课/publish" "${AUTH[@]}" \
+  -H 'content-type: application/json' -d '{}'
 ```
 
 `payload.json`：
@@ -177,6 +181,51 @@ review_cap = 8
 - 默认不要覆盖；问家长是否要更新。
 - 确认更新后，重新导入并在 payload 里设 `"force": true`。
 - 覆盖后必须重新 generate，否则音频还是旧的。
+
+## 发布到分享站（可选）
+
+只有家长明确要「发给孩子在外面听 / 分享给同学」时才做。发布只上传**课时数据**
+（清单 + 片段）到 R2，不重新合成、不消耗 TTS 额度；重复发布是幂等的。
+
+```bash
+# 先预演（只统计、不写入）——家长不确定时用
+curl -sS -X POST "$API/api/lessons/第5课/publish" "${AUTH[@]}" \
+  -H 'content-type: application/json' -d '{"dry_run":true}'
+
+# 正式发布
+curl -sS -X POST "$API/api/lessons/第5课/publish" "${AUTH[@]}" \
+  -H 'content-type: application/json' -d '{}'
+```
+
+`{id}` 可以是目录名（`第5课`）或 12 位课时 id。
+
+成功响应：
+
+```json
+{ "lesson_id": "049edc3427d6", "title": "第5课 词语听写",
+  "status": "published", "dry_run": false,
+  "uploaded": 22, "skipped": 0, "index_updated": true,
+  "url": "https://dictation.example.com/?l=049edc3427d6" }
+```
+
+- `status="skipped"`：远端内容已是最新（`uploaded=0`、`index_updated=false`），
+  **不是错误**，直接把 `url` 给家长即可。
+- `url` 是分享链接（公开可访问，v1 没有口令）；没配置 `pages_base` 时没有该字段。
+- 只有家长明确要求「不覆盖」时才有 `force`；`with_full` 只是额外传整轨 mp3，
+  播放器用不到。
+
+错误处理（不要反复重试）：
+
+| 状态 | 含义 | 你怎么做 |
+|---|---|---|
+| `503` | 服务端没配置 `config.toml [publish]` | 告诉家长去配置并重启服务；**不要**索要 R2 密钥、不要重试 |
+| `404` | 课时不存在 | 先确认导入/生成是否成功 |
+| `400` `stage="local"` | 本地片段缺失 | 让家长重新 `generate`，不要发布残缺课 |
+| `502` `stage=clips/commit/index` | 上传中断 | 幂等，可重试一次；仍失败就把 `stage`/`uploaded`/`committed` 报给家长 |
+
+**不要**执行 `wrangler`、不要碰 Cloudflare 控制台、不要读任何主机路径：
+Pages 壳的部署是家长的一次性运维步骤，agent 只调上面的接口。
+R2 凭证只在 `serve` 进程里，agent 永远不接触。
 
 ## 更新已有课时
 
