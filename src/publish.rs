@@ -716,6 +716,7 @@ pub fn build_plan(
     lesson_dir: &Path,
     with_full: bool,
 ) -> Result<LessonPlan> {
+    // 收集所有本地片段（去重，保留首次出现顺序）
     let mut clip_paths: Vec<String> = Vec::new();
     let push_clip = |paths: &mut Vec<String>, clip: &crate::manifest::ManifestClip| {
         if !paths.contains(&clip.path) {
@@ -734,7 +735,12 @@ pub fn build_plan(
         push_clip(&mut clip_paths, outro);
     }
 
+    // 内容寻址：远端文件名 = sha256(音频字节) 前 16 位。
+    // 这样同一 key 的字节永不变化（immutable 缓存安全），重新生成音频会得到新 URL。
+    let mut published: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut objects: Vec<(String, PathBuf, &'static str)> = Vec::new();
+    let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     for path in &clip_paths {
         let file = lesson_dir.join(path);
         if !file.is_file() {
@@ -743,11 +749,18 @@ pub fn build_plan(
                 file.display()
             );
         }
-        objects.push((
-            format!("lessons/{}/{}", listing.id, path),
-            file,
-            AUDIO_CONTENT_TYPE,
-        ));
+        let bytes = fs::read(&file).with_context(|| format!("读取片段失败: {}", file.display()))?;
+        let hash = &hex_sha256(&bytes)[..16];
+        let ext = Path::new(path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("wav");
+        let new_rel = format!("clips/{hash}.{ext}");
+        let key = format!("lessons/{}/{}", listing.id, new_rel);
+        published.insert(path.clone(), new_rel);
+        if seen_keys.insert(key.clone()) {
+            objects.push((key, file, AUDIO_CONTENT_TYPE));
+        }
     }
 
     let full_track = if with_full {
@@ -767,6 +780,15 @@ pub fn build_plan(
         }
     }
 
+    // 把 manifest 里的片段路径改写成发布名
+    let rewrite_clip = |clip: &crate::manifest::ManifestClip| {
+        let path = published
+            .get(&clip.path)
+            .cloned()
+            .unwrap_or_else(|| clip.path.clone());
+        json!({ "path": path, "duration_ms": clip.duration_ms })
+    };
+
     let items: Vec<Value> = manifest
         .items
         .iter()
@@ -775,7 +797,7 @@ pub fn build_plan(
                 "index": item.index,
                 "text": item.text,
                 "lang": item.lang,
-                "clips": item.clips,
+                "clips": item.clips.iter().map(&rewrite_clip).collect::<Vec<_>>(),
                 "repeat": item.repeat,
                 "repeat_gap_ms": item.repeat_gap_ms,
                 "gap_ms": item.gap_ms,
@@ -793,9 +815,9 @@ pub fn build_plan(
         "grade": manifest.grade,
         "term": manifest.term,
         "defaults": manifest.defaults,
-        "intro": manifest.intro,
+        "intro": manifest.intro.as_ref().map(&rewrite_clip),
         "intro_text": manifest.intro_text,
-        "outro": manifest.outro,
+        "outro": manifest.outro.as_ref().map(&rewrite_clip),
         "outro_text": manifest.outro_text,
         "items": items,
         "total_ms": manifest.total_ms,
@@ -1191,7 +1213,8 @@ mod tests {
         let clips = dir.path().join("clips");
         fs::create_dir_all(&clips).unwrap();
         for name in ["w0.wav", "w1.wav", "intro-a.wav"] {
-            fs::write(clips.join(name), b"RIFFfake").unwrap();
+            // 内容寻址：每个片段用不同字节，避免被去重成一个对象
+            fs::write(clips.join(name), format!("RIFFfake-{name}")).unwrap();
         }
         dir
     }
@@ -1297,6 +1320,11 @@ mod tests {
         assert_eq!(plan.payload["items"][0]["review"], false);
         assert!(plan.payload.get("full_track").is_none());
         assert_eq!(plan.objects.len(), 3); // 2 clips + intro
+        let pub_path = plan.payload["items"][0]["clips"][0]["path"]
+            .as_str()
+            .unwrap();
+        assert!(pub_path.starts_with("clips/"));
+        assert_ne!(pub_path, "clips/w0.wav", "发布名按字节内容寻址");
         assert_eq!(plan.content_hash, plan.payload["content_hash"]);
     }
 
@@ -1352,7 +1380,7 @@ mod tests {
         let src = lessons_dir.path().join(&listing.dir);
         fs::create_dir_all(src.join("clips")).unwrap();
         for name in ["w0.wav", "w1.wav", "intro-a.wav"] {
-            fs::write(src.join("clips").join(name), b"RIFFfake").unwrap();
+            fs::write(src.join("clips").join(name), format!("RIFFfake-{name}")).unwrap();
         }
         fs::write(
             src.join("manifest.json"),
@@ -1381,7 +1409,22 @@ mod tests {
         assert_eq!(store.object_count(), 3 + 1 + 1); // clips + lesson.json + index
 
         // 缓存语义（契约 §11.3）：clips immutable，lesson.json / index no-cache
-        let clip = store.object("lessons/049edc3427d6/clips/w0.wav").unwrap();
+        let lesson_json: Value = serde_json::from_slice(
+            &store
+                .get("lessons/049edc3427d6/lesson.json")
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let published_path = lesson_json["items"][0]["clips"][0]["path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(published_path.starts_with("clips/"), "{published_path}");
+        let clip = store
+            .object(&format!("lessons/049edc3427d6/{published_path}"))
+            .unwrap();
         assert_eq!(clip.content_type, "audio/wav");
         assert_eq!(clip.cache_control, "public, max-age=31536000, immutable");
         let lesson_json = store.object("lessons/049edc3427d6/lesson.json").unwrap();
@@ -1431,7 +1474,7 @@ mod tests {
         let src = lessons_dir.path().join(&listing.dir);
         fs::create_dir_all(src.join("clips")).unwrap();
         for name in ["w0.wav", "w1.wav", "intro-a.wav"] {
-            fs::write(src.join("clips").join(name), b"x").unwrap();
+            fs::write(src.join("clips").join(name), format!("x-{name}")).unwrap();
         }
         fs::write(
             src.join("manifest.json"),
@@ -1513,7 +1556,7 @@ mod tests {
         let src = lessons_dir.path().join(&listing.dir);
         fs::create_dir_all(src.join("clips")).unwrap();
         for name in ["w0.wav", "w1.wav", "intro-a.wav"] {
-            fs::write(src.join("clips").join(name), b"x").unwrap();
+            fs::write(src.join("clips").join(name), format!("x-{name}")).unwrap();
         }
         fs::write(
             src.join("manifest.json"),
@@ -1676,5 +1719,53 @@ mod tests {
         settings.bucket = None;
         let err = write_shell(&settings, web.path(), out.path(), false).unwrap_err();
         assert!(err.to_string().contains("bucket"));
+    }
+
+    #[test]
+    fn published_paths_follow_clip_bytes() {
+        let listing = sample_listing();
+        let dir = sample_dir();
+        let manifest = sample_manifest();
+
+        let first = build_plan(&listing, &manifest, dir.path(), false).unwrap();
+        let path_before = first.payload["items"][0]["clips"][0]["path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // 模拟「重新生成」：文件名不变、字节变化
+        fs::write(dir.path().join("clips/w0.wav"), b"regenerated-audio").unwrap();
+        let second = build_plan(&listing, &manifest, dir.path(), false).unwrap();
+        let path_after = second.payload["items"][0]["clips"][0]["path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        assert_ne!(path_before, path_after, "音频变化必须产生新 URL");
+        assert_ne!(first.content_hash, second.content_hash);
+        assert_eq!(second.objects.len(), 3);
+    }
+
+    #[test]
+    fn identical_clip_bytes_share_one_object() {
+        let listing = sample_listing();
+        let dir = sample_dir();
+        // w1 与 w0 写成完全相同的字节
+        fs::copy(
+            dir.path().join("clips/w0.wav"),
+            dir.path().join("clips/w1.wav"),
+        )
+        .unwrap();
+        let manifest = sample_manifest();
+        let plan = build_plan(&listing, &manifest, dir.path(), false).unwrap();
+
+        let p0 = plan.payload["items"][0]["clips"][0]["path"]
+            .as_str()
+            .unwrap();
+        let p1 = plan.payload["items"][1]["clips"][0]["path"]
+            .as_str()
+            .unwrap();
+        assert_eq!(p0, p1, "同字节复用同一对象名");
+        assert_eq!(plan.objects.len(), 2, "2 个片段 + intro 去重后为 2 个对象");
     }
 }

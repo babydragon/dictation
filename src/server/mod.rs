@@ -2718,8 +2718,9 @@ mod tests {
     fn fixture_publishable_lesson(lessons_dir: &Path) -> String {
         let dir = lessons_dir.join("测试课");
         fs::create_dir_all(dir.join("clips")).unwrap();
-        fs::write(dir.join("clips/w0.wav"), b"RIFF").unwrap();
-        fs::write(dir.join("clips/w1.wav"), b"RIFF").unwrap();
+        // 内容寻址：两个片段用不同字节，避免被去重成一个对象
+        fs::write(dir.join("clips/w0.wav"), b"RIFF-0").unwrap();
+        fs::write(dir.join("clips/w1.wav"), b"RIFF-1").unwrap();
         fs::write(
             dir.join("manifest.json"),
             r#"{

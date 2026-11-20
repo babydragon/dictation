@@ -585,6 +585,20 @@ dictation result import <file|-> [--json]
 - server 模式回归：`serve` 起本库，首页渲染与 `/api/*` 正常，导出按钮隐藏。
 - 验证：`node --check web/app.js` 通过；Rust 未改动（cargo test 仍 200）。
 
+### 2026-11-20（发布内容寻址：更新音频）
+
+- 问题：`regenerate-word` 原地覆盖同名片段，而 publish 对已存在的 key 跳过；
+  即便 `--force` 上传，`immutable` 缓存也会让客户端继续用旧音频。
+- 修复：发布时按片段**字节**重命名 `clips/<sha256前16位>.<ext>`，
+  `lesson.json` 的 `clips[].path` 同步改写；本地 manifest 不变。
+  - 音频变化 → 新 URL，缓存安全；未变化 → 同名跳过；
+  - 首次切换会整课重传一次（名字全变），之后恢复增量；
+  - 旧对象保留（只增不删），老客户端不会 404；
+  - `content_hash` 随音频变化，「已是最新」判断恢复准确。
+- 测试：发布名随字节变化、同字节去重、既有发布流程 19 个测试通过。
+- 待办：孤儿 GC（`publish --status`/`--gc`，需 R2 LIST）；本轮不做。
+- 文档：`share-publish.md` §3.2/§4.3。
+
 ### 2026-11-20（异步发布 + 准备阶段冻结控件）
 
 - `POST /api/lessons/{id}/publish` 新增 `{"async": true}`：202 + job_id，

@@ -97,8 +97,12 @@ dist/pages/
 
 - `<lesson_id>` = `db::lesson_id(dir_name)`（`sha256(dir_name)` 前 12 位十六进制）。
   **与内容无关，重新生成同一目录仍是同一个 id**，因此重发只会覆盖同一前缀。
-- `clips/` 文件名来自内容哈希（`provider|voice|rate|text|pipeline_version`），
-  **同内容必同名、不同内容必不同名**。这是增量发布的基础。
+- **发布时**按片段字节重新命名：`clips/<sha256(字节)前16位>.<ext>`。
+  本地 `manifest.json` 里的名字不变，`lesson.json` 的 `clips[].path` 改写成发布名。
+  这样同一 key 的字节永不变化（`immutable` 缓存安全），重新生成音频会产生新 URL；
+  相同字节（含课内重复）只存一份。
+- 首次从旧的「按词命名」切到内容寻址时，会整课重传一次；此后只上传变化的片段。
+- 旧名字的对象保留（只增不删）：正在听旧 `lesson.json` 的客户端不会 404。
 - **不上传 `full.wav`**（约 9.8 MB/课）。`full.mp3` 仅在 `--with-full` 时上传。
 - 禁止写 `lessons/` 之外的 key。
 
