@@ -598,6 +598,8 @@ dictation result import <file|-> [--json]
 - 验证：浏览器 MutationObserver 实测 1/20→20/20 期间三个按钮均 disabled，
   进入「正在听写」后恢复；异步发布 3 个 HTTP 测试（202+轮询、去重、kind 隔离）。
 - 文档：`http-api.md`、`share-publish.md`、skill。
+- 壳资源加内容哈希（`style.css?v=…` 等）：Pages 会覆盖 `_headers` 的
+  `Cache-Control`（实测资源仍是 4h），哈希 URL 才能保证重新部署立即生效。
 
 ### 2026-11-20（B 方案：Pages Function 代理私有桶）
 

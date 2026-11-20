@@ -509,6 +509,32 @@ fn today_utc() -> String {
     )
 }
 
+/// 给静态资源加内容哈希查询串，避免 Pages 的 4h 资源缓存导致
+/// 「新 HTML 配旧 app.js/style.css」。返回处理过的文件名列表。
+fn bust_asset_urls(public_dir: &Path) -> Result<Vec<String>> {
+    let mut hashed = Vec::new();
+    let mut replace = |html: &str, name: &str| -> Result<String> {
+        let path = public_dir.join(name);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(_) => return Ok(html.to_string()), // 自定义壳可能没有这个文件
+        };
+        let hash = &hex_sha256(&bytes)[..10];
+        let needle = format!("{name}\"");
+        let replacement = format!("{name}?v={hash}\"");
+        hashed.push(format!("{name}?v={hash}"));
+        Ok(html.replace(&needle, &replacement))
+    };
+
+    let index_path = public_dir.join("index.html");
+    let mut html = fs::read_to_string(&index_path).context("读取 index.html 失败")?;
+    for name in ["style.css", "config.js", "app.js"] {
+        html = replace(&html, name)?;
+    }
+    fs::write(&index_path, html).context("写回 index.html 失败")?;
+    Ok(hashed)
+}
+
 /// 生成 Cloudflare Pages 工程（B 方案：私有桶 + 同源 Function）。
 ///
 /// 产物：
@@ -605,6 +631,11 @@ pub fn write_shell(
     files += 1;
     fs::write(&wrangler_file, wrangler).context("写入 wrangler.jsonc 失败")?;
     files += 1;
+
+    let hashed = bust_asset_urls(&public_dir)?;
+    if hashed.is_empty() {
+        bail!("静态资源哈希处理失败");
+    }
 
     Ok(ShellOutcome {
         dir: out_dir.to_path_buf(),
@@ -1560,7 +1591,13 @@ mod tests {
 
     fn shell_web() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("index.html"), "<!doctype html>").unwrap();
+        fs::write(
+            dir.path().join("index.html"),
+            "<!doctype html>\n<link rel=\"stylesheet\" href=\"style.css\" />\n\
+             <script src=\"config.js\"></script>\n<script src=\"app.js\" defer></script>\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("style.css"), "/* css */").unwrap();
         fs::write(dir.path().join("app.js"), "// app").unwrap();
         fs::write(
             dir.path().join("config.js"),
@@ -1599,7 +1636,10 @@ mod tests {
         assert!(function.contains("immutable"));
 
         assert!(out.path().join("public/_headers").is_file());
-        assert!(out.path().join("public/index.html").is_file());
+        let index = fs::read_to_string(out.path().join("public/index.html")).unwrap();
+        assert!(index.contains("style.css?v="), "样式表带内容哈希");
+        assert!(index.contains("config.js?v="), "config 带内容哈希");
+        assert!(index.contains("app.js?v="), "app 带内容哈希");
     }
 
     #[test]

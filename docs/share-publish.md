@@ -78,6 +78,10 @@ dist/pages/
 - 壳与数据仍然分离：发布课时只写 R2，**不重新部署 Pages**。
 - 只有改前端 / 改 `config.js` / 改 Function 或 binding 时才需要重新部署。
 - `dataBase` 默认取 `pages_base + /data`；也可在 `[publish].data_base` 显式指定。
+- `--shell` 会给 `index.html` 里的 `style.css` / `config.js` / `app.js` 追加
+  内容哈希查询串（`?v=<sha256前10位>`）。Pages 对静态资源有 4 小时默认缓存，
+  且 `_headers` 的 `Cache-Control` 会被其覆盖，哈希 URL 才能保证重新部署后
+  立即生效。
 
 ### 3.2 R2（数据）
 
