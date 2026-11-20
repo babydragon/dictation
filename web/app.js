@@ -1287,7 +1287,7 @@
   }
 
   /** 拼整条整轨：总是从头拼（续听用 seek），返回 Blob URL 与每项起始偏移。 */
-  async function assembleTrack(manifest, runId) {
+  async function assembleTrack(manifest, runId, onProgress) {
     const d = manifest.defaults || {};
     const items = manifest.items || [];
     const customGap = timingGapMs();
@@ -1313,6 +1313,7 @@
     const starts = new Array(items.length);
     for (let i = 0; i < items.length; i++) {
       if (!alive(runId)) throw new Error('cancelled');
+      if (onProgress) onProgress(i + 1, items.length);
       starts[i] = bytes / TRACK_BYTES_PER_MS / 1000;
       const pcm = await fetchClipPcm(items[i], runId);
       const built = buildItemChunk(items[i], pcm, d, customGap);
@@ -1450,8 +1451,11 @@
   }
 
   async function startTrack(runId, startIndex) {
+    setPlayerControlsEnabled(false);
     setStatus('准备音频…');
-    const built = await assembleTrack(player.manifest, runId);
+    const built = await assembleTrack(player.manifest, runId, (done, total) => {
+      if (alive(runId)) setStatus('准备音频… ' + done + '/' + total);
+    });
     if (!alive(runId)) {
       try { URL.revokeObjectURL(built.url); } catch (e) { /* ignore */ }
       return;
@@ -1473,6 +1477,8 @@
       try { trackEl.currentTime = 0; } catch (e) { /* 元数据未就绪时忽略 */ }
     }
     setReplayEnabled(true);
+    setPlayerControlsEnabled(true);
+    updateNavButtons(player.index, (player.manifest.items || []).length);
     setStatus('正在听写');
     updateMediaSession();
     await trackEl.play();
@@ -1668,6 +1674,13 @@
     els.btnReplay.disabled = !on;
   }
 
+  /** 整轨拼装期间冻结底部控件，避免“点了没反应像卡住”。 */
+  function setPlayerControlsEnabled(on) {
+    [els.btnToggle, els.btnReplay, els.btnPrev, els.btnNext].forEach((btn) => {
+      if (btn) btn.disabled = !on;
+    });
+  }
+
   function startPlayback(manifest, startIndex) {
     const items = (manifest && manifest.items) || [];
     let start = Math.floor(Number(startIndex) || 0);
@@ -1709,6 +1722,7 @@
         console.warn('整轨拼装失败，回退逐词播放', err);
         track.lastError = String((err && err.message) || err);
         cleanupTrack();
+        setPlayerControlsEnabled(true);
         trackBroken = true;
         toast('整轨播放不可用，改用逐词播放');
         runTimeline(runId, start).catch((fallbackErr) => {
@@ -1737,6 +1751,7 @@
     player.replayRequested = false;
     try { audio.pause(); } catch (e) { /* ignore */ }
     cleanupTrack();
+    setPlayerControlsEnabled(true);
     releaseWakeLock();
   }
 

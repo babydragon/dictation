@@ -399,32 +399,43 @@ impl JobStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct JobResult {
-    total_ms: u32,
-    tts_calls: usize,
-    cache_hits: usize,
-    clips: usize,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobKind {
+    /// 生成（TTS 渲染）
+    Generate,
+    /// 发布到 R2
+    Publish,
+}
+
+impl JobKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            JobKind::Generate => "generate",
+            JobKind::Publish => "publish",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 struct Job {
     id: String,
+    kind: JobKind,
     lesson: String,
     status: JobStatus,
     queued_at: String,
     started_at: Option<String>,
     finished_at: Option<String>,
-    result: Option<JobResult>,
+    result: Option<Value>,
     error: Option<String>,
     /// When the job reached a terminal state; used for retention.
     terminal_at: Option<Instant>,
 }
 
 impl Job {
-    fn queued(id: String, lesson: String) -> Self {
+    fn queued(kind: JobKind, id: String, lesson: String) -> Self {
         Self {
             id,
+            kind,
             lesson,
             status: JobStatus::Queued,
             queued_at: now_rfc3339(),
@@ -441,7 +452,7 @@ impl Job {
         self.started_at = Some(now_rfc3339());
     }
 
-    fn mark_done(&mut self, result: JobResult) {
+    fn mark_done(&mut self, result: Value) {
         self.status = JobStatus::Done;
         self.finished_at = Some(now_rfc3339());
         self.result = Some(result);
@@ -471,6 +482,7 @@ impl Job {
     fn view(&self) -> Value {
         json!({
             "job_id": self.id,
+            "kind": self.kind.as_str(),
             "status": self.status.as_str(),
             "lesson": self.lesson,
             "queued_at": self.queued_at,
@@ -502,11 +514,13 @@ impl JobRegistry {
     }
 
     /// Job id for a lesson that is still queued or running.
-    fn active_for(&self, lesson: &str) -> Option<String> {
+    fn active_for(&self, kind: JobKind, lesson: &str) -> Option<String> {
         self.jobs
             .values()
             .find(|job| {
-                job.lesson == lesson && matches!(job.status, JobStatus::Queued | JobStatus::Running)
+                job.kind == kind
+                    && job.lesson == lesson
+                    && matches!(job.status, JobStatus::Queued | JobStatus::Running)
             })
             .map(|job| job.id.clone())
     }
@@ -691,7 +705,7 @@ async fn enqueue_generation(
     let job_id = uuid::Uuid::new_v4().simple().to_string();
     {
         let mut jobs = state.jobs.lock().unwrap();
-        if let Some(existing) = jobs.active_for(&dir_name) {
+        if let Some(existing) = jobs.active_for(JobKind::Generate, &dir_name) {
             let status = jobs
                 .get(&existing)
                 .map(|job| job.status.as_str())
@@ -709,7 +723,11 @@ async fn enqueue_generation(
         if jobs.queued_count() >= MAX_QUEUED_JOBS {
             return Err(ApiError::new(StatusCode::TOO_MANY_REQUESTS, "生成队列已满"));
         }
-        jobs.insert(Job::queued(job_id.clone(), dir_name.clone()));
+        jobs.insert(Job::queued(
+            JobKind::Generate,
+            job_id.clone(),
+            dir_name.clone(),
+        ));
     }
 
     let task_state = state.clone();
@@ -797,6 +815,10 @@ struct PublishRequestBody {
     /// 只统计将要上传的对象，不写入。
     #[serde(default)]
     dry_run: bool,
+    /// true 时立即返回 job_id（202），后台执行；用于慢上行链路或客户端
+    /// 有 60s 超时的 agent。轮询 `GET /api/jobs/{id}`。
+    #[serde(default, rename = "async")]
+    asynchronous: bool,
 }
 
 /// `POST /api/lessons/{id}/publish`：同步发布（R2 操作为秒级）。
@@ -807,7 +829,7 @@ async fn publish_lesson_http(
     headers: HeaderMap,
     UrlPath(id): UrlPath<String>,
     body: Bytes,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     // token 优先于 body 解析（同其它写端点）
     authorize(&state, &headers)?;
 
@@ -831,6 +853,10 @@ async fn publish_lesson_http(
         dry_run: body.dry_run,
     };
 
+    if body.asynchronous {
+        return enqueue_publish(&state, &publish, &id, options);
+    }
+
     let _serial = publish.serial.lock().await;
     match publish::publish_lesson(
         publish.store.as_ref(),
@@ -842,7 +868,7 @@ async fn publish_lesson_http(
     )
     .await
     {
-        Ok(outcome) => Ok(Json(outcome.to_json())),
+        Ok(outcome) => Ok(Json(outcome.to_json()).into_response()),
         Err(err) => {
             if err.stage == publish::Stage::Local && err.message.contains("课时不存在") {
                 return Err(ApiError::not_found("课时不存在"));
@@ -858,6 +884,80 @@ async fn publish_lesson_http(
             })))
         }
     }
+}
+
+/// 异步发布：入队后立即返回 202，任务状态复用 `GET /api/jobs/{id}`。
+fn enqueue_publish(
+    state: &AppState,
+    publish: &Arc<PublishState>,
+    target: &str,
+    options: publish::PublishOptions,
+) -> Result<Response, ApiError> {
+    let job_id = uuid::Uuid::new_v4().simple().to_string();
+    {
+        let mut jobs = state.jobs.lock().unwrap();
+        if let Some(existing) = jobs.active_for(JobKind::Publish, target) {
+            let status = jobs
+                .get(&existing)
+                .map(|job| job.status.as_str())
+                .unwrap_or("queued");
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(json!({
+                    "job_id": existing,
+                    "status": status,
+                    "lesson": target,
+                })),
+            )
+                .into_response());
+        }
+        if jobs.queued_count() >= MAX_QUEUED_JOBS {
+            return Err(ApiError::new(StatusCode::TOO_MANY_REQUESTS, "任务队列已满"));
+        }
+        jobs.insert(Job::queued(
+            JobKind::Publish,
+            job_id.clone(),
+            target.to_string(),
+        ));
+    }
+
+    let task_state = state.clone();
+    let publish = publish.clone();
+    let task_job = job_id.clone();
+    let task_target = target.to_string();
+    tokio::spawn(async move {
+        if let Some(job) = task_state.jobs.lock().unwrap().get_mut(&task_job) {
+            job.mark_running();
+        }
+        let _serial = publish.serial.lock().await;
+        let result = publish::publish_lesson(
+            publish.store.as_ref(),
+            &publish.settings,
+            &task_state.lessons_dir,
+            &task_target,
+            options,
+            None,
+        )
+        .await;
+
+        let mut jobs = task_state.jobs.lock().unwrap();
+        if let Some(job) = jobs.get_mut(&task_job) {
+            match result {
+                Ok(outcome) => job.mark_done(outcome.to_json()),
+                Err(err) => job.mark_error(format!("{err}")),
+            }
+        }
+    });
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "job_id": job_id,
+            "status": "queued",
+            "lesson": target,
+        })),
+    )
+        .into_response())
 }
 
 #[derive(Debug, Deserialize)]
@@ -985,7 +1085,7 @@ async fn cancel_generation(
 
     let mut jobs = state.jobs.lock().unwrap();
     let job_id = jobs
-        .active_for(&dir_name)
+        .active_for(JobKind::Generate, &dir_name)
         .ok_or_else(|| ApiError::not_found("没有可取消的任务"))?;
     let job = jobs
         .get_mut(&job_id)
@@ -1108,12 +1208,12 @@ async fn run_generation(
         match result {
             Ok(result) => {
                 let clips = count_wav_clips(&lesson_dir.join("clips"));
-                job.mark_done(JobResult {
-                    total_ms: result.total_ms,
-                    tts_calls: result.tts_calls,
-                    cache_hits: result.cache_hits,
-                    clips,
-                });
+                job.mark_done(json!({
+                    "total_ms": result.total_ms,
+                    "tts_calls": result.tts_calls,
+                    "cache_hits": result.cache_hits,
+                    "clips": clips,
+                }));
             }
             Err(err) => {
                 warn!("生成失败（{lesson_name}）：{err:#}");
@@ -3105,29 +3205,33 @@ mod tests {
     #[test]
     fn job_registry_dedupes_active_jobs_per_lesson() {
         let mut registry = JobRegistry::default();
-        let first = Job::queued("job-1".to_string(), "第5课".to_string());
+        let first = Job::queued(JobKind::Generate, "job-1".to_string(), "第5课".to_string());
         registry.insert(first);
         assert_eq!(
-            registry.active_for("第5课"),
+            registry.active_for(JobKind::Generate, "第5课"),
             Some("job-1".to_string()),
             "排队中的同课任务复用 job_id"
         );
-        assert_eq!(registry.active_for("第6课"), None);
+        assert_eq!(registry.active_for(JobKind::Generate, "第6课"), None);
 
         registry.get_mut("job-1").unwrap().mark_running();
         assert_eq!(
-            registry.active_for("第5课"),
+            registry.active_for(JobKind::Generate, "第5课"),
             Some("job-1".to_string()),
             "运行中的同课任务同样复用"
         );
 
-        registry.get_mut("job-1").unwrap().mark_done(JobResult {
-            total_ms: 1,
-            tts_calls: 1,
-            cache_hits: 0,
-            clips: 1,
-        });
-        assert_eq!(registry.active_for("第5课"), None, "完成后可重新生成");
+        registry.get_mut("job-1").unwrap().mark_done(json!({
+            "total_ms": 1,
+            "tts_calls": 1,
+            "cache_hits": 0,
+            "clips": 1,
+        }));
+        assert_eq!(
+            registry.active_for(JobKind::Generate, "第5课"),
+            None,
+            "完成后可重新生成"
+        );
     }
 
     #[tokio::test]
@@ -3209,20 +3313,20 @@ mod tests {
         fs::create_dir_all(opts.lessons_dir.join("第6课")).unwrap();
         fs::write(opts.lessons_dir.join("第6课/lesson.txt"), "# 第6课\n粗壮\n").unwrap();
 
-        state
-            .jobs
-            .lock()
-            .unwrap()
-            .insert(Job::queued("queued-1".to_string(), "第5课".to_string()));
+        state.jobs.lock().unwrap().insert(Job::queued(
+            JobKind::Generate,
+            "queued-1".to_string(),
+            "第5课".to_string(),
+        ));
         let response = post(&app, "/api/lessons/第5课/generate/cancel", json!({})).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body_json(response).await["status"], "cancelled");
 
-        state
-            .jobs
-            .lock()
-            .unwrap()
-            .insert(Job::queued("running-1".to_string(), "第6课".to_string()));
+        state.jobs.lock().unwrap().insert(Job::queued(
+            JobKind::Generate,
+            "running-1".to_string(),
+            "第6课".to_string(),
+        ));
         state
             .jobs
             .lock()
@@ -4958,5 +5062,85 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn publish_async_returns_job_and_finishes() {
+        let temp = tempfile::tempdir().unwrap();
+        let opts = test_opts(&temp);
+        let id = fixture_publishable_lesson(&opts.lessons_dir);
+        let store = Arc::new(crate::publish::MemoryStore::default());
+        let app = router(test_state_with_publish(&opts, store, None));
+
+        let res = post(
+            &app,
+            format!("/api/lessons/{id}/publish").as_str(),
+            json!({ "async": true }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::ACCEPTED);
+        let body = body_json(res).await;
+        assert_eq!(body["status"], "queued");
+        let job_id = body["job_id"].as_str().unwrap().to_string();
+
+        let job = wait_job(&app, &job_id).await;
+        assert_eq!(job["kind"], "publish");
+        assert_eq!(job["status"], "done");
+        assert_eq!(job["result"]["status"], "published");
+        assert_eq!(job["result"]["uploaded"], 2);
+    }
+
+    #[tokio::test]
+    async fn publish_job_does_not_block_generation_dedupe() {
+        // 同一课时的 publish 任务不应让 generate 复用它的 job_id
+        let temp = tempfile::tempdir().unwrap();
+        let opts = test_opts(&temp);
+        let id = fixture_publishable_lesson(&opts.lessons_dir);
+        let store = Arc::new(crate::publish::MemoryStore::default());
+        let state = test_state_with_publish(&opts, store, None);
+        {
+            let mut jobs = state.jobs.lock().unwrap();
+            jobs.insert(Job::queued(
+                JobKind::Publish,
+                "publish-1".to_string(),
+                id.clone(),
+            ));
+        }
+        assert!(state
+            .jobs
+            .lock()
+            .unwrap()
+            .active_for(JobKind::Generate, &id)
+            .is_none());
+        assert_eq!(
+            state.jobs.lock().unwrap().active_for(JobKind::Publish, &id),
+            Some("publish-1".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_async_dedupes_active_publish_job() {
+        let temp = tempfile::tempdir().unwrap();
+        let opts = test_opts(&temp);
+        let id = fixture_publishable_lesson(&opts.lessons_dir);
+        let store = Arc::new(crate::publish::MemoryStore::default());
+        let app = router(test_state_with_publish(&opts, store, None));
+
+        let res = post(
+            &app,
+            format!("/api/lessons/{id}/publish").as_str(),
+            json!({ "async": true, "dry_run": false }),
+        )
+        .await;
+        let first = body_json(res).await;
+        let res = post(
+            &app,
+            format!("/api/lessons/{id}/publish").as_str(),
+            json!({ "async": true, "dry_run": false }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::ACCEPTED);
+        let second = body_json(res).await;
+        assert_eq!(first["job_id"], second["job_id"], "同课重复发布复用任务");
     }
 }

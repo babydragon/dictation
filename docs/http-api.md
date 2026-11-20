@@ -640,9 +640,19 @@ body 全部可选（空 body = 默认值）：
 | `force` | bool | `false` | 远端 `content_hash` 相同也重新上传全部对象 |
 | `with_full` | bool | `false` | 额外上传 `full.mp3`（不传 `full.wav`） |
 | `dry_run` | bool | `false` | 只统计将要上传的对象，不写入 |
+| `async` | bool | `false` | `true` 时立即返回 `202` + `job_id`，后台执行；慢上行链路或客户端有 60s 超时时用 |
 
 - `{id}` 解析同 `generate`（目录名优先，其次 12 位课时 id）；不存在 → `404`。
-- 成功 `200`（首次发布）：
+- 异步模式（`{"async":true}`）立即返回 `202`，复用 `GET /api/jobs/{id}` 轮询：
+
+```json
+{ "job_id": "8f2c…", "status": "queued", "lesson": "第5课 词语听写" }
+```
+
+完成后 `result` 就是同步模式的响应体，`kind="publish"`。同一课已有排队/运行中的
+发布任务时复用同一个 `job_id`；发布任务与生成任务互不影响。
+
+- 同步成功 `200`（首次发布）：
 
 ```json
 {
@@ -765,6 +775,7 @@ CLI 等价：`dictation result import <file|-> [--json]`（输出同一结构）
 ```json
 {
   "job_id": "6f1c...",
+  "kind": "generate",
   "status": "running",
   "lesson": "第5课",
   "queued_at": "2026-11-06T18:00:00+08:00",
@@ -776,6 +787,7 @@ CLI 等价：`dictation result import <file|-> [--json]`（输出同一结构）
 ```
 
 - `status`：`queued | running | done | error | cancelled`。
+- `kind`：`generate | publish`；发布任务的 `result` 是发布响应体。
 - `done` 时 `result`：
 
 ```json

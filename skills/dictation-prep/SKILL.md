@@ -195,6 +195,12 @@ curl -sS -X POST "$API/api/lessons/第5课/publish" "${AUTH[@]}" \
 # 正式发布
 curl -sS -X POST "$API/api/lessons/第5课/publish" "${AUTH[@]}" \
   -H 'content-type: application/json' -d '{}'
+
+# 上行慢 / 客户端有 60s 超时：异步
+curl -sS -X POST "$API/api/lessons/第5课/publish" "${AUTH[@]}" \
+  -H 'content-type: application/json' -d '{"async":true}'
+# → 202 {"job_id":"...","status":"queued"}；再轮询 GET /api/jobs/<job_id>
+#   （kind="publish"，done 后 result 与同步响应同形）
 ```
 
 `{id}` 可以是目录名（`第5课`）或 12 位课时 id。

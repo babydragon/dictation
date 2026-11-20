@@ -585,6 +585,20 @@ dictation result import <file|-> [--json]
 - server 模式回归：`serve` 起本库，首页渲染与 `/api/*` 正常，导出按钮隐藏。
 - 验证：`node --check web/app.js` 通过；Rust 未改动（cargo test 仍 200）。
 
+### 2026-11-20（异步发布 + 准备阶段冻结控件）
+
+- `POST /api/lessons/{id}/publish` 新增 `{"async": true}`：202 + job_id，
+  后台执行，复用 `GET /api/jobs/{id}`（`kind="publish"`，result 与同步同形）；
+  同课活动任务复用 job_id；生成/发布任务按 kind 隔离，互不影响。
+  解决 agent 客户端 60s 超时（上行慢时同步发布会被取消）。
+- `Job` 增加 `kind`，`result` 改为 JSON（生成结果字段不变）；
+  `cancel_generation` 只取消生成任务。
+- 前端整轨拼装阶段：冻结暂停/重听/上一个/下一个，状态显示
+  「准备音频… N/M」（逐词进度），播完恢复；失败回退时也恢复。
+- 验证：浏览器 MutationObserver 实测 1/20→20/20 期间三个按钮均 disabled，
+  进入「正在听写」后恢复；异步发布 3 个 HTTP 测试（202+轮询、去重、kind 隔离）。
+- 文档：`http-api.md`、`share-publish.md`、skill。
+
 ### 2026-11-20（B 方案：Pages Function 代理私有桶）
 
 - 采用 B：R2 不绑公网域名、保持私有；Pages Function 通过 binding 读桶，

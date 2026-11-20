@@ -209,7 +209,7 @@ dist/pages/
 
 ### 5.1 状态机
 
-`dictation publish <课时>`：
+`dictation publish <课时>` / `POST /api/lessons/{id}/publish`：
 
 ```
 1. 解析课时（目录名优先，其次 12 位 id）           → 404 if missing
@@ -224,6 +224,10 @@ dist/pages/
 6. PUT lessons/<id>/lesson.json                   → 提交点（no-cache）
 7. GET lessons/index.json → merge 本课 → PUT      → 最后一步
 ```
+
+HTTP 端可选 `{"async": true}`：立即返回 `202 {job_id}`，后台执行，复用
+`GET /api/jobs/{id}`（`kind="publish"`）轮询；慢上行链路或 agent 客户端
+有 60s 超时时用。
 
 **顺序不可颠倒**：6 必须在 5 之后（否则列表里出现不完整课时），7 必须在 6 之后
 （否则首页出现 404 的课）。
